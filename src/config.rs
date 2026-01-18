@@ -10,6 +10,8 @@ pub struct Config {
     #[serde(default)]
     pub default: DefaultConfig,
     #[serde(default)]
+    pub footer: FooterConfig,
+    #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
 }
 
@@ -19,8 +21,8 @@ pub struct DefaultConfig {
     pub providers: Vec<String>,
     #[serde(default = "default_true")]
     pub stream: bool,
-    #[serde(default = "default_true")]
-    pub show_tokens: bool,
+    #[serde(default)]
+    pub tui: bool,
     pub system_prompt: Option<String>,
 }
 
@@ -29,8 +31,31 @@ impl Default for DefaultConfig {
         Self {
             providers: default_providers(),
             stream: true,
-            show_tokens: true,
+            tui: false,
             system_prompt: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FooterConfig {
+    #[serde(default = "default_true")]
+    pub show_model: bool,
+    #[serde(default = "default_true")]
+    pub show_time: bool,
+    #[serde(default)]
+    pub show_tokens: bool,
+    #[serde(default = "default_true")]
+    pub show_reasoning: bool,
+}
+
+impl Default for FooterConfig {
+    fn default() -> Self {
+        Self {
+            show_model: true,
+            show_time: true,
+            show_tokens: false,
+            show_reasoning: true,
         }
     }
 }
@@ -163,6 +188,7 @@ impl Default for Config {
 
         Config {
             default: DefaultConfig::default(),
+            footer: FooterConfig::default(),
             providers,
         }
     }

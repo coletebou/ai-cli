@@ -1,3 +1,4 @@
+use crate::config::FooterConfig;
 use crate::providers::{Provider, ProviderResponse};
 use crate::query::StreamEvent;
 use colored::Colorize;
@@ -46,31 +47,39 @@ pub fn print_metadata(
     input_tokens: Option<i32>,
     output_tokens: Option<i32>,
     duration_ms: u64,
-    show_tokens: bool,
+    footer: &FooterConfig,
     reasoning: Option<&str>,
 ) {
     println!();
-    let mut parts = vec![format!("model: {}", model)];
+    let mut parts = Vec::new();
 
-    if show_tokens {
+    if footer.show_model {
+        parts.push(format!("model: {}", model));
+    }
+
+    if footer.show_tokens {
         if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
             parts.push(format!("tokens: {} in / {} out", input, output));
         }
     }
 
-    // Format duration nicely
-    let duration_str = if duration_ms >= 1000 {
-        format!("{:.1}s", duration_ms as f64 / 1000.0)
-    } else {
-        format!("{}ms", duration_ms)
-    };
-    parts.push(format!("time: {}", duration_str));
+    if footer.show_time {
+        let duration_str = if duration_ms >= 1000 {
+            format!("{:.1}s", duration_ms as f64 / 1000.0)
+        } else {
+            format!("{}ms", duration_ms)
+        };
+        parts.push(format!("time: {}", duration_str));
+    }
 
-    // Add reasoning level
-    parts.push(format!("reasoning: {}", format_reasoning(reasoning)));
+    if footer.show_reasoning {
+        parts.push(format!("reasoning: {}", format_reasoning(reasoning)));
+    }
 
-    let metadata = parts.join(" | ");
-    println!("{}", metadata.dimmed());
+    if !parts.is_empty() {
+        let metadata = parts.join(" | ");
+        println!("{}", metadata.dimmed());
+    }
     println!();
 }
 
@@ -78,11 +87,18 @@ pub fn print_error(error: &str) {
     println!("{} {}", "Error:".red().bold(), error.red());
 }
 
-pub fn print_response(response: &ProviderResponse, show_tokens: bool, reasoning: Option<&str>) {
+pub fn print_response(response: &ProviderResponse, footer: &FooterConfig, reasoning: Option<&str>) {
     if response.is_error() {
         print_header(&response.provider, "error");
         print_error(response.error.as_ref().unwrap());
-        print_metadata(&response.model, None, None, response.duration_ms, false, reasoning);
+        // Minimal footer for errors
+        let error_footer = FooterConfig {
+            show_model: footer.show_model,
+            show_time: footer.show_time,
+            show_tokens: false,
+            show_reasoning: false,
+        };
+        print_metadata(&response.model, None, None, response.duration_ms, &error_footer, reasoning);
     } else {
         print_header(&response.provider, "complete");
         println!("{}", response.text);
@@ -91,15 +107,15 @@ pub fn print_response(response: &ProviderResponse, show_tokens: bool, reasoning:
             response.input_tokens,
             response.output_tokens,
             response.duration_ms,
-            show_tokens,
+            footer,
             reasoning,
         );
     }
 }
 
-pub fn print_responses(responses: &[ProviderResponse], show_tokens: bool, reasoning: Option<&str>) {
+pub fn print_responses(responses: &[ProviderResponse], footer: &FooterConfig, reasoning: Option<&str>) {
     for response in responses {
-        print_response(response, show_tokens, reasoning);
+        print_response(response, footer, reasoning);
     }
 }
 
@@ -119,13 +135,13 @@ pub fn print_raw_responses(responses: &[ProviderResponse]) {
 pub struct StreamingDisplay {
     current_provider: Option<String>,
     provider_colors: HashMap<String, colored::Color>,
-    show_tokens: bool,
+    footer: FooterConfig,
     raw_mode: bool,
     reasoning: Option<String>,
 }
 
 impl StreamingDisplay {
-    pub fn new(providers: &[Provider], show_tokens: bool, raw_mode: bool, reasoning: Option<String>) -> Self {
+    pub fn new(providers: &[Provider], footer: FooterConfig, raw_mode: bool, reasoning: Option<String>) -> Self {
         let provider_colors: HashMap<String, colored::Color> = providers
             .iter()
             .map(|p| (p.display_name.clone(), p.color))
@@ -134,7 +150,7 @@ impl StreamingDisplay {
         StreamingDisplay {
             current_provider: None,
             provider_colors,
-            show_tokens,
+            footer,
             raw_mode,
             reasoning,
         }
@@ -219,24 +235,35 @@ impl StreamingDisplay {
                 ..
             } => {
                 println!();
-                let mut parts = vec![format!("model: {}", model)];
+                let mut parts = Vec::new();
 
-                if self.show_tokens {
+                if self.footer.show_model {
+                    parts.push(format!("model: {}", model));
+                }
+
+                if self.footer.show_tokens {
                     if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
                         parts.push(format!("tokens: {} in / {} out", input, output));
                     }
                 }
 
-                let duration_str = if duration_ms >= 1000 {
-                    format!("{:.1}s", duration_ms as f64 / 1000.0)
-                } else {
-                    format!("{}ms", duration_ms)
-                };
-                parts.push(format!("time: {}", duration_str));
-                parts.push(format!("reasoning: {}", format_reasoning(self.reasoning.as_deref())));
+                if self.footer.show_time {
+                    let duration_str = if duration_ms >= 1000 {
+                        format!("{:.1}s", duration_ms as f64 / 1000.0)
+                    } else {
+                        format!("{}ms", duration_ms)
+                    };
+                    parts.push(format!("time: {}", duration_str));
+                }
 
-                let metadata = parts.join(" | ");
-                println!("{}", metadata.dimmed());
+                if self.footer.show_reasoning {
+                    parts.push(format!("reasoning: {}", format_reasoning(self.reasoning.as_deref())));
+                }
+
+                if !parts.is_empty() {
+                    let metadata = parts.join(" | ");
+                    println!("{}", metadata.dimmed());
+                }
                 println!();
             }
             StreamEvent::Error { provider, model, error, duration_ms } => {
@@ -279,11 +306,11 @@ impl StreamingDisplay {
 pub async fn display_streaming(
     mut rx: mpsc::Receiver<StreamEvent>,
     providers: &[Provider],
-    show_tokens: bool,
+    footer: &FooterConfig,
     raw_mode: bool,
     reasoning: Option<String>,
 ) {
-    let mut display = StreamingDisplay::new(providers, show_tokens, raw_mode, reasoning);
+    let mut display = StreamingDisplay::new(providers, footer.clone(), raw_mode, reasoning);
 
     while let Some(event) = rx.recv().await {
         display.handle_event(event);

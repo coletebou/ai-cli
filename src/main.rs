@@ -101,8 +101,9 @@ async fn main() -> Result<()> {
     let system_prompt = cli.system.as_deref().or(config.default.system_prompt.as_deref());
 
     // Determine display options
-    let show_tokens = !cli.no_tokens && config.default.show_tokens;
     let stream = !cli.no_stream && config.default.stream;
+    let use_tui = cli.tui || config.default.tui;
+    let footer = config.footer.clone();
 
     // Parse reasoning effort and get display string
     let (reasoning_effort, reasoning_str) = match cli.reasoning.as_ref() {
@@ -127,14 +128,14 @@ async fn main() -> Result<()> {
         None => (None, None), // Default: no reasoning specified
     };
 
-    if cli.tui {
+    if use_tui {
         // Phase 2: TUI mode
         crate::ui::run_tui(
             manager,
             providers_to_query,
             question,
             system_prompt,
-            show_tokens,
+            footer.show_tokens,
             reasoning_effort,
         )
         .await?;
@@ -149,7 +150,7 @@ async fn main() -> Result<()> {
         )
         .await;
 
-        display::display_streaming(rx, &providers_to_query, show_tokens, cli.raw, reasoning_str.clone()).await;
+        display::display_streaming(rx, &providers_to_query, &footer, cli.raw, reasoning_str.clone()).await;
     } else {
         // Non-streaming mode
         let responses = query::query_all(
@@ -164,7 +165,7 @@ async fn main() -> Result<()> {
         if cli.raw {
             display::print_raw_responses(&responses);
         } else {
-            display::print_responses(&responses, show_tokens, reasoning_str.as_deref());
+            display::print_responses(&responses, &footer, reasoning_str.as_deref());
         }
     }
 

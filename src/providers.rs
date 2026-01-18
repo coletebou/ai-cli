@@ -192,34 +192,42 @@ impl ProviderManager {
 #[derive(Debug, Clone)]
 pub struct ProviderResponse {
     pub provider: Provider,
+    pub model: String,
     pub text: String,
     pub input_tokens: Option<i32>,
     pub output_tokens: Option<i32>,
+    pub duration_ms: u64,
     pub error: Option<String>,
 }
 
 impl ProviderResponse {
     pub fn success(
         provider: Provider,
+        model: String,
         text: String,
         input_tokens: Option<i32>,
         output_tokens: Option<i32>,
+        duration_ms: u64,
     ) -> Self {
         ProviderResponse {
             provider,
+            model,
             text,
             input_tokens,
             output_tokens,
+            duration_ms,
             error: None,
         }
     }
 
-    pub fn error(provider: Provider, error: String) -> Self {
+    pub fn error(provider: Provider, model: String, error: String, duration_ms: u64) -> Self {
         ProviderResponse {
             provider,
+            model,
             text: String::new(),
             input_tokens: None,
             output_tokens: None,
+            duration_ms,
             error: Some(error),
         }
     }

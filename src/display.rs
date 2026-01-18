@@ -19,14 +19,32 @@ pub fn print_header(provider: &Provider, status: &str) {
     println!("{}", SEPARATOR.color(provider.color));
 }
 
-pub fn print_footer(input_tokens: Option<i32>, output_tokens: Option<i32>, show_tokens: bool) {
+pub fn print_metadata(
+    model: &str,
+    input_tokens: Option<i32>,
+    output_tokens: Option<i32>,
+    duration_ms: u64,
+    show_tokens: bool,
+) {
+    println!();
+    let mut parts = vec![format!("model: {}", model)];
+
     if show_tokens {
         if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
-            let token_info = format!("tokens: {} in / {} out", input, output);
-            println!();
-            println!("{:>64}", token_info.dimmed());
+            parts.push(format!("tokens: {} in / {} out", input, output));
         }
     }
+
+    // Format duration nicely
+    let duration_str = if duration_ms >= 1000 {
+        format!("{:.1}s", duration_ms as f64 / 1000.0)
+    } else {
+        format!("{}ms", duration_ms)
+    };
+    parts.push(format!("time: {}", duration_str));
+
+    let metadata = parts.join(" | ");
+    println!("{}", metadata.dimmed());
     println!();
 }
 
@@ -38,10 +56,17 @@ pub fn print_response(response: &ProviderResponse, show_tokens: bool) {
     if response.is_error() {
         print_header(&response.provider, "error");
         print_error(response.error.as_ref().unwrap());
+        print_metadata(&response.model, None, None, response.duration_ms, false);
     } else {
         print_header(&response.provider, "complete");
         println!("{}", response.text);
-        print_footer(response.input_tokens, response.output_tokens, show_tokens);
+        print_metadata(
+            &response.model,
+            response.input_tokens,
+            response.output_tokens,
+            response.duration_ms,
+            show_tokens,
+        );
     }
 }
 
@@ -103,7 +128,7 @@ impl StreamingDisplay {
 
     fn handle_event_raw(&mut self, event: StreamEvent) {
         match event {
-            StreamEvent::Start { provider } => {
+            StreamEvent::Start { provider, .. } => {
                 if self.current_provider.is_some() {
                     println!("\n\n---\n");
                 }
@@ -114,10 +139,16 @@ impl StreamingDisplay {
                 print!("{}", text);
                 let _ = io::stdout().flush();
             }
-            StreamEvent::Done { .. } => {
+            StreamEvent::Done { model, duration_ms, .. } => {
+                let duration_str = if duration_ms >= 1000 {
+                    format!("{:.1}s", duration_ms as f64 / 1000.0)
+                } else {
+                    format!("{}ms", duration_ms)
+                };
                 println!();
+                println!("[model: {} | time: {}]", model, duration_str);
             }
-            StreamEvent::Error { provider, error } => {
+            StreamEvent::Error { provider, error, .. } => {
                 eprintln!("[{}] Error: {}", provider, error);
             }
         }
@@ -125,7 +156,7 @@ impl StreamingDisplay {
 
     fn handle_event_formatted(&mut self, event: StreamEvent) {
         match event {
-            StreamEvent::Start { provider } => {
+            StreamEvent::Start { provider, .. } => {
                 let color = self.get_color(&provider);
                 let header = format!(" {} ", provider);
                 let status_str = "[streaming]";
@@ -144,21 +175,33 @@ impl StreamingDisplay {
                 let _ = io::stdout().flush();
             }
             StreamEvent::Done {
+                model,
                 input_tokens,
                 output_tokens,
+                duration_ms,
                 ..
             } => {
+                println!();
+                let mut parts = vec![format!("model: {}", model)];
+
                 if self.show_tokens {
                     if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
-                        let token_info = format!("tokens: {} in / {} out", input, output);
-                        println!();
-                        println!();
-                        println!("{:>64}", token_info.dimmed());
+                        parts.push(format!("tokens: {} in / {} out", input, output));
                     }
                 }
+
+                let duration_str = if duration_ms >= 1000 {
+                    format!("{:.1}s", duration_ms as f64 / 1000.0)
+                } else {
+                    format!("{}ms", duration_ms)
+                };
+                parts.push(format!("time: {}", duration_str));
+
+                let metadata = parts.join(" | ");
+                println!("{}", metadata.dimmed());
                 println!();
             }
-            StreamEvent::Error { provider, error } => {
+            StreamEvent::Error { provider, model, error, duration_ms } => {
                 let color = self.get_color(&provider);
 
                 // If we haven't printed a header for this provider yet
@@ -175,6 +218,12 @@ impl StreamingDisplay {
                 }
 
                 println!("{} {}", "Error:".red().bold(), error.red());
+                let duration_str = if duration_ms >= 1000 {
+                    format!("{:.1}s", duration_ms as f64 / 1000.0)
+                } else {
+                    format!("{}ms", duration_ms)
+                };
+                println!("{}", format!("model: {} | time: {}", model, duration_str).dimmed());
                 println!();
             }
         }

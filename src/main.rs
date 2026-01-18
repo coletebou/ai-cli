@@ -44,7 +44,7 @@ struct Cli {
     no_tokens: bool,
 
     /// Side-by-side TUI display (Phase 2)
-    #[arg(long)]
+    #[arg(short = 't', long)]
     tui: bool,
 }
 

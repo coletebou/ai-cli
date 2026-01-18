@@ -20,9 +20,11 @@ use tokio::sync::mpsc;
 
 pub struct PanelState {
     pub provider: Provider,
+    pub model: String,
     pub text: String,
     pub input_tokens: Option<i32>,
     pub output_tokens: Option<i32>,
+    pub duration_ms: u64,
     pub is_complete: bool,
     pub error: Option<String>,
     pub scroll_offset: u16,
@@ -30,11 +32,14 @@ pub struct PanelState {
 
 impl PanelState {
     pub fn new(provider: Provider) -> Self {
+        let model = provider.model.clone();
         PanelState {
             provider,
+            model,
             text: String::new(),
             input_tokens: None,
             output_tokens: None,
+            duration_ms: 0,
             is_complete: false,
             error: None,
             scroll_offset: 0,
@@ -45,14 +50,16 @@ impl PanelState {
         self.text.push_str(text);
     }
 
-    pub fn complete(&mut self, input_tokens: Option<i32>, output_tokens: Option<i32>) {
+    pub fn complete(&mut self, input_tokens: Option<i32>, output_tokens: Option<i32>, duration_ms: u64) {
         self.input_tokens = input_tokens;
         self.output_tokens = output_tokens;
+        self.duration_ms = duration_ms;
         self.is_complete = true;
     }
 
-    pub fn set_error(&mut self, error: String) {
+    pub fn set_error(&mut self, error: String, duration_ms: u64) {
         self.error = Some(error);
+        self.duration_ms = duration_ms;
         self.is_complete = true;
     }
 
@@ -90,9 +97,10 @@ impl App {
 
     pub fn handle_event(&mut self, event: StreamEvent) {
         match event {
-            StreamEvent::Start { provider } => {
+            StreamEvent::Start { provider, model } => {
                 if let Some(panel) = self.panels.iter_mut().find(|p| p.provider.display_name == provider) {
                     panel.text.clear();
+                    panel.model = model;
                 }
             }
             StreamEvent::Chunk { provider, text } => {
@@ -104,14 +112,16 @@ impl App {
                 provider,
                 input_tokens,
                 output_tokens,
+                duration_ms,
+                ..
             } => {
                 if let Some(panel) = self.panels.iter_mut().find(|p| p.provider.display_name == provider) {
-                    panel.complete(input_tokens, output_tokens);
+                    panel.complete(input_tokens, output_tokens, duration_ms);
                 }
             }
-            StreamEvent::Error { provider, error } => {
+            StreamEvent::Error { provider, error, duration_ms, .. } => {
                 if let Some(panel) = self.panels.iter_mut().find(|p| p.provider.display_name == provider) {
-                    panel.set_error(error);
+                    panel.set_error(error, duration_ms);
                 }
             }
         }
@@ -227,16 +237,30 @@ fn draw_panel(frame: &mut Frame, panel: &PanelState, area: Rect, is_selected: bo
         Text::raw(&panel.text)
     };
 
-    // Add token info if showing
+    // Add metadata if complete
     let mut lines: Vec<Line> = content.lines.clone();
-    if show_tokens && panel.is_complete {
-        if let (Some(input), Some(output)) = (panel.input_tokens, panel.output_tokens) {
-            lines.push(Line::from(""));
-            lines.push(Line::styled(
-                format!("tokens: {} in / {} out", input, output),
-                Style::default().fg(Color::DarkGray),
-            ));
+    if panel.is_complete {
+        lines.push(Line::from(""));
+
+        let mut parts = vec![format!("model: {}", panel.model)];
+
+        if show_tokens {
+            if let (Some(input), Some(output)) = (panel.input_tokens, panel.output_tokens) {
+                parts.push(format!("tokens: {} in / {} out", input, output));
+            }
         }
+
+        let duration_str = if panel.duration_ms >= 1000 {
+            format!("{:.1}s", panel.duration_ms as f64 / 1000.0)
+        } else {
+            format!("{}ms", panel.duration_ms)
+        };
+        parts.push(format!("time: {}", duration_str));
+
+        lines.push(Line::styled(
+            parts.join(" | "),
+            Style::default().fg(Color::DarkGray),
+        ));
     }
 
     let text = Text::from(lines);

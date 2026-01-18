@@ -3,18 +3,21 @@ use futures::future::join_all;
 use futures::StreamExt as FuturesStreamExt;
 use genai::chat::{ChatMessage, ChatStreamEvent};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    Start { provider: String },
+    Start { provider: String, model: String },
     Chunk { provider: String, text: String },
     Done {
         provider: String,
+        model: String,
         input_tokens: Option<i32>,
         output_tokens: Option<i32>,
+        duration_ms: u64,
     },
-    Error { provider: String, error: String },
+    Error { provider: String, model: String, error: String, duration_ms: u64 },
 }
 
 pub async fn query_single(
@@ -23,6 +26,9 @@ pub async fn query_single(
     question: &str,
     system_prompt: Option<&str>,
 ) -> ProviderResponse {
+    let start = Instant::now();
+    let model = provider.model.clone();
+
     let mut messages = Vec::new();
 
     if let Some(system) = system_prompt {
@@ -32,12 +38,16 @@ pub async fn query_single(
 
     match manager.exec_chat(&provider.model, messages, None).await {
         Ok(response) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
             let text = response.first_text().unwrap_or_default().to_string();
             let input_tokens = response.usage.prompt_tokens;
             let output_tokens = response.usage.completion_tokens;
-            ProviderResponse::success(provider.clone(), text, input_tokens, output_tokens)
+            ProviderResponse::success(provider.clone(), model, text, input_tokens, output_tokens, duration_ms)
         }
-        Err(e) => ProviderResponse::error(provider.clone(), format!("{:#}", e)),
+        Err(e) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            ProviderResponse::error(provider.clone(), model, format!("{:#}", e), duration_ms)
+        }
     }
 }
 
@@ -73,7 +83,9 @@ pub async fn stream_single(
     system_prompt: Option<&str>,
     tx: mpsc::Sender<StreamEvent>,
 ) {
+    let start = Instant::now();
     let provider_name = provider.display_name.clone();
+    let model = provider.model.clone();
 
     let mut messages = Vec::new();
     if let Some(system) = system_prompt {
@@ -83,7 +95,8 @@ pub async fn stream_single(
 
     // Send start event
     let _ = tx.send(StreamEvent::Start {
-        provider: provider_name.clone()
+        provider: provider_name.clone(),
+        model: model.clone(),
     }).await;
 
     match manager.exec_chat_stream(&provider.model, messages, None).await {
@@ -116,25 +129,34 @@ pub async fn stream_single(
                     Ok(ChatStreamEvent::ToolCallChunk(_)) => {}
                     Ok(ChatStreamEvent::ThoughtSignatureChunk(_)) => {}
                     Err(e) => {
+                        let duration_ms = start.elapsed().as_millis() as u64;
                         let _ = tx.send(StreamEvent::Error {
                             provider: provider_name.clone(),
+                            model: model.clone(),
                             error: format!("{:#}", e),
+                            duration_ms,
                         }).await;
                         return;
                     }
                 }
             }
 
+            let duration_ms = start.elapsed().as_millis() as u64;
             let _ = tx.send(StreamEvent::Done {
                 provider: provider_name,
+                model,
                 input_tokens,
                 output_tokens,
+                duration_ms,
             }).await;
         }
         Err(e) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
             let _ = tx.send(StreamEvent::Error {
                 provider: provider_name,
+                model,
                 error: format!("{:#}", e),
+                duration_ms,
             }).await;
         }
     }

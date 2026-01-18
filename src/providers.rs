@@ -9,11 +9,9 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct Provider {
-    pub name: String,
     pub display_name: String,
     pub model: String,
     pub color: Color,
-    pub enabled: bool,
 }
 
 impl Provider {
@@ -37,11 +35,9 @@ impl Provider {
         };
 
         Provider {
-            name: name.to_string(),
             display_name,
             model: config.default_model.clone(),
             color,
-            enabled: config.enabled,
         }
     }
 }
@@ -117,10 +113,6 @@ impl ProviderManager {
         })
     }
 
-    pub fn get_provider(&self, name: &str) -> Option<&Provider> {
-        self.providers.get(name)
-    }
-
     pub fn resolve_alias(&self, alias: &str) -> Option<String> {
         self.config.resolve_provider_alias(alias)
     }
@@ -180,13 +172,6 @@ impl ProviderManager {
         }
     }
 
-    pub fn client(&self) -> &Client {
-        &self.client
-    }
-
-    pub fn config(&self) -> &Config {
-        &self.config
-    }
 }
 
 #[derive(Debug, Clone)]

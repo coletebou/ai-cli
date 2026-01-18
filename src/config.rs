@@ -179,18 +179,6 @@ impl Config {
         }
     }
 
-    pub fn save_default_config() -> Result<()> {
-        let config_path = Self::config_path();
-        if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let config = Config::default();
-        let content = toml::to_string_pretty(&config)?;
-        fs::write(&config_path, content)?;
-        Ok(())
-    }
-
     pub fn get_api_key(&self, provider_name: &str) -> Option<String> {
         self.providers.get(provider_name).and_then(|p| {
             // First check direct api_key

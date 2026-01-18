@@ -48,9 +48,13 @@ struct Cli {
     #[arg(long)]
     no_tokens: bool,
 
-    /// Side-by-side TUI display (Phase 2)
+    /// Side-by-side TUI display
     #[arg(short = 't', long)]
     tui: bool,
+
+    /// Disable TUI mode (use sequential display)
+    #[arg(long)]
+    no_tui: bool,
 
     /// Reasoning effort level (none, low, medium, high, or a number for budget)
     #[arg(short = 'r', long)]
@@ -102,7 +106,7 @@ async fn main() -> Result<()> {
 
     // Determine display options
     let stream = !cli.no_stream && config.default.stream;
-    let use_tui = cli.tui || config.default.tui;
+    let use_tui = !cli.no_tui && (cli.tui || config.default.tui);
     let footer = config.footer.clone();
 
     // Parse reasoning effort and get display string

@@ -1,0 +1,324 @@
+use crate::providers::{Provider, ProviderManager};
+use crate::query::StreamEvent;
+use anyhow::Result;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Text},
+    widgets::{Block, Borders, Paragraph, Wrap},
+    Frame, Terminal,
+};
+use std::io::{self, Stdout};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+
+pub struct PanelState {
+    pub provider: Provider,
+    pub text: String,
+    pub input_tokens: Option<i32>,
+    pub output_tokens: Option<i32>,
+    pub is_complete: bool,
+    pub error: Option<String>,
+    pub scroll_offset: u16,
+}
+
+impl PanelState {
+    pub fn new(provider: Provider) -> Self {
+        PanelState {
+            provider,
+            text: String::new(),
+            input_tokens: None,
+            output_tokens: None,
+            is_complete: false,
+            error: None,
+            scroll_offset: 0,
+        }
+    }
+
+    pub fn append(&mut self, text: &str) {
+        self.text.push_str(text);
+    }
+
+    pub fn complete(&mut self, input_tokens: Option<i32>, output_tokens: Option<i32>) {
+        self.input_tokens = input_tokens;
+        self.output_tokens = output_tokens;
+        self.is_complete = true;
+    }
+
+    pub fn set_error(&mut self, error: String) {
+        self.error = Some(error);
+        self.is_complete = true;
+    }
+
+    pub fn get_color(&self) -> Color {
+        match self.provider.color {
+            colored::Color::Red => Color::Red,
+            colored::Color::Green => Color::Green,
+            colored::Color::Blue => Color::Blue,
+            colored::Color::Cyan => Color::Cyan,
+            colored::Color::Magenta => Color::Magenta,
+            colored::Color::Yellow => Color::Yellow,
+            colored::Color::White => Color::White,
+            _ => Color::White,
+        }
+    }
+}
+
+pub struct App {
+    panels: Vec<PanelState>,
+    selected_panel: usize,
+    show_tokens: bool,
+    question: String,
+}
+
+impl App {
+    pub fn new(providers: Vec<Provider>, question: &str, show_tokens: bool) -> Self {
+        let panels = providers.into_iter().map(PanelState::new).collect();
+        App {
+            panels,
+            selected_panel: 0,
+            show_tokens,
+            question: question.to_string(),
+        }
+    }
+
+    pub fn handle_event(&mut self, event: StreamEvent) {
+        match event {
+            StreamEvent::Start { provider } => {
+                if let Some(panel) = self.panels.iter_mut().find(|p| p.provider.display_name == provider) {
+                    panel.text.clear();
+                }
+            }
+            StreamEvent::Chunk { provider, text } => {
+                if let Some(panel) = self.panels.iter_mut().find(|p| p.provider.display_name == provider) {
+                    panel.append(&text);
+                }
+            }
+            StreamEvent::Done {
+                provider,
+                input_tokens,
+                output_tokens,
+            } => {
+                if let Some(panel) = self.panels.iter_mut().find(|p| p.provider.display_name == provider) {
+                    panel.complete(input_tokens, output_tokens);
+                }
+            }
+            StreamEvent::Error { provider, error } => {
+                if let Some(panel) = self.panels.iter_mut().find(|p| p.provider.display_name == provider) {
+                    panel.set_error(error);
+                }
+            }
+        }
+    }
+
+    pub fn all_complete(&self) -> bool {
+        self.panels.iter().all(|p| p.is_complete)
+    }
+
+    pub fn next_panel(&mut self) {
+        if !self.panels.is_empty() {
+            self.selected_panel = (self.selected_panel + 1) % self.panels.len();
+        }
+    }
+
+    pub fn prev_panel(&mut self) {
+        if !self.panels.is_empty() {
+            self.selected_panel = (self.selected_panel + self.panels.len() - 1) % self.panels.len();
+        }
+    }
+
+    pub fn scroll_up(&mut self) {
+        if let Some(panel) = self.panels.get_mut(self.selected_panel) {
+            panel.scroll_offset = panel.scroll_offset.saturating_sub(1);
+        }
+    }
+
+    pub fn scroll_down(&mut self) {
+        if let Some(panel) = self.panels.get_mut(self.selected_panel) {
+            panel.scroll_offset = panel.scroll_offset.saturating_add(1);
+        }
+    }
+}
+
+fn draw_ui(frame: &mut Frame, app: &App) {
+    let size = frame.area();
+
+    // Main layout: header, content, footer
+    let main_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header with question
+            Constraint::Min(5),    // Content area for panels
+            Constraint::Length(1), // Footer with help
+        ])
+        .split(size);
+
+    // Draw header with question
+    let header_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Question ")
+        .style(Style::default().fg(Color::Cyan));
+    let header_text = Paragraph::new(app.question.as_str())
+        .block(header_block)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(header_text, main_layout[0]);
+
+    // Draw panels side by side
+    let num_panels = app.panels.len();
+    if num_panels > 0 {
+        let constraints: Vec<Constraint> = (0..num_panels)
+            .map(|_| Constraint::Ratio(1, num_panels as u32))
+            .collect();
+
+        let panel_layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(constraints)
+            .split(main_layout[1]);
+
+        for (i, panel) in app.panels.iter().enumerate() {
+            let is_selected = i == app.selected_panel;
+            draw_panel(frame, panel, panel_layout[i], is_selected, app.show_tokens);
+        }
+    }
+
+    // Draw footer with help
+    let help_text = if app.all_complete() {
+        "←/→: select panel | ↑/↓: scroll | q: quit"
+    } else {
+        "Loading... | q: quit"
+    };
+    let footer = Paragraph::new(help_text)
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(footer, main_layout[2]);
+}
+
+fn draw_panel(frame: &mut Frame, panel: &PanelState, area: Rect, is_selected: bool, show_tokens: bool) {
+    let color = panel.get_color();
+    let status = if panel.error.is_some() {
+        "error"
+    } else if panel.is_complete {
+        "complete"
+    } else {
+        "streaming..."
+    };
+
+    let title = format!(" {} [{}] ", panel.provider.display_name, status);
+
+    let mut border_style = Style::default().fg(color);
+    if is_selected {
+        border_style = border_style.add_modifier(Modifier::BOLD);
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style);
+
+    // Prepare content text
+    let content = if let Some(ref error) = panel.error {
+        Text::styled(format!("Error: {}", error), Style::default().fg(Color::Red))
+    } else {
+        Text::raw(&panel.text)
+    };
+
+    // Add token info if showing
+    let mut lines: Vec<Line> = content.lines.clone();
+    if show_tokens && panel.is_complete {
+        if let (Some(input), Some(output)) = (panel.input_tokens, panel.output_tokens) {
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                format!("tokens: {} in / {} out", input, output),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+
+    let text = Text::from(lines);
+    let paragraph = Paragraph::new(text)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((panel.scroll_offset, 0));
+
+    frame.render_widget(paragraph, area);
+}
+
+pub async fn run_tui(
+    manager: Arc<ProviderManager>,
+    providers: Vec<Provider>,
+    question: &str,
+    system_prompt: Option<&str>,
+    show_tokens: bool,
+) -> Result<()> {
+    // Check if we have a proper terminal
+    use std::io::IsTerminal;
+    if !io::stdout().is_terminal() {
+        anyhow::bail!("TUI mode requires an interactive terminal. Use default streaming mode instead.");
+    }
+
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Create app state
+    let mut app = App::new(providers.clone(), question, show_tokens);
+
+    // Start streaming
+    let rx = crate::query::stream_all(
+        manager,
+        providers,
+        question,
+        system_prompt,
+    )
+    .await;
+
+    // Run the main loop
+    let result = run_main_loop(&mut terminal, &mut app, rx).await;
+
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+async fn run_main_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+    mut rx: mpsc::Receiver<StreamEvent>,
+) -> Result<()> {
+    loop {
+        // Draw UI
+        terminal.draw(|frame| draw_ui(frame, app))?;
+
+        // Poll for events with a short timeout
+        if event::poll(std::time::Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Left | KeyCode::Char('h') => app.prev_panel(),
+                        KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => app.next_panel(),
+                        KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
+                        KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Try to receive stream events
+        while let Ok(event) = rx.try_recv() {
+            app.handle_event(event);
+        }
+    }
+}

@@ -1,0 +1,39 @@
+[package]
+name = "ai-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-provider AI CLI - query Grok, ChatGPT, Gemini, Claude simultaneously"
+authors = ["Cole Tebou"]
+
+[[bin]]
+name = "ai"
+path = "src/main.rs"
+
+[dependencies]
+# AI Provider Client
+genai = "0.5"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async Runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# Error Handling
+anyhow = "1"
+
+# Config & Serialization
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+
+# Terminal Output
+colored = "2"
+
+# Async Streaming
+tokio-stream = "0.1"

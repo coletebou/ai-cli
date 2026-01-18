@@ -18,7 +18,11 @@ use std::sync::Arc;
 #[command(author = "Cole Tebou")]
 struct Cli {
     /// The question to ask
-    question: String,
+    question: Option<String>,
+
+    /// Generate default config file at ~/.config/ai-cli/config.toml
+    #[arg(long)]
+    init: bool,
 
     /// Providers to query (comma-separated, e.g., claude,gpt,grok,gemini)
     #[arg(short, long, value_delimiter = ',')]
@@ -56,6 +60,17 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Handle --init flag
+    if cli.init {
+        Config::init()?;
+        return Ok(());
+    }
+
+    // Require question if not --init
+    let question = cli.question.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("Missing required argument: <QUESTION>\n\nUsage: ai <QUESTION>\n       ai --init")
+    })?;
 
     // Load configuration
     let config = Config::load()?;
@@ -117,7 +132,7 @@ async fn main() -> Result<()> {
         crate::ui::run_tui(
             manager,
             providers_to_query,
-            &cli.question,
+            question,
             system_prompt,
             show_tokens,
             reasoning_effort,
@@ -128,7 +143,7 @@ async fn main() -> Result<()> {
         let rx = query::stream_all(
             Arc::clone(&manager),
             providers_to_query.clone(),
-            &cli.question,
+            question,
             system_prompt,
             reasoning_effort,
         )
@@ -140,7 +155,7 @@ async fn main() -> Result<()> {
         let responses = query::query_all(
             Arc::clone(&manager),
             providers_to_query,
-            &cli.question,
+            question,
             system_prompt,
             reasoning_effort,
         )

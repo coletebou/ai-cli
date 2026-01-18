@@ -13,7 +13,7 @@ pub struct Config {
     pub providers: HashMap<String, ProviderConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefaultConfig {
     #[serde(default = "default_providers")]
     pub providers: Vec<String>,
@@ -22,6 +22,17 @@ pub struct DefaultConfig {
     #[serde(default = "default_true")]
     pub show_tokens: bool,
     pub system_prompt: Option<String>,
+}
+
+impl Default for DefaultConfig {
+    fn default() -> Self {
+        Self {
+            providers: default_providers(),
+            stream: true,
+            show_tokens: true,
+            system_prompt: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +188,37 @@ impl Config {
         } else {
             Ok(Config::default())
         }
+    }
+
+    /// Generate default config file
+    pub fn init() -> Result<()> {
+        let config_path = Self::config_path();
+
+        if config_path.exists() {
+            eprintln!("Config file already exists: {:?}", config_path);
+            eprintln!("Remove it first if you want to regenerate.");
+            std::process::exit(1);
+        }
+
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create config directory: {:?}", parent))?;
+        }
+
+        let config = Config::default();
+        let content = toml::to_string_pretty(&config)
+            .with_context(|| "Failed to serialize config")?;
+        fs::write(&config_path, &content)
+            .with_context(|| format!("Failed to write config file: {:?}", config_path))?;
+
+        println!("Created config file: {:?}", config_path);
+        println!("\nYou can now customize your settings:");
+        println!("  - Set default providers");
+        println!("  - Change default models");
+        println!("  - Add a default system prompt");
+        println!("  - Configure API keys (or use environment variables)");
+
+        Ok(())
     }
 
     pub fn get_api_key(&self, provider_name: &str) -> Option<String> {

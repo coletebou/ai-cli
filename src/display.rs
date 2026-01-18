@@ -1,22 +1,40 @@
 use crate::providers::{Provider, ProviderResponse};
 use crate::query::StreamEvent;
 use colored::Colorize;
+use crossterm::terminal;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use tokio::sync::mpsc;
 
-const SEPARATOR: &str = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
+fn get_terminal_width() -> usize {
+    terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
+}
+
+fn make_separator(width: usize) -> String {
+    "━".repeat(width.min(120)) // Cap at 120 to avoid excessive width
+}
 
 pub fn print_header(provider: &Provider, status: &str) {
+    let width = get_terminal_width();
+    let separator = make_separator(width);
+
     let header = format!(" {} ", provider.display_name);
     let status_str = format!("[{}]", status);
-    let padding = SEPARATOR.len().saturating_sub(header.len() + status_str.len() + 2);
-    let padded_header = format!("{}{:>width$}", header, status_str, width = padding + status_str.len());
+
+    // Calculate padding, ensuring we don't overflow on narrow terminals
+    let content_len = header.len() + status_str.len();
+    let padded_header = if content_len + 2 <= width {
+        let padding = width.saturating_sub(content_len + 2);
+        format!("{}{:>width$}", header, status_str, width = padding + status_str.len())
+    } else {
+        // Narrow terminal: just show provider name and status without padding
+        format!("{} {}", header.trim(), status_str)
+    };
 
     println!();
-    println!("{}", SEPARATOR.color(provider.color));
+    println!("{}", separator.color(provider.color));
     println!("{}", padded_header.color(provider.color).bold());
-    println!("{}", SEPARATOR.color(provider.color));
+    println!("{}", separator.color(provider.color));
 }
 
 pub fn format_reasoning(reasoning: Option<&str>) -> String {
@@ -169,15 +187,23 @@ impl StreamingDisplay {
         match event {
             StreamEvent::Start { provider, .. } => {
                 let color = self.get_color(&provider);
+                let width = get_terminal_width();
+                let separator = make_separator(width);
+
                 let header = format!(" {} ", provider);
                 let status_str = "[streaming]";
-                let padding = SEPARATOR.len().saturating_sub(header.len() + status_str.len() + 2);
-                let padded_header = format!("{}{:>width$}", header, status_str, width = padding + status_str.len());
+                let content_len = header.len() + status_str.len();
+                let padded_header = if content_len + 2 <= width {
+                    let padding = width.saturating_sub(content_len + 2);
+                    format!("{}{:>width$}", header, status_str, width = padding + status_str.len())
+                } else {
+                    format!("{} {}", header.trim(), status_str)
+                };
 
                 println!();
-                println!("{}", SEPARATOR.color(color));
+                println!("{}", separator.color(color));
                 println!("{}", padded_header.color(color).bold());
-                println!("{}", SEPARATOR.color(color));
+                println!("{}", separator.color(color));
 
                 self.current_provider = Some(provider);
             }
@@ -218,15 +244,23 @@ impl StreamingDisplay {
 
                 // If we haven't printed a header for this provider yet
                 if self.current_provider.as_ref() != Some(&provider) {
+                    let width = get_terminal_width();
+                    let separator = make_separator(width);
+
                     let header = format!(" {} ", provider);
                     let status_str = "[error]";
-                    let padding = SEPARATOR.len().saturating_sub(header.len() + status_str.len() + 2);
-                    let padded_header = format!("{}{:>width$}", header, status_str, width = padding + status_str.len());
+                    let content_len = header.len() + status_str.len();
+                    let padded_header = if content_len + 2 <= width {
+                        let padding = width.saturating_sub(content_len + 2);
+                        format!("{}{:>width$}", header, status_str, width = padding + status_str.len())
+                    } else {
+                        format!("{} {}", header.trim(), status_str)
+                    };
 
                     println!();
-                    println!("{}", SEPARATOR.color(color));
+                    println!("{}", separator.color(color));
                     println!("{}", padded_header.color(color).bold());
-                    println!("{}", SEPARATOR.color(color));
+                    println!("{}", separator.color(color));
                 }
 
                 println!("{} {}", "Error:".red().bold(), error.red());

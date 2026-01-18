@@ -89,24 +89,28 @@ async fn main() -> Result<()> {
     let show_tokens = !cli.no_tokens && config.default.show_tokens;
     let stream = !cli.no_stream && config.default.stream;
 
-    // Parse reasoning effort
-    let reasoning_effort = cli.reasoning.as_ref().map(|r| {
-        match r.to_lowercase().as_str() {
-            "none" | "off" | "0" => ReasoningEffort::None,
-            "low" | "l" | "1" => ReasoningEffort::Low,
-            "medium" | "med" | "m" | "2" => ReasoningEffort::Medium,
-            "high" | "h" | "3" => ReasoningEffort::High,
-            s => {
-                // Try to parse as a budget number
-                if let Ok(budget) = s.parse::<u32>() {
-                    ReasoningEffort::Budget(budget)
-                } else {
-                    eprintln!("Warning: Unknown reasoning level '{}', using Medium", s);
-                    ReasoningEffort::Medium
+    // Parse reasoning effort and get display string
+    let (reasoning_effort, reasoning_str) = match cli.reasoning.as_ref() {
+        Some(r) => {
+            let (effort, display) = match r.to_lowercase().as_str() {
+                "none" | "off" | "0" => (ReasoningEffort::None, "none"),
+                "low" | "l" | "1" => (ReasoningEffort::Low, "low"),
+                "medium" | "med" | "m" | "2" => (ReasoningEffort::Medium, "medium"),
+                "high" | "h" | "3" => (ReasoningEffort::High, "high"),
+                s => {
+                    // Try to parse as a budget number
+                    if let Ok(budget) = s.parse::<u32>() {
+                        (ReasoningEffort::Budget(budget), "budget")
+                    } else {
+                        eprintln!("Warning: Unknown reasoning level '{}', using Medium", s);
+                        (ReasoningEffort::Medium, "medium")
+                    }
                 }
-            }
+            };
+            (Some(effort), Some(display.to_string()))
         }
-    });
+        None => (None, None), // Default: no reasoning specified
+    };
 
     if cli.tui {
         // Phase 2: TUI mode
@@ -130,7 +134,7 @@ async fn main() -> Result<()> {
         )
         .await;
 
-        display::display_streaming(rx, &providers_to_query, show_tokens, cli.raw).await;
+        display::display_streaming(rx, &providers_to_query, show_tokens, cli.raw, reasoning_str.clone()).await;
     } else {
         // Non-streaming mode
         let responses = query::query_all(
@@ -145,7 +149,7 @@ async fn main() -> Result<()> {
         if cli.raw {
             display::print_raw_responses(&responses);
         } else {
-            display::print_responses(&responses, show_tokens);
+            display::print_responses(&responses, show_tokens, reasoning_str.as_deref());
         }
     }
 

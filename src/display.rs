@@ -19,12 +19,17 @@ pub fn print_header(provider: &Provider, status: &str) {
     println!("{}", SEPARATOR.color(provider.color));
 }
 
+pub fn format_reasoning(reasoning: Option<&str>) -> String {
+    reasoning.unwrap_or("none").to_string()
+}
+
 pub fn print_metadata(
     model: &str,
     input_tokens: Option<i32>,
     output_tokens: Option<i32>,
     duration_ms: u64,
     show_tokens: bool,
+    reasoning: Option<&str>,
 ) {
     println!();
     let mut parts = vec![format!("model: {}", model)];
@@ -43,6 +48,9 @@ pub fn print_metadata(
     };
     parts.push(format!("time: {}", duration_str));
 
+    // Add reasoning level
+    parts.push(format!("reasoning: {}", format_reasoning(reasoning)));
+
     let metadata = parts.join(" | ");
     println!("{}", metadata.dimmed());
     println!();
@@ -52,11 +60,11 @@ pub fn print_error(error: &str) {
     println!("{} {}", "Error:".red().bold(), error.red());
 }
 
-pub fn print_response(response: &ProviderResponse, show_tokens: bool) {
+pub fn print_response(response: &ProviderResponse, show_tokens: bool, reasoning: Option<&str>) {
     if response.is_error() {
         print_header(&response.provider, "error");
         print_error(response.error.as_ref().unwrap());
-        print_metadata(&response.model, None, None, response.duration_ms, false);
+        print_metadata(&response.model, None, None, response.duration_ms, false, reasoning);
     } else {
         print_header(&response.provider, "complete");
         println!("{}", response.text);
@@ -66,13 +74,14 @@ pub fn print_response(response: &ProviderResponse, show_tokens: bool) {
             response.output_tokens,
             response.duration_ms,
             show_tokens,
+            reasoning,
         );
     }
 }
 
-pub fn print_responses(responses: &[ProviderResponse], show_tokens: bool) {
+pub fn print_responses(responses: &[ProviderResponse], show_tokens: bool, reasoning: Option<&str>) {
     for response in responses {
-        print_response(response, show_tokens);
+        print_response(response, show_tokens, reasoning);
     }
 }
 
@@ -94,10 +103,11 @@ pub struct StreamingDisplay {
     provider_colors: HashMap<String, colored::Color>,
     show_tokens: bool,
     raw_mode: bool,
+    reasoning: Option<String>,
 }
 
 impl StreamingDisplay {
-    pub fn new(providers: &[Provider], show_tokens: bool, raw_mode: bool) -> Self {
+    pub fn new(providers: &[Provider], show_tokens: bool, raw_mode: bool, reasoning: Option<String>) -> Self {
         let provider_colors: HashMap<String, colored::Color> = providers
             .iter()
             .map(|p| (p.display_name.clone(), p.color))
@@ -108,6 +118,7 @@ impl StreamingDisplay {
             provider_colors,
             show_tokens,
             raw_mode,
+            reasoning,
         }
     }
 
@@ -146,7 +157,7 @@ impl StreamingDisplay {
                     format!("{}ms", duration_ms)
                 };
                 println!();
-                println!("[model: {} | time: {}]", model, duration_str);
+                println!("[model: {} | time: {} | reasoning: {}]", model, duration_str, format_reasoning(self.reasoning.as_deref()));
             }
             StreamEvent::Error { provider, error, .. } => {
                 eprintln!("[{}] Error: {}", provider, error);
@@ -196,6 +207,7 @@ impl StreamingDisplay {
                     format!("{}ms", duration_ms)
                 };
                 parts.push(format!("time: {}", duration_str));
+                parts.push(format!("reasoning: {}", format_reasoning(self.reasoning.as_deref())));
 
                 let metadata = parts.join(" | ");
                 println!("{}", metadata.dimmed());
@@ -235,8 +247,9 @@ pub async fn display_streaming(
     providers: &[Provider],
     show_tokens: bool,
     raw_mode: bool,
+    reasoning: Option<String>,
 ) {
-    let mut display = StreamingDisplay::new(providers, show_tokens, raw_mode);
+    let mut display = StreamingDisplay::new(providers, show_tokens, raw_mode, reasoning);
 
     while let Some(event) = rx.recv().await {
         display.handle_event(event);

@@ -28,6 +28,8 @@ pub struct PanelState {
     pub is_complete: bool,
     pub error: Option<String>,
     pub scroll_offset: u16,
+    pub content_height: u16,  // Total lines of content (with wrapping)
+    pub visible_height: u16,  // Visible area height
 }
 
 impl PanelState {
@@ -43,7 +45,13 @@ impl PanelState {
             is_complete: false,
             error: None,
             scroll_offset: 0,
+            content_height: 0,
+            visible_height: 0,
         }
+    }
+
+    pub fn max_scroll(&self) -> u16 {
+        self.content_height.saturating_sub(self.visible_height)
     }
 
     pub fn append(&mut self, text: &str) {
@@ -151,12 +159,15 @@ impl App {
 
     pub fn scroll_down(&mut self) {
         if let Some(panel) = self.panels.get_mut(self.selected_panel) {
-            panel.scroll_offset = panel.scroll_offset.saturating_add(1);
+            let max = panel.max_scroll();
+            if panel.scroll_offset < max {
+                panel.scroll_offset = panel.scroll_offset.saturating_add(1);
+            }
         }
     }
 }
 
-fn draw_ui(frame: &mut Frame, app: &App) {
+fn draw_ui(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
 
     // Main layout: header, content, footer
@@ -191,9 +202,11 @@ fn draw_ui(frame: &mut Frame, app: &App) {
             .constraints(constraints)
             .split(main_layout[1]);
 
-        for (i, panel) in app.panels.iter().enumerate() {
+        for i in 0..app.panels.len() {
             let is_selected = i == app.selected_panel;
-            draw_panel(frame, panel, panel_layout[i], is_selected, app.show_tokens);
+            let area = panel_layout[i];
+            let show_tokens = app.show_tokens;
+            draw_panel(frame, &mut app.panels[i], area, is_selected, show_tokens);
         }
     }
 
@@ -208,7 +221,7 @@ fn draw_ui(frame: &mut Frame, app: &App) {
     frame.render_widget(footer, main_layout[2]);
 }
 
-fn draw_panel(frame: &mut Frame, panel: &PanelState, area: Rect, is_selected: bool, show_tokens: bool) {
+fn draw_panel(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_selected: bool, show_tokens: bool) {
     let color = panel.get_color();
     let status = if panel.error.is_some() {
         "error"
@@ -263,7 +276,34 @@ fn draw_panel(frame: &mut Frame, panel: &PanelState, area: Rect, is_selected: bo
         ));
     }
 
-    let text = Text::from(lines);
+    let text = Text::from(lines.clone());
+
+    // Calculate content height with wrapping
+    // Inner area is area minus borders (2 for top/bottom, 2 for left/right)
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2);
+
+    // Count wrapped lines
+    let mut total_lines: u16 = 0;
+    for line in &lines {
+        let line_len = line.width();
+        if inner_width > 0 && line_len > 0 {
+            total_lines += ((line_len + inner_width - 1) / inner_width) as u16;
+        } else {
+            total_lines += 1;
+        }
+    }
+
+    // Update panel dimensions for scroll bounds
+    panel.content_height = total_lines;
+    panel.visible_height = inner_height;
+
+    // Clamp scroll offset if content shrank
+    let max_scroll = panel.max_scroll();
+    if panel.scroll_offset > max_scroll {
+        panel.scroll_offset = max_scroll;
+    }
+
     let paragraph = Paragraph::new(text)
         .block(block)
         .wrap(Wrap { trim: false })

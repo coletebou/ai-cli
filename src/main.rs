@@ -7,6 +7,7 @@ mod ui;
 use anyhow::Result;
 use clap::Parser;
 use config::Config;
+use genai::chat::ReasoningEffort;
 use providers::ProviderManager;
 use std::sync::Arc;
 
@@ -46,6 +47,10 @@ struct Cli {
     /// Side-by-side TUI display (Phase 2)
     #[arg(short = 't', long)]
     tui: bool,
+
+    /// Reasoning effort level (none, low, medium, high, or a number for budget)
+    #[arg(short = 'r', long)]
+    reasoning: Option<String>,
 }
 
 #[tokio::main]
@@ -84,6 +89,25 @@ async fn main() -> Result<()> {
     let show_tokens = !cli.no_tokens && config.default.show_tokens;
     let stream = !cli.no_stream && config.default.stream;
 
+    // Parse reasoning effort
+    let reasoning_effort = cli.reasoning.as_ref().map(|r| {
+        match r.to_lowercase().as_str() {
+            "none" | "off" | "0" => ReasoningEffort::None,
+            "low" | "l" | "1" => ReasoningEffort::Low,
+            "medium" | "med" | "m" | "2" => ReasoningEffort::Medium,
+            "high" | "h" | "3" => ReasoningEffort::High,
+            s => {
+                // Try to parse as a budget number
+                if let Ok(budget) = s.parse::<u32>() {
+                    ReasoningEffort::Budget(budget)
+                } else {
+                    eprintln!("Warning: Unknown reasoning level '{}', using Medium", s);
+                    ReasoningEffort::Medium
+                }
+            }
+        }
+    });
+
     if cli.tui {
         // Phase 2: TUI mode
         crate::ui::run_tui(
@@ -92,6 +116,7 @@ async fn main() -> Result<()> {
             &cli.question,
             system_prompt,
             show_tokens,
+            reasoning_effort,
         )
         .await?;
     } else if stream {
@@ -101,6 +126,7 @@ async fn main() -> Result<()> {
             providers_to_query.clone(),
             &cli.question,
             system_prompt,
+            reasoning_effort,
         )
         .await;
 
@@ -112,6 +138,7 @@ async fn main() -> Result<()> {
             providers_to_query,
             &cli.question,
             system_prompt,
+            reasoning_effort,
         )
         .await;
 

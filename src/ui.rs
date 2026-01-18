@@ -278,6 +278,7 @@ pub async fn run_tui(
     question: &str,
     system_prompt: Option<&str>,
     show_tokens: bool,
+    reasoning_effort: Option<genai::chat::ReasoningEffort>,
 ) -> Result<()> {
     // Check if we have a proper terminal
     use std::io::IsTerminal;
@@ -301,6 +302,7 @@ pub async fn run_tui(
         providers,
         question,
         system_prompt,
+        reasoning_effort,
     )
     .await;
 

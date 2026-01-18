@@ -1,7 +1,7 @@
 use crate::providers::{Provider, ProviderManager, ProviderResponse};
 use futures::future::join_all;
 use futures::StreamExt as FuturesStreamExt;
-use genai::chat::{ChatMessage, ChatStreamEvent};
+use genai::chat::{ChatMessage, ChatOptions, ChatStreamEvent, ReasoningEffort};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -25,6 +25,7 @@ pub async fn query_single(
     provider: &Provider,
     question: &str,
     system_prompt: Option<&str>,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> ProviderResponse {
     let start = Instant::now();
     let model = provider.model.clone();
@@ -36,7 +37,10 @@ pub async fn query_single(
     }
     messages.push(ChatMessage::user(question));
 
-    match manager.exec_chat(&provider.model, messages, None).await {
+    // Build chat options with reasoning effort if specified
+    let options = reasoning_effort.map(|r| ChatOptions::default().with_reasoning_effort(r));
+
+    match manager.exec_chat(&provider.model, messages, options.as_ref()).await {
         Ok(response) => {
             let duration_ms = start.elapsed().as_millis() as u64;
             let text = response.first_text().unwrap_or_default().to_string();
@@ -56,11 +60,13 @@ pub async fn query_all(
     providers: Vec<Provider>,
     question: &str,
     system_prompt: Option<&str>,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> Vec<ProviderResponse> {
     let futures = providers.into_iter().map(|provider| {
         let manager = Arc::clone(&manager);
         let question = question.to_string();
         let system_prompt = system_prompt.map(|s| s.to_string());
+        let reasoning = reasoning_effort.clone();
 
         async move {
             query_single(
@@ -68,6 +74,7 @@ pub async fn query_all(
                 &provider,
                 &question,
                 system_prompt.as_deref(),
+                reasoning,
             )
             .await
         }
@@ -81,6 +88,7 @@ pub async fn stream_single(
     provider: &Provider,
     question: &str,
     system_prompt: Option<&str>,
+    reasoning_effort: Option<ReasoningEffort>,
     tx: mpsc::Sender<StreamEvent>,
 ) {
     let start = Instant::now();
@@ -93,13 +101,16 @@ pub async fn stream_single(
     }
     messages.push(ChatMessage::user(question));
 
+    // Build chat options with reasoning effort if specified
+    let options = reasoning_effort.map(|r| ChatOptions::default().with_reasoning_effort(r));
+
     // Send start event
     let _ = tx.send(StreamEvent::Start {
         provider: provider_name.clone(),
         model: model.clone(),
     }).await;
 
-    match manager.exec_chat_stream(&provider.model, messages, None).await {
+    match manager.exec_chat_stream(&provider.model, messages, options.as_ref()).await {
         Ok(response) => {
             let mut input_tokens: Option<i32> = None;
             let mut output_tokens: Option<i32> = None;
@@ -167,6 +178,7 @@ pub async fn stream_all(
     providers: Vec<Provider>,
     question: &str,
     system_prompt: Option<&str>,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> mpsc::Receiver<StreamEvent> {
     let (tx, rx) = mpsc::channel(100);
 
@@ -174,6 +186,7 @@ pub async fn stream_all(
         let manager = Arc::clone(&manager);
         let question = question.to_string();
         let system_prompt = system_prompt.map(|s| s.to_string());
+        let reasoning = reasoning_effort.clone();
         let tx = tx.clone();
 
         tokio::spawn(async move {
@@ -182,6 +195,7 @@ pub async fn stream_all(
                 &provider,
                 &question,
                 system_prompt.as_deref(),
+                reasoning,
                 tx,
             )
             .await;

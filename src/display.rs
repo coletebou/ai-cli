@@ -3,9 +3,22 @@ use crate::providers::{Provider, ProviderResponse};
 use crate::query::StreamEvent;
 use colored::Colorize;
 use crossterm::terminal;
-use std::collections::HashMap;
 use std::io::{self, Write};
+use termimad::MadSkin;
 use tokio::sync::mpsc;
+
+fn get_markdown_skin() -> MadSkin {
+    let mut skin = MadSkin::default();
+    skin.set_headers_fg(termimad::crossterm::style::Color::Cyan);
+    skin.bold.set_fg(termimad::crossterm::style::Color::White);
+    skin.italic.set_fg(termimad::crossterm::style::Color::White);
+    skin
+}
+
+fn render_markdown(text: &str) {
+    let skin = get_markdown_skin();
+    skin.print_text(text);
+}
 
 fn get_terminal_width() -> usize {
     terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
@@ -101,7 +114,7 @@ pub fn print_response(response: &ProviderResponse, footer: &FooterConfig, reason
         print_metadata(&response.model, None, None, response.duration_ms, &error_footer, reasoning);
     } else {
         print_header(&response.provider, "complete");
-        println!("{}", response.text);
+        render_markdown(&response.text);
         print_metadata(
             &response.model,
             response.input_tokens,
@@ -132,35 +145,37 @@ pub fn print_raw_responses(responses: &[ProviderResponse]) {
     }
 }
 
+/// Tracks buffered state for a single provider during streaming
+struct ProviderBuffer {
+    color: colored::Color,
+    content: String,
+}
+
 pub struct StreamingDisplay {
-    current_provider: Option<String>,
-    provider_colors: HashMap<String, colored::Color>,
     footer: FooterConfig,
     raw_mode: bool,
     reasoning: Option<String>,
+    // Buffer content per provider until completion
+    provider_buffers: std::collections::HashMap<String, ProviderBuffer>,
+    // Provider colors lookup
+    provider_colors: std::collections::HashMap<String, colored::Color>,
 }
 
 impl StreamingDisplay {
     pub fn new(providers: &[Provider], footer: FooterConfig, raw_mode: bool, reasoning: Option<String>) -> Self {
-        let provider_colors: HashMap<String, colored::Color> = providers
+        // Build lookup map for provider colors
+        let provider_colors: std::collections::HashMap<String, colored::Color> = providers
             .iter()
             .map(|p| (p.display_name.clone(), p.color))
             .collect();
 
         StreamingDisplay {
-            current_provider: None,
-            provider_colors,
             footer,
             raw_mode,
             reasoning,
+            provider_buffers: std::collections::HashMap::new(),
+            provider_colors,
         }
-    }
-
-    fn get_color(&self, provider: &str) -> colored::Color {
-        self.provider_colors
-            .get(provider)
-            .copied()
-            .unwrap_or(colored::Color::White)
     }
 
     pub fn handle_event(&mut self, event: StreamEvent) {
@@ -174,11 +189,7 @@ impl StreamingDisplay {
     fn handle_event_raw(&mut self, event: StreamEvent) {
         match event {
             StreamEvent::Start { provider, .. } => {
-                if self.current_provider.is_some() {
-                    println!("\n\n---\n");
-                }
                 println!("[{}]", provider);
-                self.current_provider = Some(provider);
             }
             StreamEvent::Chunk { text, .. } => {
                 print!("{}", text);
@@ -202,12 +213,38 @@ impl StreamingDisplay {
     fn handle_event_formatted(&mut self, event: StreamEvent) {
         match event {
             StreamEvent::Start { provider, .. } => {
-                let color = self.get_color(&provider);
+                // Buffer provider info - don't print header yet
+                let color = self.provider_colors.get(&provider).copied().unwrap_or(colored::Color::White);
+                self.provider_buffers.insert(provider, ProviderBuffer {
+                    color,
+                    content: String::new(),
+                });
+            }
+            StreamEvent::Chunk { provider, text } => {
+                // Buffer content for this provider
+                if let Some(buffer) = self.provider_buffers.get_mut(&provider) {
+                    buffer.content.push_str(&text);
+                }
+            }
+            StreamEvent::Done {
+                provider,
+                model,
+                input_tokens,
+                output_tokens,
+                duration_ms,
+            } => {
+                // Get buffered content and display complete response
+                let (content, color) = if let Some(buffer) = self.provider_buffers.remove(&provider) {
+                    (buffer.content, buffer.color)
+                } else {
+                    (String::new(), colored::Color::White)
+                };
+
+                // Print header
                 let width = get_terminal_width();
                 let separator = make_separator(width);
-
                 let header = format!(" {} ", provider);
-                let status_str = "[streaming]";
+                let status_str = "[complete]";
                 let content_len = header.len() + status_str.len();
                 let padded_header = if content_len + 2 <= width {
                     let padding = width.saturating_sub(content_len + 2);
@@ -221,20 +258,13 @@ impl StreamingDisplay {
                 println!("{}", padded_header.color(color).bold());
                 println!("{}", separator.color(color));
 
-                self.current_provider = Some(provider);
-            }
-            StreamEvent::Chunk { text, .. } => {
-                print!("{}", text);
-                let _ = io::stdout().flush();
-            }
-            StreamEvent::Done {
-                model,
-                input_tokens,
-                output_tokens,
-                duration_ms,
-                ..
-            } => {
-                println!();
+                // Print content
+                if !content.is_empty() {
+                    let skin = get_markdown_skin();
+                    skin.print_text(&content);
+                }
+
+                // Print metadata footer
                 let mut parts = Vec::new();
 
                 if self.footer.show_model {
@@ -264,31 +294,30 @@ impl StreamingDisplay {
                     let metadata = parts.join(" | ");
                     println!("{}", metadata.dimmed());
                 }
-                println!();
             }
             StreamEvent::Error { provider, model, error, duration_ms } => {
-                let color = self.get_color(&provider);
+                // Remove any buffered content for this provider
+                let color = self.provider_buffers.remove(&provider)
+                    .map(|b| b.color)
+                    .unwrap_or_else(|| self.provider_colors.get(&provider).copied().unwrap_or(colored::Color::White));
 
-                // If we haven't printed a header for this provider yet
-                if self.current_provider.as_ref() != Some(&provider) {
-                    let width = get_terminal_width();
-                    let separator = make_separator(width);
+                let width = get_terminal_width();
+                let separator = make_separator(width);
 
-                    let header = format!(" {} ", provider);
-                    let status_str = "[error]";
-                    let content_len = header.len() + status_str.len();
-                    let padded_header = if content_len + 2 <= width {
-                        let padding = width.saturating_sub(content_len + 2);
-                        format!("{}{:>width$}", header, status_str, width = padding + status_str.len())
-                    } else {
-                        format!("{} {}", header.trim(), status_str)
-                    };
+                let header = format!(" {} ", provider);
+                let status_str = "[error]";
+                let content_len = header.len() + status_str.len();
+                let padded_header = if content_len + 2 <= width {
+                    let padding = width.saturating_sub(content_len + 2);
+                    format!("{}{:>width$}", header, status_str, width = padding + status_str.len())
+                } else {
+                    format!("{} {}", header.trim(), status_str)
+                };
 
-                    println!();
-                    println!("{}", separator.color(color));
-                    println!("{}", padded_header.color(color).bold());
-                    println!("{}", separator.color(color));
-                }
+                println!();
+                println!("{}", separator.color(color));
+                println!("{}", padded_header.color(color).bold());
+                println!("{}", separator.color(color));
 
                 println!("{} {}", "Error:".red().bold(), error.red());
                 let duration_str = if duration_ms >= 1000 {
@@ -297,7 +326,6 @@ impl StreamingDisplay {
                     format!("{}ms", duration_ms)
                 };
                 println!("{}", format!("model: {} | time: {}", model, duration_str).dimmed());
-                println!();
             }
         }
     }

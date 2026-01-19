@@ -143,8 +143,8 @@ async fn main() -> Result<()> {
             reasoning_effort,
         )
         .await?;
-    } else if stream {
-        // Streaming mode (default)
+    } else if stream && providers_to_query.len() == 1 {
+        // Streaming mode - only for single provider to avoid interleaved output
         let rx = query::stream_all(
             Arc::clone(&manager),
             providers_to_query.clone(),

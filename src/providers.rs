@@ -1,4 +1,4 @@
-use crate::config::{Config, ProviderConfig};
+use crate::config::{Config, ModelTier, ProviderConfig};
 use anyhow::{Context, Result};
 use colored::Color;
 use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatStreamResponse};
@@ -15,7 +15,7 @@ pub struct Provider {
 }
 
 impl Provider {
-    pub fn from_config(name: &str, config: &ProviderConfig) -> Self {
+    pub fn from_config(name: &str, config: &ProviderConfig, tier: &ModelTier) -> Self {
         let display_name = config
             .aliases
             .first()
@@ -34,9 +34,12 @@ impl Provider {
             _ => Color::White,
         };
 
+        // Select model based on tier
+        let model = config.get_model(tier).to_string();
+
         Provider {
             display_name,
-            model: config.default_model.clone(),
+            model,
             color,
         }
     }
@@ -46,10 +49,12 @@ pub struct ProviderManager {
     client: Client,
     config: Arc<Config>,
     providers: HashMap<String, Provider>,
+    #[allow(dead_code)]
+    model_tier: ModelTier,
 }
 
 impl ProviderManager {
-    pub fn new(config: Config) -> Result<Self> {
+    pub fn new(config: Config, model_tier: ModelTier) -> Result<Self> {
         let config = Arc::new(config);
         let config_clone = Arc::clone(&config);
 
@@ -102,7 +107,7 @@ impl ProviderManager {
         // Build provider map
         let mut providers = HashMap::new();
         for (name, provider_config) in &config.providers {
-            let provider = Provider::from_config(name, provider_config);
+            let provider = Provider::from_config(name, provider_config, &model_tier);
             providers.insert(name.clone(), provider);
         }
 
@@ -110,6 +115,7 @@ impl ProviderManager {
             client,
             config,
             providers,
+            model_tier,
         })
     }
 

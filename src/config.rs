@@ -7,12 +7,73 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// CLI mode settings (non-TUI)
+    #[serde(default)]
+    pub cli: ModeConfig,
+    /// TUI mode settings
+    #[serde(default)]
+    pub tui_mode: ModeConfig,
+    /// Legacy mode config - migrated to cli on load
+    #[serde(default, skip_serializing)]
+    mode: Option<ModeConfig>,
     #[serde(default)]
     pub default: DefaultConfig,
     #[serde(default)]
     pub footer: FooterConfig,
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryMode {
+    #[default]
+    Single,
+    Multi,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelTier {
+    #[default]
+    Fast,
+    Smart,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModeConfig {
+    #[serde(default)]
+    pub default_mode: QueryMode,
+    #[serde(default = "default_single_provider")]
+    pub single_provider: String,
+    #[serde(default = "default_multi_providers")]
+    pub multi_providers: Vec<String>,
+    #[serde(default)]
+    pub model_tier: ModelTier,
+}
+
+impl Default for ModeConfig {
+    fn default() -> Self {
+        Self {
+            default_mode: QueryMode::Single,
+            single_provider: default_single_provider(),
+            multi_providers: default_multi_providers(),
+            model_tier: ModelTier::Fast,
+        }
+    }
+}
+
+fn default_single_provider() -> String {
+    "claude".to_string()
+}
+
+fn default_multi_providers() -> Vec<String> {
+    vec![
+        "claude".to_string(),
+        "gpt".to_string(),
+        "grok".to_string(),
+        "gemini".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,12 +127,34 @@ pub struct ProviderConfig {
     pub enabled: bool,
     pub api_key_env: Option<String>,
     pub api_key: Option<String>,
+    /// Legacy field - use fast_model/smart_model instead
+    #[serde(default)]
     pub default_model: String,
+    /// Model for fast tier (cheaper, faster responses)
+    pub fast_model: Option<String>,
+    /// Model for smart tier (better quality, slower)
+    pub smart_model: Option<String>,
     #[serde(default)]
     pub aliases: Vec<String>,
     #[serde(default = "default_color")]
     pub color: String,
     pub base_url: Option<String>,
+}
+
+impl ProviderConfig {
+    /// Get model for the specified tier, falling back to default_model
+    pub fn get_model(&self, tier: &ModelTier) -> &str {
+        match tier {
+            ModelTier::Fast => self
+                .fast_model
+                .as_deref()
+                .unwrap_or(&self.default_model),
+            ModelTier::Smart => self
+                .smart_model
+                .as_deref()
+                .unwrap_or(&self.default_model),
+        }
+    }
 }
 
 fn default_providers() -> Vec<String> {
@@ -102,6 +185,8 @@ impl Default for Config {
                 api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
                 api_key: None,
                 default_model: "claude-haiku-4-5".to_string(),
+                fast_model: Some("claude-haiku-4-5".to_string()),
+                smart_model: Some("claude-sonnet-4".to_string()),
                 aliases: vec!["claude".to_string()],
                 color: "magenta".to_string(),
                 base_url: None,
@@ -115,6 +200,8 @@ impl Default for Config {
                 api_key_env: Some("OPENAI_API_KEY".to_string()),
                 api_key: None,
                 default_model: "gpt-5.2".to_string(),
+                fast_model: Some("gpt-5.2".to_string()),
+                smart_model: Some("gpt-5.2".to_string()),
                 aliases: vec!["chatgpt".to_string(), "gpt".to_string()],
                 color: "green".to_string(),
                 base_url: None,
@@ -128,6 +215,8 @@ impl Default for Config {
                 api_key_env: Some("XAI_API_KEY".to_string()),
                 api_key: None,
                 default_model: "grok-4-1-fast-non-reasoning".to_string(),
+                fast_model: Some("grok-4-1-fast-non-reasoning".to_string()),
+                smart_model: Some("grok-4-1-fast-reasoning".to_string()),
                 aliases: vec!["grok".to_string()],
                 color: "blue".to_string(),
                 base_url: None,
@@ -140,7 +229,9 @@ impl Default for Config {
                 enabled: true,
                 api_key_env: Some("GEMINI_API_KEY".to_string()),
                 api_key: None,
-                default_model: "gemini-3-flash-preview".to_string(),
+                default_model: "gemini-2.5-flash-lite".to_string(),
+                fast_model: Some("gemini-2.5-flash-lite".to_string()),
+                smart_model: Some("gemini-3-pro-preview".to_string()),
                 aliases: vec!["gemini".to_string()],
                 color: "cyan".to_string(),
                 base_url: None,
@@ -154,6 +245,8 @@ impl Default for Config {
                 api_key_env: Some("GROQ_API_KEY".to_string()),
                 api_key: None,
                 default_model: "llama-3.3-70b-versatile".to_string(),
+                fast_model: Some("llama-3.3-70b-versatile".to_string()),
+                smart_model: Some("llama-3.3-70b-versatile".to_string()),
                 aliases: vec!["groq".to_string()],
                 color: "yellow".to_string(),
                 base_url: None,
@@ -167,6 +260,8 @@ impl Default for Config {
                 api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
                 api_key: None,
                 default_model: "deepseek-chat".to_string(),
+                fast_model: Some("deepseek-chat".to_string()),
+                smart_model: Some("deepseek-reasoner".to_string()),
                 aliases: vec!["deepseek".to_string(), "ds".to_string()],
                 color: "white".to_string(),
                 base_url: None,
@@ -180,6 +275,8 @@ impl Default for Config {
                 api_key_env: None,
                 api_key: None,
                 default_model: "llama3.2".to_string(),
+                fast_model: Some("llama3.2".to_string()),
+                smart_model: Some("llama3.2".to_string()),
                 aliases: vec!["ollama".to_string(), "local".to_string()],
                 color: "red".to_string(),
                 base_url: Some("http://localhost:11434".to_string()),
@@ -187,6 +284,12 @@ impl Default for Config {
         );
 
         Config {
+            cli: ModeConfig::default(),
+            tui_mode: ModeConfig {
+                default_mode: QueryMode::Multi, // TUI defaults to multi
+                ..ModeConfig::default()
+            },
+            mode: None,
             default: DefaultConfig::default(),
             footer: FooterConfig::default(),
             providers,
@@ -208,8 +311,24 @@ impl Config {
         if config_path.exists() {
             let content = fs::read_to_string(&config_path)
                 .with_context(|| format!("Failed to read config file: {:?}", config_path))?;
-            let config: Config = toml::from_str(&content)
+            let mut config: Config = toml::from_str(&content)
                 .with_context(|| "Failed to parse config file")?;
+
+            // Migrate legacy [mode] section to [cli]
+            if let Some(legacy_mode) = config.mode.take() {
+                // Only migrate if cli section is default
+                if config.cli == ModeConfig::default() {
+                    config.cli = legacy_mode.clone();
+                }
+                // Also migrate to tui_mode if it's default (but default to Multi for TUI)
+                if config.tui_mode == ModeConfig::default() {
+                    config.tui_mode = ModeConfig {
+                        default_mode: QueryMode::Multi,
+                        ..legacy_mode
+                    };
+                }
+            }
+
             Ok(config)
         } else {
             Ok(Config::default())
@@ -243,6 +362,23 @@ impl Config {
         println!("  - Change default models");
         println!("  - Add a default system prompt");
         println!("  - Configure API keys (or use environment variables)");
+
+        Ok(())
+    }
+
+    /// Save config to disk
+    pub fn save(&self) -> Result<()> {
+        let config_path = Self::config_path();
+
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create config directory: {:?}", parent))?;
+        }
+
+        let content = toml::to_string_pretty(self)
+            .with_context(|| "Failed to serialize config")?;
+        fs::write(&config_path, &content)
+            .with_context(|| format!("Failed to write config file: {:?}", config_path))?;
 
         Ok(())
     }

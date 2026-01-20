@@ -1,11 +1,12 @@
 mod config;
+mod config_ui;
 mod display;
 mod providers;
 mod query;
 mod ui;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use config::Config;
 use genai::chat::ReasoningEffort;
 use providers::ProviderManager;
@@ -19,6 +20,9 @@ use std::sync::Arc;
 struct Cli {
     /// The question to ask
     question: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
 
     /// Generate default config file at ~/.config/ai-cli/config.toml
     #[arg(long)]
@@ -61,9 +65,22 @@ struct Cli {
     reasoning: Option<String>,
 }
 
+#[derive(Subcommand)]
+enum Command {
+    /// Open the TUI config editor
+    Config,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Handle subcommands
+    if let Some(command) = cli.command {
+        return match command {
+            Command::Config => config_ui::run_config_ui().await,
+        };
+    }
 
     // Handle --init flag
     if cli.init {

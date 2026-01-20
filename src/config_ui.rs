@@ -13,6 +13,7 @@ use std::io::stdout;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Section {
+    General,
     CliMode,
     TuiMode,
     Display,
@@ -22,6 +23,7 @@ enum Section {
 impl Section {
     fn title(&self) -> &str {
         match self {
+            Section::General => "General",
             Section::CliMode => "CLI Mode",
             Section::TuiMode => "TUI Mode",
             Section::Display => "Display",
@@ -30,15 +32,16 @@ impl Section {
     }
 
     fn all() -> Vec<Section> {
-        vec![Section::CliMode, Section::TuiMode, Section::Display, Section::Providers]
+        vec![Section::General, Section::CliMode, Section::TuiMode, Section::Display, Section::Providers]
     }
 
     fn index(&self) -> usize {
         match self {
-            Section::CliMode => 0,
-            Section::TuiMode => 1,
-            Section::Display => 2,
-            Section::Providers => 3,
+            Section::General => 0,
+            Section::CliMode => 1,
+            Section::TuiMode => 2,
+            Section::Display => 3,
+            Section::Providers => 4,
         }
     }
 }
@@ -59,10 +62,16 @@ enum DisplayField {
     ShowReasoning,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum GeneralField {
+    DefaultInterface,
+}
+
 struct App {
     config: Config,
     original_config: Config,
     section: Section,
+    general_field: GeneralField,
     mode_field: ModeField,
     display_field: DisplayField,
     provider_index: usize,
@@ -85,7 +94,8 @@ impl App {
         App {
             config,
             original_config: original,
-            section: Section::CliMode,
+            section: Section::General,
+            general_field: GeneralField::DefaultInterface,
             mode_field: ModeField::DefaultMode,
             display_field: DisplayField::ShowModel,
             provider_index: 0,
@@ -99,6 +109,7 @@ impl App {
     fn has_changes(&self) -> bool {
         self.config.cli != self.original_config.cli
             || self.config.tui_mode != self.original_config.tui_mode
+            || self.config.default.tui != self.original_config.default.tui
             || self.config.footer.show_model != self.original_config.footer.show_model
             || self.config.footer.show_time != self.original_config.footer.show_time
             || self.config.footer.show_tokens != self.original_config.footer.show_tokens
@@ -114,29 +125,36 @@ impl App {
 
     fn next_section(&mut self) {
         self.section = match self.section {
+            Section::General => Section::CliMode,
             Section::CliMode => Section::TuiMode,
             Section::TuiMode => Section::Display,
             Section::Display => Section::Providers,
-            Section::Providers => Section::CliMode,
+            Section::Providers => Section::General,
         };
         // Reset field selection when changing sections
+        self.general_field = GeneralField::DefaultInterface;
         self.mode_field = ModeField::DefaultMode;
         self.display_field = DisplayField::ShowModel;
     }
 
     fn prev_section(&mut self) {
         self.section = match self.section {
-            Section::CliMode => Section::Providers,
+            Section::General => Section::Providers,
+            Section::CliMode => Section::General,
             Section::TuiMode => Section::CliMode,
             Section::Display => Section::TuiMode,
             Section::Providers => Section::Display,
         };
+        self.general_field = GeneralField::DefaultInterface;
         self.mode_field = ModeField::DefaultMode;
         self.display_field = DisplayField::ShowModel;
     }
 
     fn next_field(&mut self) {
         match self.section {
+            Section::General => {
+                // Only one field for now, no-op
+            }
             Section::CliMode | Section::TuiMode => {
                 self.mode_field = match self.mode_field {
                     ModeField::DefaultMode => ModeField::SingleProvider,
@@ -164,6 +182,9 @@ impl App {
 
     fn prev_field(&mut self) {
         match self.section {
+            Section::General => {
+                // Only one field for now, no-op
+            }
             Section::CliMode | Section::TuiMode => {
                 self.mode_field = match self.mode_field {
                     ModeField::DefaultMode => ModeField::ModelTier,
@@ -211,6 +232,13 @@ impl App {
 
     fn toggle_or_cycle(&mut self) {
         match self.section {
+            Section::General => {
+                match self.general_field {
+                    GeneralField::DefaultInterface => {
+                        self.config.default.tui = !self.config.default.tui;
+                    }
+                }
+            }
             Section::CliMode | Section::TuiMode => {
                 match self.mode_field {
                     ModeField::DefaultMode => {
@@ -409,6 +437,7 @@ fn draw_ui(frame: &mut Frame, app: &App) {
 
     // Content area
     match app.section {
+        Section::General => draw_general_section(frame, chunks[1], app),
         Section::CliMode => draw_mode_section(frame, chunks[1], app, "CLI Mode (non-TUI)", &app.config.cli),
         Section::TuiMode => draw_mode_section(frame, chunks[1], app, "TUI Mode", &app.config.tui_mode),
         Section::Display => draw_display_section(frame, chunks[1], app),
@@ -426,6 +455,29 @@ fn draw_ui(frame: &mut Frame, app: &App) {
         .style(Style::default().fg(Color::DarkGray))
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(footer, chunks[2]);
+}
+
+fn draw_general_section(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" General Settings ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let items = vec![
+        format_mode_item(
+            "Default Interface",
+            if app.config.default.tui {
+                "CLI / [TUI]"
+            } else {
+                "[CLI] / TUI"
+            },
+            app.general_field == GeneralField::DefaultInterface,
+        ),
+    ];
+
+    let list = List::new(items);
+    frame.render_widget(list, inner);
 }
 
 fn draw_mode_section(frame: &mut Frame, area: Rect, app: &App, title: &str, mode: &crate::config::ModeConfig) {

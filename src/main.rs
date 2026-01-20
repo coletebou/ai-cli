@@ -18,11 +18,11 @@ use std::sync::Arc;
 #[command(about = "Query multiple AI providers simultaneously")]
 #[command(author = "Cole Tebou")]
 struct Cli {
-    /// The question to ask
-    question: Option<String>,
-
     #[command(subcommand)]
     command: Option<Command>,
+
+    /// The question to ask (multiple words joined automatically)
+    question: Vec<String>,
 
     /// Generate default config file at ~/.config/ai-cli/config.toml
     #[arg(long)]
@@ -89,9 +89,10 @@ async fn main() -> Result<()> {
     }
 
     // Require question if not --init
-    let question = cli.question.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("Missing required argument: <QUESTION>\n\nUsage: ai <QUESTION>\n       ai --init")
-    })?;
+    if cli.question.is_empty() {
+        anyhow::bail!("Missing required argument: <QUESTION>\n\nUsage: ai <QUESTION>\n       ai --init");
+    }
+    let question = cli.question.join(" ");
 
     // Load configuration
     let config = Config::load()?;
@@ -154,7 +155,7 @@ async fn main() -> Result<()> {
         crate::ui::run_tui(
             manager,
             providers_to_query,
-            question,
+            &question,
             system_prompt,
             footer.show_tokens,
             reasoning_effort,
@@ -165,7 +166,7 @@ async fn main() -> Result<()> {
         let rx = query::stream_all(
             Arc::clone(&manager),
             providers_to_query.clone(),
-            question,
+            &question,
             system_prompt,
             reasoning_effort,
         )
@@ -177,7 +178,7 @@ async fn main() -> Result<()> {
         let responses = query::query_all(
             Arc::clone(&manager),
             providers_to_query,
-            question,
+            &question,
             system_prompt,
             reasoning_effort,
         )

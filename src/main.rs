@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
     let config = Config::load()?;
 
     // Create provider manager
-    let manager = Arc::new(ProviderManager::new(config.clone())?);
+    let manager = Arc::new(ProviderManager::new(config.clone(), config.cli.model_tier.clone())?);
 
     // Determine which providers to query
     let providers_to_query = if cli.all {

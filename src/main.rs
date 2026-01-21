@@ -10,7 +10,43 @@ use clap::{Parser, Subcommand};
 use config::Config;
 use genai::chat::ReasoningEffort;
 use providers::ProviderManager;
+use std::process::Command as ProcessCommand;
 use std::sync::Arc;
+
+// Embedded at compile time by build.rs
+const BUILD_COMMIT: &str = env!("AI_CLI_GIT_HASH");
+const REPO_PATH: &str = env!("AI_CLI_REPO_PATH");
+
+fn check_binary_staleness() {
+    // Skip if repo path is empty or doesn't exist
+    if REPO_PATH.is_empty() || !std::path::Path::new(REPO_PATH).exists() {
+        return;
+    }
+
+    // Get current HEAD commit
+    let output = ProcessCommand::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(REPO_PATH)
+        .output()
+        .ok();
+
+    let current_hash = match output {
+        Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return, // Can't determine current hash, skip check
+    };
+
+    // Compare with build commit
+    if BUILD_COMMIT != "unknown" && BUILD_COMMIT != current_hash {
+        eprintln!(
+            "\x1b[33m[warn]\x1b[0m ai binary is stale (built: {}, current: {})",
+            BUILD_COMMIT, current_hash
+        );
+        eprintln!(
+            "\x1b[33m[warn]\x1b[0m Run 'ai-rebuild' or 'cargo install --path {}' to update\n",
+            REPO_PATH
+        );
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "ai")]
@@ -73,6 +109,9 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Check if binary matches source (warns if stale)
+    check_binary_staleness();
+
     let cli = Cli::parse();
 
     // Handle subcommands

@@ -100,13 +100,24 @@ async fn main() -> Result<()> {
     // Create provider manager
     let manager = Arc::new(ProviderManager::new(config.clone(), config.cli.model_tier.clone())?);
 
-    // Determine which providers to query
+    // Determine which providers to query based on CLI args and config
     let providers_to_query = if cli.all {
+        // --all flag: query all enabled providers
         manager.get_providers_for_query(None)
     } else if let Some(ref requested) = cli.providers {
+        // -p flag: query specific providers
         manager.get_providers_for_query(Some(requested))
     } else {
-        manager.get_providers_for_query(None)
+        // No flags: use cli mode settings (single vs multi)
+        use config::QueryMode;
+        match config.cli.default_mode {
+            QueryMode::Single => {
+                manager.get_providers_for_query(Some(&[config.cli.single_provider.clone()]))
+            }
+            QueryMode::Multi => {
+                manager.get_providers_for_query(Some(&config.cli.multi_providers))
+            }
+        }
     };
 
     if providers_to_query.is_empty() {
@@ -123,7 +134,7 @@ async fn main() -> Result<()> {
     let system_prompt = cli.system.as_deref().or(config.default.system_prompt.as_deref());
 
     // Determine display options
-    let stream = !cli.no_stream && config.default.stream;
+    let _stream = !cli.no_stream && config.default.stream; // Reserved for future multi-provider streaming
     let use_tui = !cli.no_tui && (cli.tui || config.default.tui);
     let footer = config.footer.clone();
 
@@ -161,8 +172,8 @@ async fn main() -> Result<()> {
             reasoning_effort,
         )
         .await?;
-    } else if stream && providers_to_query.len() == 1 {
-        // Streaming mode - only for single provider to avoid interleaved output
+    } else if providers_to_query.len() == 1 && !cli.no_stream {
+        // Single provider: always stream (no interleaving issue) unless explicitly disabled
         let rx = query::stream_all(
             Arc::clone(&manager),
             providers_to_query.clone(),

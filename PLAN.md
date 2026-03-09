@@ -26,9 +26,8 @@ Multi-provider AI CLI in Rust — query Grok, ChatGPT, Gemini, Claude simultaneo
 4. **Gemini** (Google)
 
 ### Additional Providers
-5. **Ollama** (local models)
-6. **Groq** (fast inference)
-7. **DeepSeek** (cheap reasoning)
+5. **Ollama** (local models — zero latency, no API key)
+6. **OpenRouter** (unified gateway to 200+ models via OpenAI-compatible API)
 
 ---
 
@@ -38,7 +37,7 @@ Multi-provider AI CLI in Rust — query Grok, ChatGPT, Gemini, Claude simultaneo
 
 **Why this is the winning choice:**
 - Already supports ALL target providers: OpenAI, Anthropic (Claude), Gemini, xAI (Grok)
-- Also supports: Ollama, Groq, DeepSeek, Cohere (bonus providers)
+- Also supports: Ollama, Cohere, and OpenRouter (via ServiceTargetResolver for OpenAI-compatible endpoints)
 - Normalized API across all providers — one interface for everything
 - Native streaming support via `exec_chat_stream()`
 - 9,280 downloads/month, actively maintained (v0.5.0 released Jan 2026)
@@ -275,24 +274,20 @@ aliases = ["gemini"]
 color = "cyan"
 
 # Additional providers (disabled by default)
-[providers.groq]
+[providers.openrouter]
 enabled = false
-api_key_env = "GROQ_API_KEY"
-default_model = "llama-3.3-70b-versatile"
-aliases = ["groq"]
+api_key_env = "OPENROUTER_API_KEY"
+fast_model = "google/gemini-2.5-flash"
+smart_model = "anthropic/claude-opus-4-6"
+aliases = ["openrouter", "or"]
 color = "yellow"
-
-[providers.deepseek]
-enabled = false
-api_key_env = "DEEPSEEK_API_KEY"
-default_model = "deepseek-chat"
-aliases = ["deepseek", "ds"]
-color = "white"
+base_url = "https://openrouter.ai/api/v1"
 
 [providers.ollama]
 enabled = false
 base_url = "http://localhost:11434"
-default_model = "llama3.2"
+fast_model = "qwen3:8b"
+smart_model = "qwen3:14b"
 aliases = ["ollama", "local"]
 color = "red"
 ```

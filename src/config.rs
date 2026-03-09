@@ -239,32 +239,17 @@ impl Default for Config {
         );
 
         providers.insert(
-            "groq".to_string(),
+            "openrouter".to_string(),
             ProviderConfig {
-                enabled: false,
-                api_key_env: Some("GROQ_API_KEY".to_string()),
+                enabled: true,
+                api_key_env: Some("OPENROUTER_API_KEY".to_string()),
                 api_key: None,
-                default_model: "llama-3.3-70b-versatile".to_string(),
-                fast_model: Some("llama-3.3-70b-versatile".to_string()),
-                smart_model: Some("llama-3.3-70b-versatile".to_string()),
-                aliases: vec!["groq".to_string()],
+                default_model: "google/gemini-2.5-flash".to_string(),
+                fast_model: Some("google/gemini-2.5-flash".to_string()),
+                smart_model: Some("anthropic/claude-opus-4-6".to_string()),
+                aliases: vec!["openrouter".to_string(), "or".to_string()],
                 color: "yellow".to_string(),
-                base_url: None,
-            },
-        );
-
-        providers.insert(
-            "deepseek".to_string(),
-            ProviderConfig {
-                enabled: false,
-                api_key_env: Some("DEEPSEEK_API_KEY".to_string()),
-                api_key: None,
-                default_model: "deepseek-chat".to_string(),
-                fast_model: Some("deepseek-chat".to_string()),
-                smart_model: Some("deepseek-reasoner".to_string()),
-                aliases: vec!["deepseek".to_string(), "ds".to_string()],
-                color: "white".to_string(),
-                base_url: None,
+                base_url: Some("https://openrouter.ai/api/v1".to_string()),
             },
         );
 
@@ -274,9 +259,9 @@ impl Default for Config {
                 enabled: false,
                 api_key_env: None,
                 api_key: None,
-                default_model: "llama3.2".to_string(),
-                fast_model: Some("llama3.2".to_string()),
-                smart_model: Some("llama3.2".to_string()),
+                default_model: "qwen3:8b".to_string(),
+                fast_model: Some("qwen3:8b".to_string()),
+                smart_model: Some("qwen3:14b".to_string()),
                 aliases: vec!["ollama".to_string(), "local".to_string()],
                 color: "red".to_string(),
                 base_url: Some("http://localhost:11434".to_string()),

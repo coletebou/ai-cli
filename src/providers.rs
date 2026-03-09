@@ -1,9 +1,10 @@
 use crate::config::{Config, ModelTier, ProviderConfig};
 use anyhow::{Context, Result};
 use colored::Color;
+use genai::adapter::AdapterKind;
 use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatStreamResponse};
-use genai::resolver::{AuthData, AuthResolver};
-use genai::{Client, ClientConfig, ModelIden};
+use genai::resolver::{AuthData, AuthResolver, Endpoint, ServiceTargetResolver};
+use genai::{Client, ClientConfig, ModelIden, ServiceTarget};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -56,9 +57,9 @@ pub struct ProviderManager {
 impl ProviderManager {
     pub fn new(config: Config, model_tier: ModelTier) -> Result<Self> {
         let config = Arc::new(config);
-        let config_clone = Arc::clone(&config);
 
         // Build custom auth resolver that uses our config
+        let auth_config = Arc::clone(&config);
         let auth_resolver = AuthResolver::from_resolver_fn(
             move |model_iden: ModelIden| -> Result<Option<AuthData>, genai::resolver::Error> {
                 let adapter_kind = model_iden.adapter_kind;
@@ -68,14 +69,12 @@ impl ProviderManager {
                     "Anthropic" => "anthropic",
                     "OpenAI" => "openai",
                     "Gemini" => "google",
-                    "Groq" => "groq",
                     "Ollama" => "ollama",
-                    "DeepSeek" => "deepseek",
                     "XAi" => "xai",
                     _ => return Ok(None),
                 };
 
-                if let Some(key) = config_clone.get_api_key(provider_name) {
+                if let Some(key) = auth_config.get_api_key(provider_name) {
                     Ok(Some(AuthData::from_single(key)))
                 } else {
                     // Try standard env var names as fallback
@@ -83,8 +82,6 @@ impl ProviderManager {
                         "Anthropic" => "ANTHROPIC_API_KEY",
                         "OpenAI" => "OPENAI_API_KEY",
                         "Gemini" => "GEMINI_API_KEY",
-                        "Groq" => "GROQ_API_KEY",
-                        "DeepSeek" => "DEEPSEEK_API_KEY",
                         "XAi" => "XAI_API_KEY",
                         _ => return Ok(None),
                     };
@@ -98,10 +95,64 @@ impl ProviderManager {
             },
         );
 
+        // Collect OpenRouter model names so the target resolver can identify them
+        let or_config = Arc::clone(&config);
+        let or_models: Vec<String> = config
+            .providers
+            .get("openrouter")
+            .map(|p| {
+                let mut models = vec![p.default_model.clone()];
+                if let Some(ref m) = p.fast_model {
+                    models.push(m.clone());
+                }
+                if let Some(ref m) = p.smart_model {
+                    models.push(m.clone());
+                }
+                models.sort();
+                models.dedup();
+                models
+            })
+            .unwrap_or_default();
+
+        // ServiceTargetResolver: redirect OpenRouter models to OpenRouter's endpoint
+        let target_resolver = ServiceTargetResolver::from_resolver_fn(
+            move |service_target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+                let ServiceTarget {
+                    model,
+                    endpoint,
+                    auth,
+                } = service_target;
+
+                // Check if this model belongs to OpenRouter (slash-namespaced models)
+                if or_models.contains(&model.model_name.to_string()) {
+                    let or_endpoint =
+                        Endpoint::from_static("https://openrouter.ai/api/v1/");
+                    let or_auth = if let Some(key) = or_config.get_api_key("openrouter") {
+                        AuthData::from_single(key)
+                    } else {
+                        AuthData::from_env("OPENROUTER_API_KEY")
+                    };
+                    let or_model = ModelIden::new(AdapterKind::OpenAI, model.model_name);
+                    Ok(ServiceTarget {
+                        endpoint: or_endpoint,
+                        auth: or_auth,
+                        model: or_model,
+                    })
+                } else {
+                    Ok(ServiceTarget {
+                        model,
+                        endpoint,
+                        auth,
+                    })
+                }
+            },
+        );
+
         let client_config = ClientConfig::default();
         let client = Client::builder()
             .with_config(client_config)
             .with_auth_resolver(auth_resolver)
+            .with_service_target_resolver(target_resolver)
             .build();
 
         // Build provider map

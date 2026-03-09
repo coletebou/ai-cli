@@ -1,6 +1,7 @@
 mod config;
 mod config_ui;
 mod display;
+mod models;
 mod providers;
 mod query;
 mod ui;
@@ -105,6 +106,14 @@ struct Cli {
 enum Command {
     /// Open the TUI config editor
     Config,
+    /// List available models from OpenRouter
+    Models {
+        /// Search/filter models by name or ID
+        search: Option<String>,
+        /// Force refresh the cached model list
+        #[arg(long)]
+        refresh: bool,
+    },
 }
 
 #[tokio::main]
@@ -118,6 +127,9 @@ async fn main() -> Result<()> {
     if let Some(command) = cli.command {
         return match command {
             Command::Config => config_ui::run_config_ui().await,
+            Command::Models { search, refresh } => {
+                models::list_models(search.as_deref(), refresh).await
+            }
         };
     }
 

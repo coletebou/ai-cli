@@ -125,7 +125,28 @@ async fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<ModelInfo>
     Ok(models)
 }
 
-pub async fn list_models(search: Option<&str>, refresh: bool) -> Result<()> {
+fn is_free(model: &ModelInfo) -> bool {
+    match &model.pricing {
+        Some(p) => {
+            let prompt_free = p
+                .prompt
+                .as_deref()
+                .and_then(|v| v.parse::<f64>().ok())
+                .map(|v| v == 0.0)
+                .unwrap_or(true);
+            let completion_free = p
+                .completion
+                .as_deref()
+                .and_then(|v| v.parse::<f64>().ok())
+                .map(|v| v == 0.0)
+                .unwrap_or(true);
+            prompt_free && completion_free
+        }
+        None => false,
+    }
+}
+
+pub async fn list_models(search: Option<&str>, refresh: bool, free_only: bool) -> Result<()> {
     let config = Config::load()?;
     let api_key = config.get_api_key("openrouter");
 
@@ -157,16 +178,21 @@ pub async fn list_models(search: Option<&str>, refresh: bool) -> Result<()> {
         fetch_and_cache(api_key.as_deref()).await?
     };
 
-    // Filter by search term
-    let filtered: Vec<&ModelInfo> = if let Some(query) = search {
-        let q = query.to_lowercase();
-        models
-            .iter()
-            .filter(|m| m.id.to_lowercase().contains(&q) || m.name.to_lowercase().contains(&q))
-            .collect()
-    } else {
-        models.iter().collect()
-    };
+    // Filter by search term and free flag
+    let filtered: Vec<&ModelInfo> = models
+        .iter()
+        .filter(|m| {
+            if free_only && !is_free(m) {
+                return false;
+            }
+            if let Some(query) = search {
+                let q = query.to_lowercase();
+                m.id.to_lowercase().contains(&q) || m.name.to_lowercase().contains(&q)
+            } else {
+                true
+            }
+        })
+        .collect();
 
     if filtered.is_empty() {
         if let Some(query) = search {
@@ -178,13 +204,18 @@ pub async fn list_models(search: Option<&str>, refresh: bool) -> Result<()> {
     }
 
     // Print header
+    let mut suffix = String::new();
+    if free_only {
+        suffix.push_str(" (free)");
+    }
+    if let Some(s) = search {
+        suffix.push_str(&format!(" matching '{}'", s));
+    }
     println!(
         "\n{} {} models{}",
         "OpenRouter".yellow().bold(),
         filtered.len(),
-        search
-            .map(|s| format!(" matching '{}'", s))
-            .unwrap_or_default()
+        suffix
     );
     println!(
         "{:<45} {:>8} {:>12} {:>12}",

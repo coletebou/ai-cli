@@ -95,26 +95,16 @@ impl ProviderManager {
             },
         );
 
-        // Collect OpenRouter model names so the target resolver can identify them
+        // ServiceTargetResolver: redirect OpenRouter models to OpenRouter's endpoint.
+        // OpenRouter models use slash-namespaced IDs (e.g. "google/gemini-2.5-flash"),
+        // so any model containing a '/' is routed through OpenRouter.
         let or_config = Arc::clone(&config);
-        let or_models: Vec<String> = config
+        let or_enabled = config
             .providers
             .get("openrouter")
-            .map(|p| {
-                let mut models = vec![p.default_model.clone()];
-                if let Some(ref m) = p.fast_model {
-                    models.push(m.clone());
-                }
-                if let Some(ref m) = p.smart_model {
-                    models.push(m.clone());
-                }
-                models.sort();
-                models.dedup();
-                models
-            })
-            .unwrap_or_default();
+            .map(|p| p.enabled)
+            .unwrap_or(false);
 
-        // ServiceTargetResolver: redirect OpenRouter models to OpenRouter's endpoint
         let target_resolver = ServiceTargetResolver::from_resolver_fn(
             move |service_target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
                 let ServiceTarget {
@@ -123,8 +113,8 @@ impl ProviderManager {
                     auth,
                 } = service_target;
 
-                // Check if this model belongs to OpenRouter (slash-namespaced models)
-                if or_models.contains(&model.model_name.to_string()) {
+                // Route slash-namespaced models through OpenRouter
+                if or_enabled && model.model_name.contains('/') {
                     let or_endpoint =
                         Endpoint::from_static("https://openrouter.ai/api/v1/");
                     let or_auth = if let Some(key) = or_config.get_api_key("openrouter") {

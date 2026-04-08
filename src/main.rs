@@ -113,6 +113,9 @@ enum Command {
         /// Force refresh the cached model list
         #[arg(long)]
         refresh: bool,
+        /// Show only free models
+        #[arg(long)]
+        free: bool,
     },
 }
 
@@ -127,8 +130,8 @@ async fn main() -> Result<()> {
     if let Some(command) = cli.command {
         return match command {
             Command::Config => config_ui::run_config_ui().await,
-            Command::Models { search, refresh } => {
-                models::list_models(search.as_deref(), refresh).await
+            Command::Models { search, refresh, free } => {
+                models::list_models(search.as_deref(), refresh, free).await
             }
         };
     }

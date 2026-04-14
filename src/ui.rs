@@ -1,5 +1,5 @@
 use crate::providers::{Provider, ProviderManager};
-use crate::query::StreamEvent;
+use crate::query::{QueryContext, StreamEvent};
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -132,6 +132,23 @@ impl App {
                     panel.set_error(error, duration_ms);
                 }
             }
+            StreamEvent::SearchStart { provider, query } => {
+                if let Some(panel) = self.panels.iter_mut().find(|p| p.provider.display_name == provider) {
+                    // Insert a styled marker that the markdown renderer will italicize
+                    panel.append(&format!("\n*→ searching: {}*\n\n", query));
+                }
+            }
+            StreamEvent::SearchEnd { provider, search_provider, result_count, error, .. } => {
+                if let Some(panel) = self.panels.iter_mut().find(|p| p.provider.display_name == provider) {
+                    match error {
+                        Some(err) => panel.append(&format!("*← search failed: {}*\n\n", err)),
+                        None => panel.append(&format!(
+                            "*← via {}: {} result(s)*\n\n",
+                            search_provider, result_count
+                        )),
+                    }
+                }
+            }
         }
     }
 
@@ -217,7 +234,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         "Loading... | q: quit"
     };
     let footer = Paragraph::new(help_text)
-        .style(Style::default().fg(Color::DarkGray));
+        .style(Style::default().fg(Color::Gray));
     frame.render_widget(footer, main_layout[2]);
 }
 
@@ -243,15 +260,15 @@ fn draw_panel(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_selected
         .title(title)
         .border_style(border_style);
 
-    // Prepare content text
-    let content = if let Some(ref error) = panel.error {
-        Text::styled(format!("Error: {}", error), Style::default().fg(Color::Red))
+    // Prepare content: parse markdown into styled lines
+    let mut lines: Vec<Line> = if let Some(ref error) = panel.error {
+        vec![Line::styled(
+            format!("Error: {}", error),
+            Style::default().fg(Color::Red),
+        )]
     } else {
-        Text::raw(&panel.text)
+        crate::markdown::markdown_to_lines(&panel.text)
     };
-
-    // Add metadata if complete
-    let mut lines: Vec<Line> = content.lines.clone();
     if panel.is_complete {
         lines.push(Line::from(""));
 
@@ -315,10 +332,9 @@ fn draw_panel(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_selected
 pub async fn run_tui(
     manager: Arc<ProviderManager>,
     providers: Vec<Provider>,
+    ctx: QueryContext,
     question: &str,
-    system_prompt: Option<&str>,
     show_tokens: bool,
-    reasoning_effort: Option<genai::chat::ReasoningEffort>,
 ) -> Result<()> {
     // Check if we have a proper terminal
     use std::io::IsTerminal;
@@ -337,14 +353,7 @@ pub async fn run_tui(
     let mut app = App::new(providers.clone(), question, show_tokens);
 
     // Start streaming
-    let rx = crate::query::stream_all(
-        manager,
-        providers,
-        question,
-        system_prompt,
-        reasoning_effort,
-    )
-    .await;
+    let rx = crate::query::stream_all(manager, providers, ctx).await;
 
     // Run the main loop
     let result = run_main_loop(&mut terminal, &mut app, rx).await;

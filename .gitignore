@@ -1,1 +1,7 @@
 /target
+
+# macOS Finder metadata
+.DS_Store
+
+# Local session/memory state (not part of the project)
+.remember/

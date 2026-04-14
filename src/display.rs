@@ -207,6 +207,18 @@ impl StreamingDisplay {
             StreamEvent::Error { provider, error, .. } => {
                 eprintln!("[{}] Error: {}", provider, error);
             }
+            StreamEvent::SearchStart { provider, query } => {
+                eprintln!("[{}/search] {}", provider, query);
+            }
+            StreamEvent::SearchEnd { provider, search_provider, result_count, error, .. } => {
+                match error {
+                    Some(e) => eprintln!("[{}/search] failed: {}", provider, e),
+                    None => eprintln!(
+                        "[{}/search via {}] {} result(s)",
+                        provider, search_provider, result_count
+                    ),
+                }
+            }
         }
     }
 
@@ -326,6 +338,33 @@ impl StreamingDisplay {
                     format!("{}ms", duration_ms)
                 };
                 println!("{}", format!("model: {} | time: {}", model, duration_str).dimmed());
+            }
+            StreamEvent::SearchStart { provider, query } => {
+                // Live feedback to stderr so the user sees searches in progress,
+                // and append an inline marker into the buffered content for the final render.
+                eprintln!("  {} {}", "→ search:".dimmed(), query.italic());
+                if let Some(buffer) = self.provider_buffers.get_mut(&provider) {
+                    buffer.content.push_str(&format!("\n*→ searching: {}*\n\n", query));
+                }
+            }
+            StreamEvent::SearchEnd { provider, search_provider, result_count, error, .. } => {
+                match &error {
+                    Some(e) => eprintln!("  {} {}", "← search failed:".dimmed(), e.red()),
+                    None => eprintln!(
+                        "  {} {}",
+                        "←".dimmed(),
+                        format!("via {}: {} result(s)", search_provider, result_count).dimmed()
+                    ),
+                }
+                if let Some(buffer) = self.provider_buffers.get_mut(&provider) {
+                    match error {
+                        Some(e) => buffer.content.push_str(&format!("*← search failed: {}*\n\n", e)),
+                        None => buffer.content.push_str(&format!(
+                            "*← via {}: {} result(s)*\n\n",
+                            search_provider, result_count
+                        )),
+                    }
+                }
             }
         }
     }

@@ -17,6 +17,7 @@ enum Section {
     CliMode,
     TuiMode,
     Display,
+    Search,
     Providers,
 }
 
@@ -27,12 +28,20 @@ impl Section {
             Section::CliMode => "CLI Mode",
             Section::TuiMode => "TUI Mode",
             Section::Display => "Display",
+            Section::Search => "Search",
             Section::Providers => "Providers",
         }
     }
 
     fn all() -> Vec<Section> {
-        vec![Section::General, Section::CliMode, Section::TuiMode, Section::Display, Section::Providers]
+        vec![
+            Section::General,
+            Section::CliMode,
+            Section::TuiMode,
+            Section::Display,
+            Section::Search,
+            Section::Providers,
+        ]
     }
 
     fn index(&self) -> usize {
@@ -41,7 +50,8 @@ impl Section {
             Section::CliMode => 1,
             Section::TuiMode => 2,
             Section::Display => 3,
-            Section::Providers => 4,
+            Section::Search => 4,
+            Section::Providers => 5,
         }
     }
 }
@@ -67,6 +77,26 @@ enum GeneralField {
     DefaultInterface,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum SearchField {
+    Provider,
+    GeminiModel,
+    MaxResults,
+    MaxIterations,
+}
+
+/// Gemini models offered for cycling in the Search config UI.
+/// Users can still hand-edit config.toml for any other model.
+const GEMINI_MODEL_CHOICES: &[&str] = &[
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3-flash-preview",
+    "gemini-3-pro-preview",
+    "gemini-2.5-flash",
+];
+/// Preset values users can cycle through for numeric search fields.
+const MAX_RESULTS_CHOICES: &[usize] = &[3, 5, 10];
+const MAX_ITERATIONS_CHOICES: &[usize] = &[3, 5, 10];
+
 struct App {
     config: Config,
     original_config: Config,
@@ -74,6 +104,7 @@ struct App {
     general_field: GeneralField,
     mode_field: ModeField,
     display_field: DisplayField,
+    search_field: SearchField,
     provider_index: usize,
     multi_provider_index: usize,
     available_providers: Vec<String>,
@@ -98,6 +129,7 @@ impl App {
             general_field: GeneralField::DefaultInterface,
             mode_field: ModeField::DefaultMode,
             display_field: DisplayField::ShowModel,
+            search_field: SearchField::Provider,
             provider_index: 0,
             multi_provider_index: 0,
             available_providers,
@@ -114,6 +146,10 @@ impl App {
             || self.config.footer.show_time != self.original_config.footer.show_time
             || self.config.footer.show_tokens != self.original_config.footer.show_tokens
             || self.config.footer.show_reasoning != self.original_config.footer.show_reasoning
+            || self.config.search.provider != self.original_config.search.provider
+            || self.config.search.gemini.model != self.original_config.search.gemini.model
+            || self.config.search.max_results != self.original_config.search.max_results
+            || self.config.search.max_iterations != self.original_config.search.max_iterations
     }
 
     fn save(&mut self) -> Result<()> {
@@ -128,13 +164,11 @@ impl App {
             Section::General => Section::CliMode,
             Section::CliMode => Section::TuiMode,
             Section::TuiMode => Section::Display,
-            Section::Display => Section::Providers,
+            Section::Display => Section::Search,
+            Section::Search => Section::Providers,
             Section::Providers => Section::General,
         };
-        // Reset field selection when changing sections
-        self.general_field = GeneralField::DefaultInterface;
-        self.mode_field = ModeField::DefaultMode;
-        self.display_field = DisplayField::ShowModel;
+        self.reset_fields();
     }
 
     fn prev_section(&mut self) {
@@ -143,11 +177,17 @@ impl App {
             Section::CliMode => Section::General,
             Section::TuiMode => Section::CliMode,
             Section::Display => Section::TuiMode,
-            Section::Providers => Section::Display,
+            Section::Search => Section::Display,
+            Section::Providers => Section::Search,
         };
+        self.reset_fields();
+    }
+
+    fn reset_fields(&mut self) {
         self.general_field = GeneralField::DefaultInterface;
         self.mode_field = ModeField::DefaultMode;
         self.display_field = DisplayField::ShowModel;
+        self.search_field = SearchField::Provider;
     }
 
     fn next_field(&mut self) {
@@ -169,6 +209,14 @@ impl App {
                     DisplayField::ShowTime => DisplayField::ShowTokens,
                     DisplayField::ShowTokens => DisplayField::ShowReasoning,
                     DisplayField::ShowReasoning => DisplayField::ShowModel,
+                };
+            }
+            Section::Search => {
+                self.search_field = match self.search_field {
+                    SearchField::Provider => SearchField::GeminiModel,
+                    SearchField::GeminiModel => SearchField::MaxResults,
+                    SearchField::MaxResults => SearchField::MaxIterations,
+                    SearchField::MaxIterations => SearchField::Provider,
                 };
             }
             Section::Providers => {
@@ -199,6 +247,14 @@ impl App {
                     DisplayField::ShowTime => DisplayField::ShowModel,
                     DisplayField::ShowTokens => DisplayField::ShowTime,
                     DisplayField::ShowReasoning => DisplayField::ShowTokens,
+                };
+            }
+            Section::Search => {
+                self.search_field = match self.search_field {
+                    SearchField::Provider => SearchField::MaxIterations,
+                    SearchField::GeminiModel => SearchField::Provider,
+                    SearchField::MaxResults => SearchField::GeminiModel,
+                    SearchField::MaxIterations => SearchField::MaxResults,
                 };
             }
             Section::Providers => {
@@ -303,6 +359,37 @@ impl App {
                 }
                 DisplayField::ShowReasoning => {
                     self.config.footer.show_reasoning = !self.config.footer.show_reasoning;
+                }
+            },
+            Section::Search => match self.search_field {
+                SearchField::Provider => {
+                    // Cycle between gemini and tavily
+                    self.config.search.provider = if self.config.search.provider == "gemini" {
+                        "tavily".to_string()
+                    } else {
+                        "gemini".to_string()
+                    };
+                }
+                SearchField::GeminiModel => {
+                    // Cycle through known Gemini models
+                    let current = self.config.search.gemini.model.as_str();
+                    let next_index = GEMINI_MODEL_CHOICES
+                        .iter()
+                        .position(|m| *m == current)
+                        .map(|i| (i + 1) % GEMINI_MODEL_CHOICES.len())
+                        .unwrap_or(0);
+                    self.config.search.gemini.model =
+                        GEMINI_MODEL_CHOICES[next_index].to_string();
+                }
+                SearchField::MaxResults => {
+                    let current = self.config.search.max_results;
+                    let next = cycle_usize(MAX_RESULTS_CHOICES, current);
+                    self.config.search.max_results = next;
+                }
+                SearchField::MaxIterations => {
+                    let current = self.config.search.max_iterations;
+                    let next = cycle_usize(MAX_ITERATIONS_CHOICES, current);
+                    self.config.search.max_iterations = next;
                 }
             },
             Section::Providers => {
@@ -441,6 +528,7 @@ fn draw_ui(frame: &mut Frame, app: &App) {
         Section::CliMode => draw_mode_section(frame, chunks[1], app, "CLI Mode (non-TUI)", &app.config.cli),
         Section::TuiMode => draw_mode_section(frame, chunks[1], app, "TUI Mode", &app.config.tui_mode),
         Section::Display => draw_display_section(frame, chunks[1], app),
+        Section::Search => draw_search_section(frame, chunks[1], app),
         Section::Providers => draw_providers_section(frame, chunks[1], app),
     }
 
@@ -585,6 +673,59 @@ fn format_bool_item<'a>(label: &str, value: bool, selected: bool) -> ListItem<'a
     let prefix = if selected { "▶ " } else { "  " };
     let checkbox = if value { "[x]" } else { "[ ]" };
     ListItem::new(format!("{}{} {}", prefix, checkbox, label)).style(style)
+}
+
+fn draw_search_section(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Search Settings ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let search = &app.config.search;
+
+    let provider_display = if search.provider == "gemini" {
+        "[gemini] / tavily"
+    } else {
+        "gemini / [tavily]"
+    };
+
+    let items = vec![
+        format_mode_item(
+            "Provider",
+            provider_display,
+            app.search_field == SearchField::Provider,
+        ),
+        format_mode_item(
+            "Gemini Model",
+            &search.gemini.model,
+            app.search_field == SearchField::GeminiModel,
+        ),
+        format_mode_item(
+            "Max Results",
+            &search.max_results.to_string(),
+            app.search_field == SearchField::MaxResults,
+        ),
+        format_mode_item(
+            "Max Iterations",
+            &search.max_iterations.to_string(),
+            app.search_field == SearchField::MaxIterations,
+        ),
+    ];
+
+    let list = List::new(items);
+    frame.render_widget(list, inner);
+}
+
+/// Cycle through a slice of preset values, returning the next one. If `current`
+/// isn't in the list, returns the first value.
+fn cycle_usize(choices: &[usize], current: usize) -> usize {
+    let idx = choices
+        .iter()
+        .position(|&v| v == current)
+        .map(|i| (i + 1) % choices.len())
+        .unwrap_or(0);
+    choices[idx]
 }
 
 fn draw_providers_section(frame: &mut Frame, area: Rect, app: &App) {

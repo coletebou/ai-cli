@@ -2,7 +2,7 @@ use crate::config::{Config, ModelTier, ProviderConfig};
 use anyhow::{Context, Result};
 use colored::Color;
 use genai::adapter::AdapterKind;
-use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatStreamResponse};
+use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatStreamResponse, Tool};
 use genai::resolver::{AuthData, AuthResolver, Endpoint, ServiceTargetResolver};
 use genai::{Client, ClientConfig, ModelIden, ServiceTarget};
 use std::collections::HashMap;
@@ -195,8 +195,12 @@ impl ProviderManager {
         model: &str,
         messages: Vec<ChatMessage>,
         options: Option<&ChatOptions>,
+        tools: Option<Vec<Tool>>,
     ) -> Result<ChatResponse> {
-        let request = ChatRequest::new(messages);
+        let mut request = ChatRequest::new(messages);
+        if let Some(tools) = tools {
+            request = request.with_tools(tools);
+        }
         self.client
             .exec_chat(model, request, options)
             .await
@@ -208,8 +212,12 @@ impl ProviderManager {
         model: &str,
         messages: Vec<ChatMessage>,
         options: Option<&ChatOptions>,
+        tools: Option<Vec<Tool>>,
     ) -> Result<ChatStreamResponse> {
-        let request = ChatRequest::new(messages);
+        let mut request = ChatRequest::new(messages);
+        if let Some(tools) = tools {
+            request = request.with_tools(tools);
+        }
         match self.client.exec_chat_stream(model, request, options).await {
             Ok(response) => Ok(response),
             Err(e) => {

@@ -21,7 +21,105 @@ pub struct Config {
     #[serde(default)]
     pub footer: FooterConfig,
     #[serde(default)]
+    pub search: SearchConfig,
+    #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchConfig {
+    /// Active search provider: "gemini" or "tavily"
+    #[serde(default = "default_search_provider")]
+    pub provider: String,
+    /// Maximum number of search results per query (Tavily only)
+    #[serde(default = "default_max_results")]
+    pub max_results: usize,
+    /// Maximum rounds of tool calls per query (safety cap)
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: usize,
+    /// Tavily-specific settings
+    #[serde(default)]
+    pub tavily: TavilyConfig,
+    /// Gemini grounding-specific settings
+    #[serde(default)]
+    pub gemini: GeminiSearchConfig,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_search_provider(),
+            max_results: default_max_results(),
+            max_iterations: default_max_iterations(),
+            tavily: TavilyConfig::default(),
+            gemini: GeminiSearchConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TavilyConfig {
+    #[serde(default = "default_tavily_api_key_env")]
+    pub api_key_env: String,
+}
+
+impl Default for TavilyConfig {
+    fn default() -> Self {
+        Self {
+            api_key_env: default_tavily_api_key_env(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeminiSearchConfig {
+    /// Primary env var to check (defaults to GEMINI_API_KEY)
+    #[serde(default = "default_gemini_api_key_env")]
+    pub api_key_env: String,
+    /// Fallback env var (defaults to GOOGLE_API_KEY)
+    #[serde(default = "default_gemini_fallback_env")]
+    pub fallback_api_key_env: String,
+    /// Which Gemini model to use for grounded search
+    #[serde(default = "default_gemini_search_model")]
+    pub model: String,
+}
+
+impl Default for GeminiSearchConfig {
+    fn default() -> Self {
+        Self {
+            api_key_env: default_gemini_api_key_env(),
+            fallback_api_key_env: default_gemini_fallback_env(),
+            model: default_gemini_search_model(),
+        }
+    }
+}
+
+fn default_search_provider() -> String {
+    "gemini".to_string()
+}
+
+fn default_tavily_api_key_env() -> String {
+    "TAVILY_API_KEY".to_string()
+}
+
+fn default_gemini_api_key_env() -> String {
+    "GEMINI_API_KEY".to_string()
+}
+
+fn default_gemini_fallback_env() -> String {
+    "GOOGLE_API_KEY".to_string()
+}
+
+fn default_gemini_search_model() -> String {
+    "gemini-3.1-flash-lite-preview".to_string()
+}
+
+fn default_max_results() -> usize {
+    5
+}
+
+fn default_max_iterations() -> usize {
+    5
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
@@ -277,6 +375,7 @@ impl Default for Config {
             mode: None,
             default: DefaultConfig::default(),
             footer: FooterConfig::default(),
+            search: SearchConfig::default(),
             providers,
         }
     }

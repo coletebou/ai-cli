@@ -1,9 +1,11 @@
 mod config;
 mod config_ui;
 mod display;
+mod markdown;
 mod models;
 mod providers;
 mod query;
+mod search;
 mod ui;
 
 use anyhow::Result;
@@ -100,6 +102,14 @@ struct Cli {
     /// Reasoning effort level (none, low, medium, high, or a number for budget)
     #[arg(short = 'r', long)]
     reasoning: Option<String>,
+
+    /// Enable web search (uses provider from config; override with --search-provider)
+    #[arg(short = 'w', long)]
+    search: bool,
+
+    /// Override search provider for this query ("gemini" or "tavily")
+    #[arg(long, value_name = "PROVIDER")]
+    search_provider: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -151,25 +161,26 @@ async fn main() -> Result<()> {
     // Load configuration
     let config = Config::load()?;
 
-    // Create provider manager
-    let manager = Arc::new(ProviderManager::new(config.clone(), config.cli.model_tier.clone())?);
+    // Determine TUI mode first — it affects provider and model tier selection
+    let use_tui = !cli.no_tui && (cli.tui || config.default.tui);
+    let mode_config = if use_tui { &config.tui_mode } else { &config.cli };
 
-    // Determine which providers to query based on CLI args and config
+    // Create provider manager with the correct model tier for the active mode
+    let manager = Arc::new(ProviderManager::new(config.clone(), mode_config.model_tier.clone())?);
+
+    // Determine which providers to query based on CLI args and active mode config
     let providers_to_query = if cli.all {
-        // --all flag: query all enabled providers
         manager.get_providers_for_query(None)
     } else if let Some(ref requested) = cli.providers {
-        // -p flag: query specific providers
         manager.get_providers_for_query(Some(requested))
     } else {
-        // No flags: use cli mode settings (single vs multi)
         use config::QueryMode;
-        match config.cli.default_mode {
+        match mode_config.default_mode {
             QueryMode::Single => {
-                manager.get_providers_for_query(Some(&[config.cli.single_provider.clone()]))
+                manager.get_providers_for_query(Some(&[mode_config.single_provider.clone()]))
             }
             QueryMode::Multi => {
-                manager.get_providers_for_query(Some(&config.cli.multi_providers))
+                manager.get_providers_for_query(Some(&mode_config.multi_providers))
             }
         }
     };
@@ -189,7 +200,6 @@ async fn main() -> Result<()> {
 
     // Determine display options
     let _stream = !cli.no_stream && config.default.stream; // Reserved for future multi-provider streaming
-    let use_tui = !cli.no_tui && (cli.tui || config.default.tui);
     let footer = config.footer.clone();
 
     // Parse reasoning effort and get display string
@@ -215,39 +225,95 @@ async fn main() -> Result<()> {
         None => (None, None), // Default: no reasoning specified
     };
 
+    // Build search engine (primary + optional fallback) if --search flag set
+    let search_client = if cli.search {
+        // Determine primary: CLI override > config
+        let primary_name = cli
+            .search_provider
+            .as_deref()
+            .unwrap_or(&config.search.provider)
+            .to_lowercase();
+
+        // Build a named provider, returning None if its key isn't available
+        let build = |name: &str| -> Option<search::SearchProvider> {
+            match name {
+                "gemini" => search::GeminiSearchClient::from_env(
+                    &config.search.gemini.api_key_env,
+                    &config.search.gemini.fallback_api_key_env,
+                    &config.search.gemini.model,
+                )
+                .map(search::SearchProvider::Gemini),
+                "tavily" => search::TavilyClient::from_env(
+                    &config.search.tavily.api_key_env,
+                    config.search.max_results,
+                )
+                .map(search::SearchProvider::Tavily),
+                _ => None,
+            }
+        };
+
+        // Primary must build successfully — user explicitly chose it
+        let primary = match build(&primary_name) {
+            Some(p) => p,
+            None => {
+                match primary_name.as_str() {
+                    "gemini" => {
+                        eprintln!(
+                            "Error: search provider 'gemini' requires {} or {} to be set.",
+                            config.search.gemini.api_key_env,
+                            config.search.gemini.fallback_api_key_env,
+                        );
+                    }
+                    "tavily" => {
+                        eprintln!(
+                            "Error: search provider 'tavily' requires {} to be set.",
+                            config.search.tavily.api_key_env,
+                        );
+                        eprintln!("Get a free Tavily API key at https://tavily.com");
+                    }
+                    other => {
+                        eprintln!("Error: unknown search provider '{}'. Valid options: gemini, tavily.", other);
+                    }
+                }
+                std::process::exit(1);
+            }
+        };
+
+        // Fallback: whichever provider the primary isn't, if its key is available
+        let fallback_name = if primary_name == "gemini" { "tavily" } else { "gemini" };
+        let fallback = build(fallback_name);
+
+        Some(Arc::new(search::SearchEngine::new(primary, fallback)))
+    } else {
+        None
+    };
+
+    // Build query context
+    let mut ctx = query::QueryContext::new(&question)
+        .with_system_prompt(system_prompt)
+        .with_reasoning(reasoning_effort);
+    if let Some(client) = search_client {
+        ctx = ctx.with_search(client, config.search.max_iterations);
+    }
+
     if use_tui {
         // Phase 2: TUI mode
         crate::ui::run_tui(
             manager,
             providers_to_query,
+            ctx,
             &question,
-            system_prompt,
             footer.show_tokens,
-            reasoning_effort,
         )
         .await?;
     } else if providers_to_query.len() == 1 && !cli.no_stream {
         // Single provider: always stream (no interleaving issue) unless explicitly disabled
-        let rx = query::stream_all(
-            Arc::clone(&manager),
-            providers_to_query.clone(),
-            &question,
-            system_prompt,
-            reasoning_effort,
-        )
-        .await;
+        let rx = query::stream_all(Arc::clone(&manager), providers_to_query.clone(), ctx).await;
 
         display::display_streaming(rx, &providers_to_query, &footer, cli.raw, reasoning_str.clone()).await;
     } else {
         // Non-streaming mode
-        let responses = query::query_all(
-            Arc::clone(&manager),
-            providers_to_query,
-            &question,
-            system_prompt,
-            reasoning_effort,
-        )
-        .await;
+        let responses = query::query_all(Arc::clone(&manager), providers_to_query, ctx).await;
 
         if cli.raw {
             display::print_raw_responses(&responses);

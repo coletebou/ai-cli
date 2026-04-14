@@ -40,5 +40,8 @@ reqwest = { version = "0.12", features = ["json"] }
 colored = "2"
 termimad = "0.30"
 
+# Markdown Parsing (for TUI rendering)
+pulldown-cmark = "0.11"
+
 # Async Streaming
 tokio-stream = "0.1"

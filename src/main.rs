@@ -10,7 +10,8 @@ mod search;
 mod ui;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use config::Config;
 use genai::chat::ReasoningEffort;
 use providers::ProviderManager;
@@ -132,6 +133,11 @@ enum Command {
         #[arg(long)]
         free: bool,
     },
+    /// Generate shell completion script (bash, zsh, fish, elvish, powershell)
+    Completions {
+        /// Shell to generate completions for
+        shell: Shell,
+    },
 }
 
 #[tokio::main]
@@ -150,6 +156,12 @@ async fn main() -> Result<()> {
                 refresh,
                 free,
             } => models::list_models(search.as_deref(), refresh, free).await,
+            Command::Completions { shell } => {
+                let mut cmd = Cli::command();
+                let bin_name = cmd.get_name().to_string();
+                generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+                Ok(())
+            }
         };
     }
 

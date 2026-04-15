@@ -105,6 +105,20 @@ ai models                           # list available OpenRouter models
 ai models --free                    # only free models
 ai models --refresh                 # force-refresh model cache
 ai models "llama"                   # filter by name
+ai completions zsh                  # generate shell completion script
+```
+
+## Shell completions
+
+```bash
+# zsh
+ai completions zsh > ~/.zfunc/_ai       # then: fpath+=(~/.zfunc); autoload -Uz compinit && compinit
+
+# bash
+ai completions bash > ~/.local/share/bash-completion/completions/ai
+
+# fish
+ai completions fish > ~/.config/fish/completions/ai.fish
 ```
 
 ## Interactive chat

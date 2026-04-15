@@ -19,6 +19,7 @@ crossterm = "0.28"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 
 # Async Runtime
 tokio = { version = "1", features = ["full"] }

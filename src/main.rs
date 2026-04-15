@@ -181,18 +181,20 @@ async fn main() -> Result<()> {
     let expanded = context::expand_file_refs(&raw_question)?;
     let question = context::merge_stdin(&expanded, stdin);
 
-    // Require some question unless --interactive (which can enter chat empty)
-    if question.trim().is_empty() && !cli.interactive {
-        anyhow::bail!(
-            "Missing required argument: <QUESTION>\n\nUsage: ai <QUESTION>\n       cat file | ai <QUESTION>\n       ai -i [QUESTION]\n       ai --init"
-        );
-    }
-
     // Load configuration
     let config = Config::load()?;
 
     // Determine TUI mode first — it affects provider and model tier selection
     let use_tui = !cli.no_tui && (cli.tui || config.default.tui);
+
+    // Require a question only for one-shot modes. Interactive chat (-i) and
+    // the TUI both now launch into a prompt/input box, so an empty question
+    // is a valid "open the UI and wait" invocation.
+    if question.trim().is_empty() && !cli.interactive && !use_tui {
+        anyhow::bail!(
+            "Missing required argument: <QUESTION>\n\nUsage: ai <QUESTION>\n       cat file | ai <QUESTION>\n       ai -i [QUESTION]\n       ai -t [QUESTION]\n       ai --init"
+        );
+    }
     let mode_config = if use_tui {
         &config.tui_mode
     } else {

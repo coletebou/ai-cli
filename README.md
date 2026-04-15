@@ -12,7 +12,7 @@ $ ai -w "latest release of tokio?"          # with web search
 ## Highlights
 
 - **One CLI, many providers.** Unified interface over Anthropic, OpenAI, Google, xAI, and OpenRouter via the [`genai`](https://crates.io/crates/genai) crate.
-- **Side-by-side TUI.** `-t` splits the terminal into per-provider panels with proper markdown rendering (headings, bold, italics, lists, tables, code blocks).
+- **Side-by-side TUI.** `-t` splits the terminal into per-provider panels with proper markdown rendering. Interactive by default: type follow-ups, scroll with the mouse wheel, cancel with Ctrl+C.
 - **Streaming by default.** Tokens appear as they arrive; no waiting for the full response.
 - **Web search tool use.** `-w` exposes a `web_search` tool to any model — backed by Gemini (Google Search grounding) or Tavily, with automatic fallback.
 - **Interactive chat.** `-i` keeps conversation history so you can ask follow-ups. `/clear`, `/history`, `/help` built in.
@@ -159,6 +159,33 @@ Slash commands inside chat:
 
 Chat is single-provider — if multiple are configured, the first is used and the rest are noted as skipped.
 
+## Interactive TUI
+
+```bash
+ai -t                      # open empty, type your first question
+ai -t "initial question"   # seed the first turn
+```
+
+The TUI is a long-running chat: type a message, hit Enter, read responses in each panel, type a follow-up. Each provider keeps its own history, so you can compare how they handle a conversation over multiple turns.
+
+**Keybinds** — vim-style modes:
+
+| Mode | Key | Action |
+|------|-----|--------|
+| Normal | `i` | Enter insert mode |
+| Normal | `h` / `l` / `←` / `→` / `Tab` | Cycle between panels |
+| Normal | `j` / `k` / `↑` / `↓` | Scroll selected panel |
+| Normal | `PageUp` / `PageDown` | Page-size scroll |
+| Normal | `q` / `Esc` | Quit (Esc cancels first if streaming) |
+| Insert | `Enter` | Submit turn to all panels |
+| Insert | `Esc` | Back to normal |
+| Insert | `Ctrl+C` | Cancel in-flight turn, or clear line |
+| Any | Mouse wheel | Scroll the panel under the cursor |
+
+Slash commands in the input box: `/clear` (reset all histories), `/exit` (quit).
+
+Mouse capture is enabled so the wheel scrolls panels natively. To text-select in the terminal (which mouse capture normally blocks), hold `Shift` (iTerm2, Terminal.app, most Linux terminals) or `Option`.
+
 ## Flags reference
 
 | Flag                        | Description                                       |
@@ -192,7 +219,7 @@ src/
 ├── display.rs    Sequential + streaming terminal output
 ├── chat.rs       Interactive chat (rustyline) with slash commands
 ├── models.rs     OpenRouter model listing
-└── ui.rs         Ratatui TUI — side-by-side panels
+└── ui.rs         Ratatui TUI — interactive side-by-side chat panels
 ```
 
 **Data flow:** CLI → Config → `ProviderManager` → `query_all`/`stream_all` (concurrent) → `Display` / TUI panels.

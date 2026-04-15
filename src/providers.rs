@@ -71,7 +71,7 @@ impl ProviderManager {
                     "OpenAI" => "openai",
                     "Gemini" => "google",
                     "Ollama" => "ollama",
-                    "XAi" => "xai",
+                    "xAi" => "xai",
                     _ => return Ok(None),
                 };
 
@@ -83,7 +83,7 @@ impl ProviderManager {
                         "Anthropic" => "ANTHROPIC_API_KEY",
                         "OpenAI" => "OPENAI_API_KEY",
                         "Gemini" => "GEMINI_API_KEY",
-                        "XAi" => "XAI_API_KEY",
+                        "xAi" => "XAI_API_KEY",
                         _ => return Ok(None),
                     };
 

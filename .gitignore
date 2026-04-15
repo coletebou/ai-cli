@@ -5,3 +5,4 @@
 
 # Local session/memory state (not part of the project)
 .remember/
+.claude/

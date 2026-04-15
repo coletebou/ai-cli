@@ -4,13 +4,14 @@ use crate::providers::{Provider, ProviderManager};
 use crate::query::{stream_with_messages, QueryContext, StreamEvent};
 use anyhow::Result;
 use colored::Colorize;
-use genai::chat::ChatMessage;
+use genai::chat::{ChatMessage, ChatRole, ContentPart};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Slash command recognized in the interactive prompt.
+#[derive(Debug)]
 enum Command {
     Exit,
     Clear,
@@ -20,12 +21,10 @@ enum Command {
 }
 
 fn parse_command(line: &str) -> Option<Command> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with('/') {
-        return None;
-    }
-    let cmd = trimmed.trim_start_matches('/').to_lowercase();
-    let cmd = cmd.split_whitespace().next().unwrap_or("");
+    // strip_prefix removes exactly one leading '/', so `//history` becomes an
+    // unknown command rather than silently aliasing to History.
+    let body = line.trim().strip_prefix('/')?.to_lowercase();
+    let cmd = body.split_whitespace().next().unwrap_or("");
     Some(match cmd {
         "exit" | "quit" | "q" => Command::Exit,
         "clear" | "reset" => Command::Clear,
@@ -64,30 +63,95 @@ fn print_help() {
         "  {}  — clear conversation history (keeps system prompt)",
         "/clear, /reset".cyan()
     );
-    println!("  {}  — show message count", "/history".cyan());
+    println!("  {}  — print conversation so far", "/history".cyan());
     println!("  {}  — show this help", "/help".cyan());
     println!();
 }
 
-fn print_history_summary(messages: &[ChatMessage]) {
+/// Maximum characters of each message body shown in `/history`. Longer
+/// messages are truncated with a `… (+N chars)` suffix.
+const HISTORY_MAX_CHARS: usize = 240;
+
+/// One-line summary of a message's content for `/history` output.
+/// Collapses whitespace, renders tool calls/responses as bracketed markers,
+/// and truncates to `HISTORY_MAX_CHARS`.
+fn summarize_content(msg: &ChatMessage) -> String {
+    let mut pieces: Vec<String> = Vec::new();
+    for part in msg.content.parts() {
+        match part {
+            ContentPart::Text(t) => pieces.push(t.clone()),
+            ContentPart::ToolCall(tc) => {
+                let arg_preview = tc
+                    .fn_arguments
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .map(|s| format!("{:?}", s))
+                    .unwrap_or_else(|| tc.fn_arguments.to_string());
+                pieces.push(format!("[→ {}({})]", tc.fn_name, arg_preview));
+            }
+            ContentPart::ToolResponse(tr) => {
+                pieces.push(format!("[← tool result: {} chars]", tr.content.len()));
+            }
+            _ => {}
+        }
+    }
+    let joined = pieces
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let total_chars = joined.chars().count();
+    if total_chars > HISTORY_MAX_CHARS {
+        let head: String = joined.chars().take(HISTORY_MAX_CHARS).collect();
+        format!(
+            "{}{}",
+            head,
+            format!("… (+{} chars)", total_chars - HISTORY_MAX_CHARS).dimmed()
+        )
+    } else {
+        joined
+    }
+}
+
+fn print_history(messages: &[ChatMessage]) {
+    println!();
+    if messages.is_empty() {
+        println!("{}", "history: (empty)".dimmed());
+        println!();
+        return;
+    }
+
+    for (i, msg) in messages.iter().enumerate() {
+        let (label, color) = match msg.role {
+            ChatRole::System => ("system", colored::Color::Yellow),
+            ChatRole::User => ("user", colored::Color::Cyan),
+            ChatRole::Assistant => ("assistant", colored::Color::Green),
+            ChatRole::Tool => ("tool", colored::Color::Magenta),
+        };
+        let body = summarize_content(msg);
+        println!(
+            "  {:>2}. [{}] {}",
+            i + 1,
+            format!("{:<9}", label).color(color).bold(),
+            body
+        );
+    }
+
     let user_count = messages
         .iter()
-        .filter(|m| matches!(m.role, genai::chat::ChatRole::User))
+        .filter(|m| matches!(m.role, ChatRole::User))
         .count();
     let assistant_count = messages
         .iter()
-        .filter(|m| matches!(m.role, genai::chat::ChatRole::Assistant))
+        .filter(|m| matches!(m.role, ChatRole::Assistant))
         .count();
-    let has_system = messages
-        .iter()
-        .any(|m| matches!(m.role, genai::chat::ChatRole::System));
     println!();
     println!(
-        "{} {} user, {} assistant{}",
-        "history:".dimmed(),
+        "  {} {} user, {} assistant",
+        "total:".dimmed(),
         user_count,
         assistant_count,
-        if has_system { " (+ system prompt)" } else { "" },
     );
     println!();
 }
@@ -206,7 +270,7 @@ pub async fn run_interactive(
                             continue;
                         }
                         Command::History => {
-                            print_history_summary(&messages);
+                            print_history(&messages);
                             continue;
                         }
                         Command::Help => {
@@ -258,4 +322,65 @@ pub async fn run_interactive(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_command_recognizes_aliases() {
+        assert!(matches!(parse_command("/exit"), Some(Command::Exit)));
+        assert!(matches!(parse_command("/quit"), Some(Command::Exit)));
+        assert!(matches!(parse_command("/q"), Some(Command::Exit)));
+        assert!(matches!(parse_command("/clear"), Some(Command::Clear)));
+        assert!(matches!(parse_command("/reset"), Some(Command::Clear)));
+        assert!(matches!(parse_command("/history"), Some(Command::History)));
+        assert!(matches!(parse_command("/log"), Some(Command::History)));
+        assert!(matches!(parse_command("/help"), Some(Command::Help)));
+        assert!(matches!(parse_command("/?"), Some(Command::Help)));
+    }
+
+    #[test]
+    fn parse_command_ignores_non_slash_input() {
+        assert!(parse_command("hello world").is_none());
+        assert!(parse_command("  hi").is_none());
+    }
+
+    #[test]
+    fn parse_command_flags_unknown_slash_commands() {
+        match parse_command("/wibble") {
+            Some(Command::Unknown(name)) => assert_eq!(name, "wibble"),
+            other => panic!("expected Unknown, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_command_rejects_multiple_leading_slashes() {
+        // strip_prefix only peels one '/', so `//history` is treated as the
+        // unknown command "/history" rather than aliasing to History.
+        match parse_command("//history") {
+            Some(Command::Unknown(name)) => assert_eq!(name, "/history"),
+            other => panic!("expected Unknown(\"/history\"), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn summarize_content_truncates_long_text() {
+        let long = "word ".repeat(200); // ~1000 chars
+        let msg = ChatMessage::user(long.clone());
+        let out = summarize_content(&msg);
+        assert!(
+            out.contains("… "),
+            "expected truncation marker, got: {}",
+            out
+        );
+        assert!(out.contains("chars)"), "expected char count suffix");
+    }
+
+    #[test]
+    fn summarize_content_collapses_whitespace() {
+        let msg = ChatMessage::user("hello\n\n   world\t\tagain");
+        assert_eq!(summarize_content(&msg), "hello world again");
+    }
 }

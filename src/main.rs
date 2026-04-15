@@ -1,3 +1,4 @@
+mod chat;
 mod config;
 mod config_ui;
 mod display;
@@ -110,6 +111,10 @@ struct Cli {
     /// Override search provider for this query ("gemini" or "tavily")
     #[arg(long, value_name = "PROVIDER")]
     search_provider: Option<String>,
+
+    /// Interactive chat mode (follow-up questions with conversation history)
+    #[arg(short = 'i', long)]
+    interactive: bool,
 }
 
 #[derive(Subcommand)]
@@ -152,9 +157,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Require question if not --init
-    if cli.question.is_empty() {
-        anyhow::bail!("Missing required argument: <QUESTION>\n\nUsage: ai <QUESTION>\n       ai --init");
+    // Require question unless --init or --interactive (which can enter chat empty)
+    if cli.question.is_empty() && !cli.interactive {
+        anyhow::bail!(
+            "Missing required argument: <QUESTION>\n\nUsage: ai <QUESTION>\n       ai -i [QUESTION]\n       ai --init"
+        );
     }
     let question = cli.question.join(" ");
 
@@ -294,6 +301,23 @@ async fn main() -> Result<()> {
         .with_reasoning(reasoning_effort);
     if let Some(client) = search_client {
         ctx = ctx.with_search(client, config.search.max_iterations);
+    }
+
+    // Interactive chat mode takes precedence over other dispatch modes.
+    // Multi-provider chat is confusing; pick the first viable provider.
+    if cli.interactive {
+        let provider = providers_to_query
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no provider available for chat"))?;
+        if providers_to_query.len() > 1 {
+            eprintln!(
+                "Note: chat mode is single-provider; using {} (ignoring others)",
+                provider.display_name
+            );
+        }
+        let initial = if question.is_empty() { None } else { Some(question.clone()) };
+        return crate::chat::run_interactive(manager, provider, ctx, footer, initial).await;
     }
 
     if use_tui {

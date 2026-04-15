@@ -299,11 +299,29 @@ pub async fn stream_single(
     ctx: &QueryContext,
     tx: mpsc::Sender<StreamEvent>,
 ) {
+    let messages = build_initial_messages(&ctx.question, ctx.system_prompt.as_deref());
+    let _ = stream_with_messages(manager, provider, messages, ctx, tx).await;
+}
+
+/// Stream a single response from `provider` using the given prebuilt message
+/// history. This is the core streaming routine used by both single-shot and
+/// multi-turn (chat) modes. The tool-use loop (for search) is executed here.
+///
+/// Returns the enriched message history including any tool-call assistant
+/// messages, tool-response messages, and the final assistant text reply. For
+/// single-shot callers the return value can be ignored; chat mode uses it to
+/// preserve full tool-use context across turns.
+pub async fn stream_with_messages(
+    manager: &ProviderManager,
+    provider: &Provider,
+    mut messages: Vec<ChatMessage>,
+    ctx: &QueryContext,
+    tx: mpsc::Sender<StreamEvent>,
+) -> Vec<ChatMessage> {
     let start = Instant::now();
     let provider_name = provider.display_name.clone();
     let model = provider.model.clone();
 
-    let mut messages = build_initial_messages(&ctx.question, ctx.system_prompt.as_deref());
     let options = build_options(ctx);
 
     let _ = tx
@@ -315,6 +333,10 @@ pub async fn stream_single(
 
     let mut total_input: Option<i32> = None;
     let mut total_output: Option<i32> = None;
+    // Text emitted on the FINAL iteration (the one that exits the loop). Earlier
+    // iterations may also emit narration before returning a tool call — we
+    // discard that so it doesn't leak into the persisted assistant reply.
+    let mut final_text = String::new();
 
     for iteration in 0..ctx.max_iterations.max(1) {
         let stream_response = match manager
@@ -337,18 +359,23 @@ pub async fn stream_single(
                         duration_ms,
                     })
                     .await;
-                return;
+                return messages;
             }
         };
 
         let mut stream = stream_response.stream;
         let mut captured_tool_calls: Vec<ToolCall> = Vec::new();
         let mut captured_thoughts: Vec<String> = Vec::new();
+        // Reset per-iteration text. Only the text from the iteration that
+        // actually exits the loop (the non-tool-call one) is kept as the
+        // assistant's final reply.
+        let mut iter_text = String::new();
 
         while let Some(event) = stream.next().await {
             match event {
                 Ok(ChatStreamEvent::Chunk(chunk)) => {
                     if !chunk.content.is_empty() {
+                        iter_text.push_str(&chunk.content);
                         let _ = tx
                             .send(StreamEvent::Chunk {
                                 provider: provider_name.clone(),
@@ -392,23 +419,26 @@ pub async fn stream_single(
                             duration_ms,
                         })
                         .await;
-                    return;
+                    return messages;
                 }
             }
         }
 
-        // Done if no tool calls
+        // Done if no tool calls — this iteration's text is the final answer
         if captured_tool_calls.is_empty() {
+            final_text = iter_text;
             break;
         }
 
-        // No search client? Can't execute — stop
+        // No search client? Can't execute — keep whatever text we got and stop
         if ctx.search_client.is_none() {
+            final_text = iter_text;
             break;
         }
 
         // Safety: stop if we're at the last iteration (results would not be used)
         if iteration + 1 >= ctx.max_iterations {
+            final_text = iter_text;
             break;
         }
 
@@ -432,6 +462,12 @@ pub async fn stream_single(
         }
     }
 
+    // Persist the final assistant reply in the message history so multi-turn
+    // callers see it on subsequent turns.
+    if !final_text.is_empty() {
+        messages.push(ChatMessage::assistant(final_text));
+    }
+
     let duration_ms = start.elapsed().as_millis() as u64;
     let _ = tx
         .send(StreamEvent::Done {
@@ -442,6 +478,8 @@ pub async fn stream_single(
             duration_ms,
         })
         .await;
+
+    messages
 }
 
 pub async fn stream_all(

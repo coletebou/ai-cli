@@ -43,5 +43,8 @@ termimad = "0.30"
 # Markdown Parsing (for TUI rendering)
 pulldown-cmark = "0.11"
 
+# Interactive chat mode — readline-style input editing with history
+rustyline = "14"
+
 # Async Streaming
 tokio-stream = "0.1"

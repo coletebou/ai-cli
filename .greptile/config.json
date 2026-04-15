@@ -1,0 +1,59 @@
+{
+  "strictness": 2,
+  "commentTypes": ["logic", "style"],
+  "triggerOnUpdates": true,
+  "triggerOnDrafts": false,
+  "updateExistingSummaryComment": false,
+  "statusCheck": true,
+  "statusCommentsEnabled": true,
+  "shouldUpdateDescription": false,
+  "excludeAuthors": ["dependabot[bot]", "renovate[bot]"],
+  "disabledLabels": ["skip-review", "wip"],
+  "ignorePatterns": "target/**\nCargo.lock\ndist/**\n**/*.snap\nbacklog/**",
+  "instructions": "Rust CLI for multi-provider AI queries (Anthropic, OpenAI, Google, xAI, OpenRouter). Tokio async + ratatui TUI + genai crate. Single binary, distributed via `cargo install` and homebrew. Users install personal configs at ~/.config/ai-cli/config.toml. Org-level review rules already apply — this file only adds ai-cli-specific rules.",
+  "rules": [
+    {
+      "id": "streaming-is-product-requirement",
+      "severity": "high",
+      "rule": "Streaming is a product requirement, not an optimization. Provider adapter changes that buffer full responses before yielding are a defect. Output must appear token-by-token from the first byte available. Flag any .collect() on a stream, .await on a full response body, or accumulation into a String before yielding to the UI layer.",
+      "scope": ["src/**/*.rs"]
+    },
+    {
+      "id": "async-cancellation-discipline",
+      "severity": "medium",
+      "rule": "Async cancellation discipline: every tokio::spawn must have a managed JoinHandle or an explicit // DETACH: reason comment. Unbounded channels (tokio::sync::mpsc::unbounded_channel) require a bounded alternative or a justifying comment. Orphaned tasks are a leak.",
+      "scope": ["src/**/*.rs"]
+    },
+    {
+      "id": "provider-adapter-parity",
+      "severity": "medium",
+      "rule": "Provider parity: when one provider adapter gains a capability (web search, tool use, reasoning budget, cache control, vision), note in the review whether the other adapters should gain the same capability. Silent drift between adapters degrades the CLI's 'one interface, many providers' promise.",
+      "scope": ["src/**/*.rs"]
+    },
+    {
+      "id": "secrets-never-in-argv-or-logs",
+      "severity": "high",
+      "rule": "Secrets: API keys read from env vars or keychain (macOS Security framework / Linux Secret Service) only. NEVER from argv (visible in `ps`), never logged, never printed in error messages, never serialized into config files. Flag any format!/println!/eprintln! that interpolates a key-like identifier.",
+      "scope": ["src/**/*.rs"]
+    },
+    {
+      "id": "config-backward-compat",
+      "severity": "medium",
+      "rule": "Config schema changes to ~/.config/ai-cli/config.toml must be backward-compatible OR ship a migration path. Real users have real configs in the wild — hard breaks are a support problem. Flag any field rename/removal without a serde(alias) or explicit migration.",
+      "scope": ["src/**/*.rs"]
+    },
+    {
+      "id": "clippy-pedantic-unwrap",
+      "severity": "medium",
+      "rule": "Clippy-pedantic level is expected. Flag new code that adds .unwrap() or .expect() in non-test non-example code without a // SAFETY: or // OK_BECAUSE: comment explaining why panic is acceptable.",
+      "scope": ["src/**/*.rs"]
+    },
+    {
+      "id": "cli-flag-changes-need-changelog",
+      "severity": "medium",
+      "rule": "CLI flag changes: any breaking rename of a short/long flag requires a CHANGELOG entry and ideally a deprecation alias for one release. Users have muscle memory for the short flags.",
+      "scope": ["src/**/*.rs"]
+    }
+  ],
+  "disabledRules": []
+}

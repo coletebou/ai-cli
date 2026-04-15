@@ -1,0 +1,14 @@
+[
+  {
+    "path": "README.md",
+    "description": "CLI usage, feature overview, and install instructions"
+  },
+  {
+    "path": "CHANGELOG.md",
+    "description": "Release history — required entry for breaking changes"
+  },
+  {
+    "path": "CLAUDE.md",
+    "description": "Project-specific conventions"
+  }
+]

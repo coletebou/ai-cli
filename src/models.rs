@@ -166,7 +166,10 @@ pub async fn list_models(search: Option<&str>, refresh: bool, free_only: bool) -
                     fetch_and_cache(api_key.as_deref()).await?
                 }
             } else {
-                eprintln!("{} Cache expired, fetching fresh list...", "[fetch]".dimmed());
+                eprintln!(
+                    "{} Cache expired, fetching fresh list...",
+                    "[fetch]".dimmed()
+                );
                 fetch_and_cache(api_key.as_deref()).await?
             }
         } else {
@@ -229,7 +232,7 @@ pub async fn list_models(search: Option<&str>, refresh: bool, free_only: bool) -
     for model in &filtered {
         let ctx = model
             .context_length
-            .map(|c| format_context(c))
+            .map(format_context)
             .unwrap_or_else(|| "—".to_string());
 
         let (in_price, out_price) = match &model.pricing {
@@ -240,7 +243,10 @@ pub async fn list_models(search: Option<&str>, refresh: bool, free_only: bool) -
             None => ("—".to_string(), "—".to_string()),
         };
 
-        println!("{:<45} {:>8} {:>12} {:>12}", model.id, ctx, in_price, out_price);
+        println!(
+            "{:<45} {:>8} {:>12} {:>12}",
+            model.id, ctx, in_price, out_price
+        );
     }
 
     println!(

@@ -217,7 +217,12 @@ pub async fn query_single(
             Ok(r) => r,
             Err(e) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
-                return ProviderResponse::error(provider.clone(), model, format!("{:#}", e), duration_ms);
+                return ProviderResponse::error(
+                    provider.clone(),
+                    model,
+                    format!("{:#}", e),
+                    duration_ms,
+                );
             }
         };
 
@@ -455,8 +460,7 @@ pub async fn stream_with_messages(
 
         // Execute each tool call
         for tool_call in &captured_tool_calls {
-            let result_text =
-                execute_tool_call(tool_call, ctx, &provider_name, Some(&tx)).await;
+            let result_text = execute_tool_call(tool_call, ctx, &provider_name, Some(&tx)).await;
             let tool_response = ToolResponse::new(tool_call.call_id.clone(), result_text);
             messages.push(ChatMessage::from(tool_response));
         }

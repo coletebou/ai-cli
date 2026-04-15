@@ -145,9 +145,11 @@ async fn main() -> Result<()> {
     if let Some(command) = cli.command {
         return match command {
             Command::Config => config_ui::run_config_ui().await,
-            Command::Models { search, refresh, free } => {
-                models::list_models(search.as_deref(), refresh, free).await
-            }
+            Command::Models {
+                search,
+                refresh,
+                free,
+            } => models::list_models(search.as_deref(), refresh, free).await,
         };
     }
 
@@ -170,10 +172,17 @@ async fn main() -> Result<()> {
 
     // Determine TUI mode first — it affects provider and model tier selection
     let use_tui = !cli.no_tui && (cli.tui || config.default.tui);
-    let mode_config = if use_tui { &config.tui_mode } else { &config.cli };
+    let mode_config = if use_tui {
+        &config.tui_mode
+    } else {
+        &config.cli
+    };
 
     // Create provider manager with the correct model tier for the active mode
-    let manager = Arc::new(ProviderManager::new(config.clone(), mode_config.model_tier.clone())?);
+    let manager = Arc::new(ProviderManager::new(
+        config.clone(),
+        mode_config.model_tier,
+    )?);
 
     // Determine which providers to query based on CLI args and active mode config
     let providers_to_query = if cli.all {
@@ -183,12 +192,9 @@ async fn main() -> Result<()> {
     } else {
         use config::QueryMode;
         match mode_config.default_mode {
-            QueryMode::Single => {
-                manager.get_providers_for_query(Some(&[mode_config.single_provider.clone()]))
-            }
-            QueryMode::Multi => {
-                manager.get_providers_for_query(Some(&mode_config.multi_providers))
-            }
+            QueryMode::Single => manager
+                .get_providers_for_query(Some(std::slice::from_ref(&mode_config.single_provider))),
+            QueryMode::Multi => manager.get_providers_for_query(Some(&mode_config.multi_providers)),
         }
     };
 
@@ -203,7 +209,10 @@ async fn main() -> Result<()> {
     }
 
     // Determine system prompt
-    let system_prompt = cli.system.as_deref().or(config.default.system_prompt.as_deref());
+    let system_prompt = cli
+        .system
+        .as_deref()
+        .or(config.default.system_prompt.as_deref());
 
     // Determine display options
     let _stream = !cli.no_stream && config.default.stream; // Reserved for future multi-provider streaming
@@ -279,7 +288,10 @@ async fn main() -> Result<()> {
                         eprintln!("Get a free Tavily API key at https://tavily.com");
                     }
                     other => {
-                        eprintln!("Error: unknown search provider '{}'. Valid options: gemini, tavily.", other);
+                        eprintln!(
+                            "Error: unknown search provider '{}'. Valid options: gemini, tavily.",
+                            other
+                        );
                     }
                 }
                 std::process::exit(1);
@@ -287,7 +299,11 @@ async fn main() -> Result<()> {
         };
 
         // Fallback: whichever provider the primary isn't, if its key is available
-        let fallback_name = if primary_name == "gemini" { "tavily" } else { "gemini" };
+        let fallback_name = if primary_name == "gemini" {
+            "tavily"
+        } else {
+            "gemini"
+        };
         let fallback = build(fallback_name);
 
         Some(Arc::new(search::SearchEngine::new(primary, fallback)))
@@ -316,7 +332,11 @@ async fn main() -> Result<()> {
                 provider.display_name
             );
         }
-        let initial = if question.is_empty() { None } else { Some(question.clone()) };
+        let initial = if question.is_empty() {
+            None
+        } else {
+            Some(question.clone())
+        };
         return crate::chat::run_interactive(manager, provider, ctx, footer, initial).await;
     }
 
@@ -334,7 +354,14 @@ async fn main() -> Result<()> {
         // Single provider: always stream (no interleaving issue) unless explicitly disabled
         let rx = query::stream_all(Arc::clone(&manager), providers_to_query.clone(), ctx).await;
 
-        display::display_streaming(rx, &providers_to_query, &footer, cli.raw, reasoning_str.clone()).await;
+        display::display_streaming(
+            rx,
+            &providers_to_query,
+            &footer,
+            cli.raw,
+            reasoning_str.clone(),
+        )
+        .await;
     } else {
         // Non-streaming mode
         let responses = query::query_all(Arc::clone(&manager), providers_to_query, ctx).await;

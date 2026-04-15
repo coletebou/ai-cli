@@ -21,7 +21,7 @@ fn main() {
     let repo_path = repo_output
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "".to_string());
+        .unwrap_or_default();
 
     // Export as compile-time environment variables
     println!("cargo:rustc-env=AI_CLI_GIT_HASH={}", commit_hash);

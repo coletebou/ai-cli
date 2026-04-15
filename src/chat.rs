@@ -70,7 +70,10 @@ fn print_help() {
 }
 
 fn print_history_summary(messages: &[ChatMessage]) {
-    let user_count = messages.iter().filter(|m| matches!(m.role, genai::chat::ChatRole::User)).count();
+    let user_count = messages
+        .iter()
+        .filter(|m| matches!(m.role, genai::chat::ChatRole::User))
+        .count();
     let assistant_count = messages
         .iter()
         .filter(|m| matches!(m.role, genai::chat::ChatRole::Assistant))

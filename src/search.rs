@@ -181,11 +181,7 @@ impl GeminiSearchClient {
         let key = std::env::var(env_var)
             .ok()
             .filter(|k| !k.is_empty())
-            .or_else(|| {
-                std::env::var(fallback_env)
-                    .ok()
-                    .filter(|k| !k.is_empty())
-            })?;
+            .or_else(|| std::env::var(fallback_env).ok().filter(|k| !k.is_empty()))?;
 
         Some(GeminiSearchClient {
             api_key: key,
@@ -246,9 +242,7 @@ impl GeminiSearchClient {
 fn parse_gemini_grounding(json: &Value, query: &str) -> Vec<SearchResult> {
     let mut results = Vec::new();
 
-    let candidate = json
-        .get("candidates")
-        .and_then(|c| c.get(0));
+    let candidate = json.get("candidates").and_then(|c| c.get(0));
 
     // Extract synthesized answer text (concatenation of all text parts)
     let answer_text: String = candidate

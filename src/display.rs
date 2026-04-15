@@ -39,7 +39,12 @@ pub fn print_header(provider: &Provider, status: &str) {
     let content_len = header.len() + status_str.len();
     let padded_header = if content_len + 2 <= width {
         let padding = width.saturating_sub(content_len + 2);
-        format!("{}{:>width$}", header, status_str, width = padding + status_str.len())
+        format!(
+            "{}{:>width$}",
+            header,
+            status_str,
+            width = padding + status_str.len()
+        )
     } else {
         // Narrow terminal: just show provider name and status without padding
         format!("{} {}", header.trim(), status_str)
@@ -111,7 +116,14 @@ pub fn print_response(response: &ProviderResponse, footer: &FooterConfig, reason
             show_tokens: false,
             show_reasoning: false,
         };
-        print_metadata(&response.model, None, None, response.duration_ms, &error_footer, reasoning);
+        print_metadata(
+            &response.model,
+            None,
+            None,
+            response.duration_ms,
+            &error_footer,
+            reasoning,
+        );
     } else {
         print_header(&response.provider, "complete");
         render_markdown(&response.text);
@@ -126,7 +138,11 @@ pub fn print_response(response: &ProviderResponse, footer: &FooterConfig, reason
     }
 }
 
-pub fn print_responses(responses: &[ProviderResponse], footer: &FooterConfig, reasoning: Option<&str>) {
+pub fn print_responses(
+    responses: &[ProviderResponse],
+    footer: &FooterConfig,
+    reasoning: Option<&str>,
+) {
     for response in responses {
         print_response(response, footer, reasoning);
     }
@@ -138,7 +154,11 @@ pub fn print_raw_responses(responses: &[ProviderResponse]) {
             println!("\n---\n");
         }
         if response.is_error() {
-            eprintln!("[{}] Error: {}", response.provider.display_name, response.error.as_ref().unwrap());
+            eprintln!(
+                "[{}] Error: {}",
+                response.provider.display_name,
+                response.error.as_ref().unwrap()
+            );
         } else {
             println!("[{}]\n{}", response.provider.display_name, response.text);
         }
@@ -162,7 +182,12 @@ pub struct StreamingDisplay {
 }
 
 impl StreamingDisplay {
-    pub fn new(providers: &[Provider], footer: FooterConfig, raw_mode: bool, reasoning: Option<String>) -> Self {
+    pub fn new(
+        providers: &[Provider],
+        footer: FooterConfig,
+        raw_mode: bool,
+        reasoning: Option<String>,
+    ) -> Self {
         // Build lookup map for provider colors
         let provider_colors: std::collections::HashMap<String, colored::Color> = providers
             .iter()
@@ -195,30 +220,43 @@ impl StreamingDisplay {
                 print!("{}", text);
                 let _ = io::stdout().flush();
             }
-            StreamEvent::Done { model, duration_ms, .. } => {
+            StreamEvent::Done {
+                model, duration_ms, ..
+            } => {
                 let duration_str = if duration_ms >= 1000 {
                     format!("{:.1}s", duration_ms as f64 / 1000.0)
                 } else {
                     format!("{}ms", duration_ms)
                 };
                 println!();
-                println!("[model: {} | time: {} | reasoning: {}]", model, duration_str, format_reasoning(self.reasoning.as_deref()));
+                println!(
+                    "[model: {} | time: {} | reasoning: {}]",
+                    model,
+                    duration_str,
+                    format_reasoning(self.reasoning.as_deref())
+                );
             }
-            StreamEvent::Error { provider, error, .. } => {
+            StreamEvent::Error {
+                provider, error, ..
+            } => {
                 eprintln!("[{}] Error: {}", provider, error);
             }
             StreamEvent::SearchStart { provider, query } => {
                 eprintln!("[{}/search] {}", provider, query);
             }
-            StreamEvent::SearchEnd { provider, search_provider, result_count, error, .. } => {
-                match error {
-                    Some(e) => eprintln!("[{}/search] failed: {}", provider, e),
-                    None => eprintln!(
-                        "[{}/search via {}] {} result(s)",
-                        provider, search_provider, result_count
-                    ),
-                }
-            }
+            StreamEvent::SearchEnd {
+                provider,
+                search_provider,
+                result_count,
+                error,
+                ..
+            } => match error {
+                Some(e) => eprintln!("[{}/search] failed: {}", provider, e),
+                None => eprintln!(
+                    "[{}/search via {}] {} result(s)",
+                    provider, search_provider, result_count
+                ),
+            },
         }
     }
 
@@ -226,11 +264,18 @@ impl StreamingDisplay {
         match event {
             StreamEvent::Start { provider, .. } => {
                 // Buffer provider info - don't print header yet
-                let color = self.provider_colors.get(&provider).copied().unwrap_or(colored::Color::White);
-                self.provider_buffers.insert(provider, ProviderBuffer {
-                    color,
-                    content: String::new(),
-                });
+                let color = self
+                    .provider_colors
+                    .get(&provider)
+                    .copied()
+                    .unwrap_or(colored::Color::White);
+                self.provider_buffers.insert(
+                    provider,
+                    ProviderBuffer {
+                        color,
+                        content: String::new(),
+                    },
+                );
             }
             StreamEvent::Chunk { provider, text } => {
                 // Buffer content for this provider
@@ -246,7 +291,8 @@ impl StreamingDisplay {
                 duration_ms,
             } => {
                 // Get buffered content and display complete response
-                let (content, color) = if let Some(buffer) = self.provider_buffers.remove(&provider) {
+                let (content, color) = if let Some(buffer) = self.provider_buffers.remove(&provider)
+                {
                     (buffer.content, buffer.color)
                 } else {
                     (String::new(), colored::Color::White)
@@ -260,7 +306,12 @@ impl StreamingDisplay {
                 let content_len = header.len() + status_str.len();
                 let padded_header = if content_len + 2 <= width {
                     let padding = width.saturating_sub(content_len + 2);
-                    format!("{}{:>width$}", header, status_str, width = padding + status_str.len())
+                    format!(
+                        "{}{:>width$}",
+                        header,
+                        status_str,
+                        width = padding + status_str.len()
+                    )
                 } else {
                     format!("{} {}", header.trim(), status_str)
                 };
@@ -299,7 +350,10 @@ impl StreamingDisplay {
                 }
 
                 if self.footer.show_reasoning {
-                    parts.push(format!("reasoning: {}", format_reasoning(self.reasoning.as_deref())));
+                    parts.push(format!(
+                        "reasoning: {}",
+                        format_reasoning(self.reasoning.as_deref())
+                    ));
                 }
 
                 if !parts.is_empty() {
@@ -307,11 +361,23 @@ impl StreamingDisplay {
                     println!("{}", metadata.dimmed());
                 }
             }
-            StreamEvent::Error { provider, model, error, duration_ms } => {
+            StreamEvent::Error {
+                provider,
+                model,
+                error,
+                duration_ms,
+            } => {
                 // Remove any buffered content for this provider
-                let color = self.provider_buffers.remove(&provider)
+                let color = self
+                    .provider_buffers
+                    .remove(&provider)
                     .map(|b| b.color)
-                    .unwrap_or_else(|| self.provider_colors.get(&provider).copied().unwrap_or(colored::Color::White));
+                    .unwrap_or_else(|| {
+                        self.provider_colors
+                            .get(&provider)
+                            .copied()
+                            .unwrap_or(colored::Color::White)
+                    });
 
                 let width = get_terminal_width();
                 let separator = make_separator(width);
@@ -321,7 +387,12 @@ impl StreamingDisplay {
                 let content_len = header.len() + status_str.len();
                 let padded_header = if content_len + 2 <= width {
                     let padding = width.saturating_sub(content_len + 2);
-                    format!("{}{:>width$}", header, status_str, width = padding + status_str.len())
+                    format!(
+                        "{}{:>width$}",
+                        header,
+                        status_str,
+                        width = padding + status_str.len()
+                    )
                 } else {
                     format!("{} {}", header.trim(), status_str)
                 };
@@ -337,17 +408,28 @@ impl StreamingDisplay {
                 } else {
                     format!("{}ms", duration_ms)
                 };
-                println!("{}", format!("model: {} | time: {}", model, duration_str).dimmed());
+                println!(
+                    "{}",
+                    format!("model: {} | time: {}", model, duration_str).dimmed()
+                );
             }
             StreamEvent::SearchStart { provider, query } => {
                 // Live feedback to stderr so the user sees searches in progress,
                 // and append an inline marker into the buffered content for the final render.
                 eprintln!("  {} {}", "→ search:".dimmed(), query.italic());
                 if let Some(buffer) = self.provider_buffers.get_mut(&provider) {
-                    buffer.content.push_str(&format!("\n*→ searching: {}*\n\n", query));
+                    buffer
+                        .content
+                        .push_str(&format!("\n*→ searching: {}*\n\n", query));
                 }
             }
-            StreamEvent::SearchEnd { provider, search_provider, result_count, error, .. } => {
+            StreamEvent::SearchEnd {
+                provider,
+                search_provider,
+                result_count,
+                error,
+                ..
+            } => {
                 match &error {
                     Some(e) => eprintln!("  {} {}", "← search failed:".dimmed(), e.red()),
                     None => eprintln!(
@@ -358,7 +440,9 @@ impl StreamingDisplay {
                 }
                 if let Some(buffer) = self.provider_buffers.get_mut(&provider) {
                     match error {
-                        Some(e) => buffer.content.push_str(&format!("*← search failed: {}*\n\n", e)),
+                        Some(e) => buffer
+                            .content
+                            .push_str(&format!("*← search failed: {}*\n\n", e)),
                         None => buffer.content.push_str(&format!(
                             "*← via {}: {} result(s)*\n\n",
                             search_provider, result_count

@@ -28,8 +28,8 @@ pub struct PanelState {
     pub is_complete: bool,
     pub error: Option<String>,
     pub scroll_offset: u16,
-    pub content_height: u16,  // Total lines of content (with wrapping)
-    pub visible_height: u16,  // Visible area height
+    pub content_height: u16, // Total lines of content (with wrapping)
+    pub visible_height: u16, // Visible area height
 }
 
 impl PanelState {
@@ -58,7 +58,12 @@ impl PanelState {
         self.text.push_str(text);
     }
 
-    pub fn complete(&mut self, input_tokens: Option<i32>, output_tokens: Option<i32>, duration_ms: u64) {
+    pub fn complete(
+        &mut self,
+        input_tokens: Option<i32>,
+        output_tokens: Option<i32>,
+        duration_ms: u64,
+    ) {
         self.input_tokens = input_tokens;
         self.output_tokens = output_tokens;
         self.duration_ms = duration_ms;
@@ -106,13 +111,21 @@ impl App {
     pub fn handle_event(&mut self, event: StreamEvent) {
         match event {
             StreamEvent::Start { provider, model } => {
-                if let Some(panel) = self.panels.iter_mut().find(|p| p.provider.display_name == provider) {
+                if let Some(panel) = self
+                    .panels
+                    .iter_mut()
+                    .find(|p| p.provider.display_name == provider)
+                {
                     panel.text.clear();
                     panel.model = model;
                 }
             }
             StreamEvent::Chunk { provider, text } => {
-                if let Some(panel) = self.panels.iter_mut().find(|p| p.provider.display_name == provider) {
+                if let Some(panel) = self
+                    .panels
+                    .iter_mut()
+                    .find(|p| p.provider.display_name == provider)
+                {
                     panel.append(&text);
                 }
             }
@@ -123,23 +136,50 @@ impl App {
                 duration_ms,
                 ..
             } => {
-                if let Some(panel) = self.panels.iter_mut().find(|p| p.provider.display_name == provider) {
+                if let Some(panel) = self
+                    .panels
+                    .iter_mut()
+                    .find(|p| p.provider.display_name == provider)
+                {
                     panel.complete(input_tokens, output_tokens, duration_ms);
                 }
             }
-            StreamEvent::Error { provider, error, duration_ms, .. } => {
-                if let Some(panel) = self.panels.iter_mut().find(|p| p.provider.display_name == provider) {
+            StreamEvent::Error {
+                provider,
+                error,
+                duration_ms,
+                ..
+            } => {
+                if let Some(panel) = self
+                    .panels
+                    .iter_mut()
+                    .find(|p| p.provider.display_name == provider)
+                {
                     panel.set_error(error, duration_ms);
                 }
             }
             StreamEvent::SearchStart { provider, query } => {
-                if let Some(panel) = self.panels.iter_mut().find(|p| p.provider.display_name == provider) {
+                if let Some(panel) = self
+                    .panels
+                    .iter_mut()
+                    .find(|p| p.provider.display_name == provider)
+                {
                     // Insert a styled marker that the markdown renderer will italicize
                     panel.append(&format!("\n*→ searching: {}*\n\n", query));
                 }
             }
-            StreamEvent::SearchEnd { provider, search_provider, result_count, error, .. } => {
-                if let Some(panel) = self.panels.iter_mut().find(|p| p.provider.display_name == provider) {
+            StreamEvent::SearchEnd {
+                provider,
+                search_provider,
+                result_count,
+                error,
+                ..
+            } => {
+                if let Some(panel) = self
+                    .panels
+                    .iter_mut()
+                    .find(|p| p.provider.display_name == provider)
+                {
                     match error {
                         Some(err) => panel.append(&format!("*← search failed: {}*\n\n", err)),
                         None => panel.append(&format!(
@@ -233,12 +273,17 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     } else {
         "Loading... | q: quit"
     };
-    let footer = Paragraph::new(help_text)
-        .style(Style::default().fg(Color::Gray));
+    let footer = Paragraph::new(help_text).style(Style::default().fg(Color::Gray));
     frame.render_widget(footer, main_layout[2]);
 }
 
-fn draw_panel(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_selected: bool, show_tokens: bool) {
+fn draw_panel(
+    frame: &mut Frame,
+    panel: &mut PanelState,
+    area: Rect,
+    is_selected: bool,
+    show_tokens: bool,
+) {
     let color = panel.get_color();
     let status = if panel.error.is_some() {
         "error"
@@ -305,7 +350,7 @@ fn draw_panel(frame: &mut Frame, panel: &mut PanelState, area: Rect, is_selected
     for line in &lines {
         let line_len = line.width();
         if inner_width > 0 && line_len > 0 {
-            total_lines += ((line_len + inner_width - 1) / inner_width) as u16;
+            total_lines += line_len.div_ceil(inner_width) as u16;
         } else {
             total_lines += 1;
         }
@@ -339,7 +384,9 @@ pub async fn run_tui(
     // Check if we have a proper terminal
     use std::io::IsTerminal;
     if !io::stdout().is_terminal() {
-        anyhow::bail!("TUI mode requires an interactive terminal. Use default streaming mode instead.");
+        anyhow::bail!(
+            "TUI mode requires an interactive terminal. Use default streaming mode instead."
+        );
     }
 
     // Setup terminal

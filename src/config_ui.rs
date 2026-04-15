@@ -65,6 +65,7 @@ enum ModeField {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 enum DisplayField {
     ShowModel,
     ShowTime,
@@ -115,11 +116,7 @@ struct App {
 impl App {
     fn new(config: Config) -> Self {
         let original = config.clone();
-        let mut available_providers: Vec<String> = config
-            .providers
-            .keys()
-            .cloned()
-            .collect();
+        let mut available_providers: Vec<String> = config.providers.keys().cloned().collect();
         available_providers.sort();
 
         App {
@@ -288,13 +285,11 @@ impl App {
 
     fn toggle_or_cycle(&mut self) {
         match self.section {
-            Section::General => {
-                match self.general_field {
-                    GeneralField::DefaultInterface => {
-                        self.config.default.tui = !self.config.default.tui;
-                    }
+            Section::General => match self.general_field {
+                GeneralField::DefaultInterface => {
+                    self.config.default.tui = !self.config.default.tui;
                 }
-            }
+            },
             Section::CliMode | Section::TuiMode => {
                 match self.mode_field {
                     ModeField::DefaultMode => {
@@ -378,8 +373,7 @@ impl App {
                         .position(|m| *m == current)
                         .map(|i| (i + 1) % GEMINI_MODEL_CHOICES.len())
                         .unwrap_or(0);
-                    self.config.search.gemini.model =
-                        GEMINI_MODEL_CHOICES[next_index].to_string();
+                    self.config.search.gemini.model = GEMINI_MODEL_CHOICES[next_index].to_string();
                 }
                 SearchField::MaxResults => {
                     let current = self.config.search.max_results;
@@ -445,7 +439,9 @@ pub async fn run_config_ui() -> Result<()> {
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => {
                 if app.has_changes() {
-                    app.message = Some("Unsaved changes! Press Ctrl+S to save, or q again to discard".to_string());
+                    app.message = Some(
+                        "Unsaved changes! Press Ctrl+S to save, or q again to discard".to_string(),
+                    );
                     if app.should_quit {
                         break;
                     }
@@ -516,7 +512,11 @@ fn draw_ui(frame: &mut Frame, app: &App) {
     let sections = Section::all();
     let titles: Vec<&str> = sections.iter().map(|s| s.title()).collect();
     let tabs = Tabs::new(titles)
-        .block(Block::default().borders(Borders::ALL).title(" AI CLI Configuration "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" AI CLI Configuration "),
+        )
         .select(app.section.index())
         .style(Style::default().fg(Color::White))
         .highlight_style(Style::default().fg(Color::Yellow).bold());
@@ -525,8 +525,12 @@ fn draw_ui(frame: &mut Frame, app: &App) {
     // Content area
     match app.section {
         Section::General => draw_general_section(frame, chunks[1], app),
-        Section::CliMode => draw_mode_section(frame, chunks[1], app, "CLI Mode (non-TUI)", &app.config.cli),
-        Section::TuiMode => draw_mode_section(frame, chunks[1], app, "TUI Mode", &app.config.tui_mode),
+        Section::CliMode => {
+            draw_mode_section(frame, chunks[1], app, "CLI Mode (non-TUI)", &app.config.cli)
+        }
+        Section::TuiMode => {
+            draw_mode_section(frame, chunks[1], app, "TUI Mode", &app.config.tui_mode)
+        }
         Section::Display => draw_display_section(frame, chunks[1], app),
         Section::Search => draw_search_section(frame, chunks[1], app),
         Section::Providers => draw_providers_section(frame, chunks[1], app),
@@ -552,23 +556,27 @@ fn draw_general_section(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let items = vec![
-        format_mode_item(
-            "Default Interface",
-            if app.config.default.tui {
-                "CLI / [TUI]"
-            } else {
-                "[CLI] / TUI"
-            },
-            app.general_field == GeneralField::DefaultInterface,
-        ),
-    ];
+    let items = vec![format_mode_item(
+        "Default Interface",
+        if app.config.default.tui {
+            "CLI / [TUI]"
+        } else {
+            "[CLI] / TUI"
+        },
+        app.general_field == GeneralField::DefaultInterface,
+    )];
 
     let list = List::new(items);
     frame.render_widget(list, inner);
 }
 
-fn draw_mode_section(frame: &mut Frame, area: Rect, app: &App, title: &str, mode: &crate::config::ModeConfig) {
+fn draw_mode_section(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    title: &str,
+    mode: &crate::config::ModeConfig,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {} ", title));
@@ -634,7 +642,11 @@ fn format_multi_providers_item(app: &App, mode: &crate::config::ModeConfig) -> L
         .iter()
         .enumerate()
         .map(|(i, alias)| {
-            let checked = if mode.multi_providers.contains(alias) { "x" } else { " " };
+            let checked = if mode.multi_providers.contains(alias) {
+                "x"
+            } else {
+                " "
+            };
             if selected && i == app.multi_provider_index {
                 format!(">[{}] {}<", checked, alias)
             } else {
@@ -643,7 +655,12 @@ fn format_multi_providers_item(app: &App, mode: &crate::config::ModeConfig) -> L
         })
         .collect();
 
-    ListItem::new(format!("{}Multi Providers: {}", prefix, checkboxes.join(" "))).style(style)
+    ListItem::new(format!(
+        "{}Multi Providers: {}",
+        prefix,
+        checkboxes.join(" ")
+    ))
+    .style(style)
 }
 
 fn draw_display_section(frame: &mut Frame, area: Rect, app: &App) {
@@ -654,10 +671,26 @@ fn draw_display_section(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let items = vec![
-        format_bool_item("Show Model", app.config.footer.show_model, app.display_field == DisplayField::ShowModel),
-        format_bool_item("Show Time", app.config.footer.show_time, app.display_field == DisplayField::ShowTime),
-        format_bool_item("Show Tokens", app.config.footer.show_tokens, app.display_field == DisplayField::ShowTokens),
-        format_bool_item("Show Reasoning", app.config.footer.show_reasoning, app.display_field == DisplayField::ShowReasoning),
+        format_bool_item(
+            "Show Model",
+            app.config.footer.show_model,
+            app.display_field == DisplayField::ShowModel,
+        ),
+        format_bool_item(
+            "Show Time",
+            app.config.footer.show_time,
+            app.display_field == DisplayField::ShowTime,
+        ),
+        format_bool_item(
+            "Show Tokens",
+            app.config.footer.show_tokens,
+            app.display_field == DisplayField::ShowTokens,
+        ),
+        format_bool_item(
+            "Show Reasoning",
+            app.config.footer.show_reasoning,
+            app.display_field == DisplayField::ShowReasoning,
+        ),
     ];
 
     let list = List::new(items);
@@ -729,9 +762,7 @@ fn cycle_usize(choices: &[usize], current: usize) -> usize {
 }
 
 fn draw_providers_section(frame: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Providers ");
+    let block = Block::default().borders(Borders::ALL).title(" Providers ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -779,16 +810,22 @@ fn draw_providers_section(frame: &mut Frame, area: Rect, app: &App) {
     if app.provider_index < app.available_providers.len() {
         let provider_name = &app.available_providers[app.provider_index];
         if let Some(provider) = app.config.providers.get(provider_name) {
-            let fast = provider.fast_model.as_deref().unwrap_or(&provider.default_model);
-            let smart = provider.smart_model.as_deref().unwrap_or(&provider.default_model);
-            let details = vec![
+            let fast = provider
+                .fast_model
+                .as_deref()
+                .unwrap_or(&provider.default_model);
+            let smart = provider
+                .smart_model
+                .as_deref()
+                .unwrap_or(&provider.default_model);
+            let details_text = [
                 format!("Provider: {}", provider_name),
                 format!("Enabled: {}", if provider.enabled { "Yes" } else { "No" }),
                 format!("Fast Model: {}", fast),
                 format!("Smart Model: {}", smart),
                 format!("Color: {}", provider.color),
-            ];
-            let details_text = details.join("\n");
+            ]
+            .join("\n");
             let details_para = Paragraph::new(details_text)
                 .style(Style::default().fg(Color::White))
                 .block(Block::default().borders(Borders::NONE));

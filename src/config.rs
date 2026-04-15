@@ -243,14 +243,8 @@ impl ProviderConfig {
     /// Get model for the specified tier, falling back to default_model
     pub fn get_model(&self, tier: &ModelTier) -> &str {
         match tier {
-            ModelTier::Fast => self
-                .fast_model
-                .as_deref()
-                .unwrap_or(&self.default_model),
-            ModelTier::Smart => self
-                .smart_model
-                .as_deref()
-                .unwrap_or(&self.default_model),
+            ModelTier::Fast => self.fast_model.as_deref().unwrap_or(&self.default_model),
+            ModelTier::Smart => self.smart_model.as_deref().unwrap_or(&self.default_model),
         }
     }
 }
@@ -395,8 +389,8 @@ impl Config {
         if config_path.exists() {
             let content = fs::read_to_string(&config_path)
                 .with_context(|| format!("Failed to read config file: {:?}", config_path))?;
-            let mut config: Config = toml::from_str(&content)
-                .with_context(|| "Failed to parse config file")?;
+            let mut config: Config =
+                toml::from_str(&content).with_context(|| "Failed to parse config file")?;
 
             // Migrate legacy [mode] section to [cli]
             if let Some(legacy_mode) = config.mode.take() {
@@ -435,8 +429,8 @@ impl Config {
         }
 
         let config = Config::default();
-        let content = toml::to_string_pretty(&config)
-            .with_context(|| "Failed to serialize config")?;
+        let content =
+            toml::to_string_pretty(&config).with_context(|| "Failed to serialize config")?;
         fs::write(&config_path, &content)
             .with_context(|| format!("Failed to write config file: {:?}", config_path))?;
 
@@ -459,8 +453,7 @@ impl Config {
                 .with_context(|| format!("Failed to create config directory: {:?}", parent))?;
         }
 
-        let content = toml::to_string_pretty(self)
-            .with_context(|| "Failed to serialize config")?;
+        let content = toml::to_string_pretty(self).with_context(|| "Failed to serialize config")?;
         fs::write(&config_path, &content)
             .with_context(|| format!("Failed to write config file: {:?}", config_path))?;
 
@@ -541,9 +534,21 @@ mod tests {
     #[test]
     fn test_resolve_alias() {
         let config = Config::default();
-        assert_eq!(config.resolve_provider_alias("claude"), Some("anthropic".to_string()));
-        assert_eq!(config.resolve_provider_alias("gpt"), Some("openai".to_string()));
-        assert_eq!(config.resolve_provider_alias("grok"), Some("xai".to_string()));
-        assert_eq!(config.resolve_provider_alias("gemini"), Some("google".to_string()));
+        assert_eq!(
+            config.resolve_provider_alias("claude"),
+            Some("anthropic".to_string())
+        );
+        assert_eq!(
+            config.resolve_provider_alias("gpt"),
+            Some("openai".to_string())
+        );
+        assert_eq!(
+            config.resolve_provider_alias("grok"),
+            Some("xai".to_string())
+        );
+        assert_eq!(
+            config.resolve_provider_alias("gemini"),
+            Some("google".to_string())
+        );
     }
 }

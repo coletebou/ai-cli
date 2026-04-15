@@ -72,8 +72,7 @@ impl Renderer {
     }
 
     fn flush_line(&mut self) {
-        self.lines
-            .push(Line::from(std::mem::take(&mut self.spans)));
+        self.lines.push(Line::from(std::mem::take(&mut self.spans)));
     }
 
     fn current_style(&self) -> Style {
@@ -115,10 +114,8 @@ impl Renderer {
             Some(ListKind::Unordered) => format!("{}  • ", indent),
             None => return,
         };
-        self.spans.push(Span::styled(
-            prefix,
-            Style::default().fg(Color::Gray),
-        ));
+        self.spans
+            .push(Span::styled(prefix, Style::default().fg(Color::Gray)));
     }
 
     fn maybe_add_bullet(&mut self) {
@@ -170,10 +167,8 @@ impl Renderer {
             Event::Start(Tag::Paragraph) => {
                 self.maybe_add_bullet();
                 if self.in_blockquote && self.list_stack.is_empty() {
-                    self.spans.push(Span::styled(
-                        "│ ",
-                        Style::default().fg(Color::DarkGray),
-                    ));
+                    self.spans
+                        .push(Span::styled("│ ", Style::default().fg(Color::DarkGray)));
                 }
             }
 

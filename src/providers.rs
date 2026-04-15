@@ -115,8 +115,7 @@ impl ProviderManager {
 
                 // Route slash-namespaced models through OpenRouter
                 if or_enabled && model.model_name.contains('/') {
-                    let or_endpoint =
-                        Endpoint::from_static("https://openrouter.ai/api/v1/");
+                    let or_endpoint = Endpoint::from_static("https://openrouter.ai/api/v1/");
                     let or_auth = if let Some(key) = or_config.get_api_key("openrouter") {
                         AuthData::from_single(key)
                     } else {
@@ -226,7 +225,6 @@ impl ProviderManager {
             }
         }
     }
-
 }
 
 #[derive(Debug, Clone)]

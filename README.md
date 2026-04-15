@@ -136,14 +136,15 @@ ai -i "initial question" # start with a seed question
 
 Slash commands inside chat:
 
-| Command           | Action                           |
-|-------------------|----------------------------------|
-| `/exit`, `/q`     | Quit                             |
-| `/clear`, `/reset`| Clear conversation history       |
-| `/history`        | Print the full message history   |
-| `/help`           | Show available commands          |
+| Command                | Action                                                    |
+|------------------------|-----------------------------------------------------------|
+| `/exit`, `/q`          | Quit                                                      |
+| `/clear`, `/reset`     | Clear conversation history                                |
+| `/history`             | Print the full message history                            |
+| `/export [path.md]`    | Save conversation as markdown (auto-named if path omitted)|
+| `/help`                | Show available commands                                   |
 
-`Ctrl+D` exits. `Ctrl+C` cancels the current input line. History persists across turns; use `/clear` to reset.
+`Ctrl+D` exits. `Ctrl+C` cancels the current input line at the prompt, or aborts an in-flight streaming response mid-turn. History persists across turns; use `/clear` to reset.
 
 Chat is single-provider — if multiple are configured, the first is used and the rest are noted as skipped.
 

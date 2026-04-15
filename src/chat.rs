@@ -2,13 +2,15 @@ use crate::config::FooterConfig;
 use crate::display::StreamingDisplay;
 use crate::providers::{Provider, ProviderManager};
 use crate::query::{stream_with_messages, QueryContext, StreamEvent};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use colored::Colorize;
 use genai::chat::{ChatMessage, ChatRole, ContentPart};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Slash command recognized in the interactive prompt.
 #[derive(Debug)]
@@ -17,19 +19,31 @@ enum Command {
     Clear,
     History,
     Help,
+    /// Write the conversation so far as markdown. `None` picks an
+    /// auto-named file in the CWD (`chat-<timestamp>.md`).
+    Export(Option<PathBuf>),
     Unknown(String),
 }
 
 fn parse_command(line: &str) -> Option<Command> {
     // strip_prefix removes exactly one leading '/', so `//history` becomes an
     // unknown command rather than silently aliasing to History.
-    let body = line.trim().strip_prefix('/')?.to_lowercase();
-    let cmd = body.split_whitespace().next().unwrap_or("");
-    Some(match cmd {
+    let body = line.trim().strip_prefix('/')?;
+    let mut parts = body.splitn(2, char::is_whitespace);
+    let cmd = parts.next().unwrap_or("").to_lowercase();
+    let rest = parts.next().unwrap_or("").trim();
+    Some(match cmd.as_str() {
         "exit" | "quit" | "q" => Command::Exit,
         "clear" | "reset" => Command::Clear,
         "history" | "log" => Command::History,
         "help" | "?" => Command::Help,
+        "export" | "save" => {
+            if rest.is_empty() {
+                Command::Export(None)
+            } else {
+                Command::Export(Some(PathBuf::from(rest)))
+            }
+        }
         other => Command::Unknown(other.to_string()),
     })
 }
@@ -64,8 +78,78 @@ fn print_help() {
         "/clear, /reset".cyan()
     );
     println!("  {}  — print conversation so far", "/history".cyan());
+    println!(
+        "  {}  — save conversation as markdown (auto-named if omitted)",
+        "/export [path.md]".cyan()
+    );
     println!("  {}  — show this help", "/help".cyan());
     println!();
+}
+
+/// Current Unix timestamp in seconds, or 0 on the unfathomable-edge case
+/// of a clock before the epoch.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Render the conversation as markdown with `##` headings per message. Tool
+/// calls and responses round-trip as fenced blocks so a later reader can
+/// reconstruct the full context, not just the user-visible text. The caller
+/// supplies the timestamp so the title and any auto-named file can share a
+/// single value (avoiding off-by-one drift across a second boundary).
+fn render_markdown(messages: &[ChatMessage], unix_ts: u64) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# Chat export (unix {})\n\n", unix_ts));
+
+    for msg in messages {
+        let heading = match msg.role {
+            ChatRole::System => "## System",
+            ChatRole::User => "## User",
+            ChatRole::Assistant => "## Assistant",
+            ChatRole::Tool => "## Tool",
+        };
+        out.push_str(heading);
+        out.push_str("\n\n");
+
+        for part in msg.content.parts() {
+            match part {
+                ContentPart::Text(t) => {
+                    out.push_str(t);
+                    out.push_str("\n\n");
+                }
+                ContentPart::ToolCall(tc) => {
+                    // Build the object via serde_json so any quote/backslash
+                    // in the tool name or args is escaped correctly — direct
+                    // string interpolation would emit malformed JSON.
+                    let obj = serde_json::json!({
+                        "tool": tc.fn_name,
+                        "args": tc.fn_arguments,
+                    });
+                    out.push_str(&format!("```json\n{}\n```\n\n", obj));
+                }
+                ContentPart::ToolResponse(tr) => {
+                    out.push_str("```\n");
+                    out.push_str(&tr.content);
+                    if !tr.content.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push_str("```\n\n");
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+fn export_history(messages: &[ChatMessage], path: &Path, unix_ts: u64) -> Result<()> {
+    let content = render_markdown(messages, unix_ts);
+    std::fs::write(path, content)
+        .with_context(|| format!("failed to write chat export to {}", path.display()))?;
+    Ok(())
 }
 
 /// Maximum characters of each message body shown in `/history`. Longer
@@ -169,6 +253,18 @@ async fn run_turn(
 ) -> Option<Vec<ChatMessage>> {
     let (tx, mut rx) = mpsc::channel::<StreamEvent>(100);
 
+    // Arm a cancellation token for this turn. A spawned listener flips it on
+    // Ctrl+C so an in-flight stream bails promptly instead of forcing the
+    // user to wait for the provider to finish producing tokens. Rustyline
+    // handles Ctrl+C at the prompt itself, so this only covers mid-turn.
+    let cancel = CancellationToken::new();
+    let cancel_for_signal = cancel.clone();
+    let sigint_task = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            cancel_for_signal.cancel();
+        }
+    });
+
     // Consumer future: forward events to the display and flag hard errors.
     // Runs concurrently with the streamer via tokio::join! — no spawn needed,
     // which keeps borrows local to this task.
@@ -189,8 +285,12 @@ async fn run_turn(
         had_error
     };
 
-    let streamer = stream_with_messages(&manager, &provider, messages, &ctx, tx);
+    let streamer = stream_with_messages(&manager, &provider, messages, &ctx, tx, &cancel);
     let (enriched, had_error) = tokio::join!(streamer, consume);
+
+    // Disarm the SIGINT listener so a later Ctrl+C at the readline prompt
+    // goes to rustyline's handler instead of this task.
+    sigint_task.abort();
 
     if had_error {
         None
@@ -271,6 +371,24 @@ pub async fn run_interactive(
                         }
                         Command::History => {
                             print_history(&messages);
+                            continue;
+                        }
+                        Command::Export(path) => {
+                            // Capture the timestamp once so the auto-named
+                            // file and the in-document title agree.
+                            let ts = now_unix();
+                            let target =
+                                path.unwrap_or_else(|| PathBuf::from(format!("chat-{}.md", ts)));
+                            match export_history(&messages, &target, ts) {
+                                Ok(()) => println!(
+                                    "  {} {}",
+                                    "exported to".dimmed(),
+                                    target.display().to_string().green()
+                                ),
+                                Err(e) => {
+                                    println!("  {} {}", "export failed:".red(), e)
+                                }
+                            }
                             continue;
                         }
                         Command::Help => {
@@ -363,6 +481,44 @@ mod tests {
             Some(Command::Unknown(name)) => assert_eq!(name, "/history"),
             other => panic!("expected Unknown(\"/history\"), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_command_captures_export_path() {
+        match parse_command("/export my chat.md") {
+            // The first whitespace splits command from argument; spaces in
+            // the path are preserved so `/export my chat.md` works.
+            Some(Command::Export(Some(p))) => assert_eq!(p, PathBuf::from("my chat.md")),
+            other => panic!("expected Export(Some(...)), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_command_bare_export_means_auto_path() {
+        match parse_command("/export") {
+            Some(Command::Export(None)) => {}
+            other => panic!("expected Export(None), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn render_markdown_includes_each_message_with_heading() {
+        let messages = vec![
+            ChatMessage::system("you are helpful"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi there"),
+        ];
+        let md = render_markdown(&messages, 1_700_000_000);
+        assert!(
+            md.contains("# Chat export (unix 1700000000)"),
+            "missing title: {}",
+            md
+        );
+        assert!(md.contains("## System"), "missing system heading");
+        assert!(md.contains("## User"), "missing user heading");
+        assert!(md.contains("## Assistant"), "missing assistant heading");
+        assert!(md.contains("hello"));
+        assert!(md.contains("hi there"));
     }
 
     #[test]

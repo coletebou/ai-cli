@@ -32,6 +32,7 @@ dependencies = [
  "termimad",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "toml",
 ]
 

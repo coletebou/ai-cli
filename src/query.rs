@@ -8,6 +8,7 @@ use genai::chat::{
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
@@ -305,7 +306,9 @@ pub async fn stream_single(
     tx: mpsc::Sender<StreamEvent>,
 ) {
     let messages = build_initial_messages(&ctx.question, ctx.system_prompt.as_deref());
-    let _ = stream_with_messages(manager, provider, messages, ctx, tx).await;
+    // Non-cancellable for single-shot callers; chat mode uses its own token.
+    let cancel = CancellationToken::new();
+    let _ = stream_with_messages(manager, provider, messages, ctx, tx, &cancel).await;
 }
 
 /// Stream a single response from `provider` using the given prebuilt message
@@ -322,6 +325,7 @@ pub async fn stream_with_messages(
     mut messages: Vec<ChatMessage>,
     ctx: &QueryContext,
     tx: mpsc::Sender<StreamEvent>,
+    cancel: &CancellationToken,
 ) -> Vec<ChatMessage> {
     let start = Instant::now();
     let provider_name = provider.display_name.clone();
@@ -376,7 +380,29 @@ pub async fn stream_with_messages(
         // assistant's final reply.
         let mut iter_text = String::new();
 
-        while let Some(event) = stream.next().await {
+        loop {
+            // Race the next stream event against cancellation so a Ctrl+C
+            // during mid-response breaks out promptly instead of waiting
+            // for the provider to finish producing tokens.
+            let event = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let _ = tx
+                        .send(StreamEvent::Error {
+                            provider: provider_name,
+                            model,
+                            error: "cancelled".to_string(),
+                            duration_ms,
+                        })
+                        .await;
+                    return messages;
+                }
+                ev = stream.next() => match ev {
+                    Some(e) => e,
+                    None => break,
+                },
+            };
             match event {
                 Ok(ChatStreamEvent::Chunk(chunk)) => {
                     if !chunk.content.is_empty() {

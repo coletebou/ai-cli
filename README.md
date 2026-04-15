@@ -49,7 +49,8 @@ Set the env vars for whichever providers you want to use. Providers without keys
 
 ```bash
 ai "what is the airspeed velocity of an unladen swallow?"    # default providers
-ai -a "summarize this" < file.md                              # all configured providers
+cat file.md | ai "summarize this"                             # pipe stdin as context
+ai "explain @src/main.rs briefly"                             # inline a file with @path
 ai -p claude,gpt "compare these approaches"                   # specific providers
 ai -t "design a rate limiter"                                 # TUI mode
 ai -i                                                         # interactive chat
@@ -57,6 +58,11 @@ ai -w "what changed in React 19.1?"                           # web search
 ai -r high "prove this theorem"                               # high-reasoning mode
 ai --raw "generate a commit message" | pbcopy                 # raw/pipeable
 ```
+
+### Context expansion
+
+- **Piped stdin.** When stdin isn't a TTY, its content is appended to the question as a fenced context block.
+- **`@path` references.** Any token starting with `@` at a word boundary is replaced with the file's contents inside a fenced code block. The path's extension is used as the fence language. Non-existent paths pass through as literal text, so typos are visible.
 
 ## Configuration
 
@@ -166,6 +172,7 @@ src/
 ├── main.rs       CLI parsing, mode selection
 ├── config.rs     TOML config, alias resolution, search settings
 ├── config_ui.rs  TUI config editor
+├── context.rs    @file expansion and stdin context merging
 ├── providers.rs  ProviderManager wrapping genai::Client + AuthResolver
 ├── query.rs      Query execution, tool-use loop, StreamEvent enum
 ├── search.rs     SearchEngine: Tavily + Gemini grounding, fallback logic

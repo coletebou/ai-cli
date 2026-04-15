@@ -1,6 +1,7 @@
 mod chat;
 mod config;
 mod config_ui;
+mod context;
 mod display;
 mod markdown;
 mod models;
@@ -171,13 +172,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Require question unless --init or --interactive (which can enter chat empty)
-    if cli.question.is_empty() && !cli.interactive {
+    // Gather context from piped stdin and inline @file references so the
+    // user can do `cat notes.md | ai "summarize this"` or
+    // `ai "explain @src/foo.rs"` without hand-rolling the prompt.
+    let stdin = context::read_stdin_if_piped();
+    let raw_question = cli.question.join(" ");
+    let expanded = context::expand_file_refs(&raw_question)?;
+    let question = context::merge_stdin(&expanded, stdin);
+
+    // Require some question unless --interactive (which can enter chat empty)
+    if question.trim().is_empty() && !cli.interactive {
         anyhow::bail!(
-            "Missing required argument: <QUESTION>\n\nUsage: ai <QUESTION>\n       ai -i [QUESTION]\n       ai --init"
+            "Missing required argument: <QUESTION>\n\nUsage: ai <QUESTION>\n       cat file | ai <QUESTION>\n       ai -i [QUESTION]\n       ai --init"
         );
     }
-    let question = cli.question.join(" ");
 
     // Load configuration
     let config = Config::load()?;

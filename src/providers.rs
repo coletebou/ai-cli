@@ -47,6 +47,13 @@ impl Provider {
     }
 }
 
+fn ensure_trailing_slash(mut url: String) -> String {
+    if !url.ends_with('/') {
+        url.push('/');
+    }
+    url
+}
+
 pub struct ProviderManager {
     client: Client,
     config: Arc<Config>,
@@ -114,27 +121,50 @@ impl ProviderManager {
                     auth,
                 } = service_target;
 
-                // Route slash-namespaced models through OpenRouter
+                // Route slash-namespaced models through OpenRouter.
+                // Endpoint comes from [providers.openrouter].base_url, with a hardcoded fallback.
                 if or_enabled && model.model_name.contains('/') {
-                    let or_endpoint = Endpoint::from_static("https://openrouter.ai/api/v1/");
+                    let or_url = or_config
+                        .providers
+                        .get("openrouter")
+                        .and_then(|p| p.base_url.clone())
+                        .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
+                    let or_url = ensure_trailing_slash(or_url);
+                    let or_endpoint = Endpoint::from_owned(or_url);
                     let or_auth = if let Some(key) = or_config.get_api_key("openrouter") {
                         AuthData::from_single(key)
                     } else {
                         AuthData::from_env("OPENROUTER_API_KEY")
                     };
                     let or_model = ModelIden::new(AdapterKind::OpenAI, model.model_name);
-                    Ok(ServiceTarget {
+                    return Ok(ServiceTarget {
                         endpoint: or_endpoint,
                         auth: or_auth,
                         model: or_model,
-                    })
-                } else {
-                    Ok(ServiceTarget {
-                        model,
-                        endpoint,
-                        auth,
-                    })
+                    });
                 }
+
+                // For direct-provider calls, override the genai default endpoint
+                // with [providers.<name>].base_url if the user set one — this is
+                // the seam that lets traffic route through a reverse proxy.
+                let provider_name = match model.adapter_kind.as_str() {
+                    "Anthropic" => Some("anthropic"),
+                    "OpenAI" => Some("openai"),
+                    "Gemini" => Some("google"),
+                    "xAi" => Some("xai"),
+                    "Ollama" => Some("ollama"),
+                    _ => None,
+                };
+                let override_endpoint = provider_name
+                    .and_then(|n| or_config.providers.get(n))
+                    .and_then(|p| p.base_url.clone())
+                    .map(|u| Endpoint::from_owned(ensure_trailing_slash(u)));
+
+                Ok(ServiceTarget {
+                    model,
+                    endpoint: override_endpoint.unwrap_or(endpoint),
+                    auth,
+                })
             },
         );
 

@@ -7,6 +7,7 @@ mod markdown;
 mod models;
 mod providers;
 mod query;
+mod retry;
 mod search;
 mod ui;
 

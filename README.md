@@ -103,6 +103,17 @@ api_key_env = "TAVILY_API_KEY"
 
 Override at the CLI: `ai -w --search-provider tavily "query"`.
 
+### Retry behavior
+
+Transient provider errors (HTTP 408/425/429/5xx and network timeouts) are retried automatically with exponential backoff. A `Retry-After` header from the server takes precedence over the default backoff.
+
+```toml
+[retry]
+max_attempts = 3       # total attempts including the first; 1 disables retry
+base_ms = 250          # first backoff delay; doubles each subsequent retry
+max_delay_ms = 5000    # ceiling per attempt
+```
+
 ## Subcommands
 
 ```bash

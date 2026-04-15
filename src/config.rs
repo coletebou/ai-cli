@@ -23,7 +23,42 @@ pub struct Config {
     #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]
+    pub retry: RetryConfig,
+    #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetryConfig {
+    /// Total attempts, including the initial try. 1 disables retry.
+    #[serde(default = "default_retry_max_attempts")]
+    pub max_attempts: u32,
+    /// First backoff delay; doubles each subsequent retry up to `max_delay_ms`.
+    #[serde(default = "default_retry_base_ms")]
+    pub base_ms: u64,
+    /// Cap on per-attempt backoff delay.
+    #[serde(default = "default_retry_max_delay_ms")]
+    pub max_delay_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_retry_max_attempts(),
+            base_ms: default_retry_base_ms(),
+            max_delay_ms: default_retry_max_delay_ms(),
+        }
+    }
+}
+
+fn default_retry_max_attempts() -> u32 {
+    3
+}
+fn default_retry_base_ms() -> u64 {
+    250
+}
+fn default_retry_max_delay_ms() -> u64 {
+    5_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,6 +405,7 @@ impl Default for Config {
             default: DefaultConfig::default(),
             footer: FooterConfig::default(),
             search: SearchConfig::default(),
+            retry: RetryConfig::default(),
             providers,
         }
     }

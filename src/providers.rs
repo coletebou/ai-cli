@@ -1,4 +1,5 @@
-use crate::config::{Config, ModelTier, ProviderConfig};
+use crate::config::{Config, ModelTier, ProviderConfig, RetryConfig};
+use crate::retry::{self, Retryable};
 use anyhow::{Context, Result};
 use colored::Color;
 use genai::adapter::AdapterKind;
@@ -189,6 +190,10 @@ impl ProviderManager {
             .collect()
     }
 
+    fn retry_cfg(&self) -> &RetryConfig {
+        &self.config.retry
+    }
+
     pub async fn exec_chat(
         &self,
         model: &str,
@@ -196,14 +201,32 @@ impl ProviderManager {
         options: Option<&ChatOptions>,
         tools: Option<Vec<Tool>>,
     ) -> Result<ChatResponse> {
-        let mut request = ChatRequest::new(messages);
-        if let Some(tools) = tools {
-            request = request.with_tools(tools);
+        let cfg = self.retry_cfg();
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let mut request = ChatRequest::new(messages.clone());
+            if let Some(t) = &tools {
+                request = request.with_tools(t.clone());
+            }
+            match self.client.exec_chat(model, request, options).await {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    let err = anyhow::Error::from(e);
+                    if let Some(delay) = should_retry(&err, cfg, attempt) {
+                        eprintln!(
+                            "[retry] {} attempt {}/{} after {:?}",
+                            model, attempt, cfg.max_attempts, delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(err).with_context(|| {
+                        format!("Failed to execute chat request for model: {}", model)
+                    });
+                }
+            }
         }
-        self.client
-            .exec_chat(model, request, options)
-            .await
-            .with_context(|| format!("Failed to execute chat request for model: {}", model))
     }
 
     pub async fn exec_chat_stream(
@@ -213,17 +236,46 @@ impl ProviderManager {
         options: Option<&ChatOptions>,
         tools: Option<Vec<Tool>>,
     ) -> Result<ChatStreamResponse> {
-        let mut request = ChatRequest::new(messages);
-        if let Some(tools) = tools {
-            request = request.with_tools(tools);
-        }
-        match self.client.exec_chat_stream(model, request, options).await {
-            Ok(response) => Ok(response),
-            Err(e) => {
-                // Include the full error chain
-                anyhow::bail!("Model: {} - {}", model, e)
+        let cfg = self.retry_cfg();
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let mut request = ChatRequest::new(messages.clone());
+            if let Some(t) = &tools {
+                request = request.with_tools(t.clone());
+            }
+            match self.client.exec_chat_stream(model, request, options).await {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    let err = anyhow::Error::from(e);
+                    if let Some(delay) = should_retry(&err, cfg, attempt) {
+                        eprintln!(
+                            "[retry] {} attempt {}/{} after {:?}",
+                            model, attempt, cfg.max_attempts, delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(err).with_context(|| format!("Model: {}", model));
+                }
             }
         }
+    }
+}
+
+/// Decide whether to retry and how long to wait. Returns `None` on give-up:
+/// either the error is non-transient, or we've exhausted `max_attempts`.
+fn should_retry(
+    err: &anyhow::Error,
+    cfg: &RetryConfig,
+    attempt: u32,
+) -> Option<std::time::Duration> {
+    if attempt >= cfg.max_attempts {
+        return None;
+    }
+    match retry::classify(err) {
+        Retryable::No => None,
+        Retryable::Yes { retry_after } => Some(retry::effective_delay(cfg, attempt, retry_after)),
     }
 }
 

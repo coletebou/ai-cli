@@ -9,6 +9,7 @@ mod providers;
 mod query;
 mod retry;
 mod search;
+mod telemetry;
 mod ui;
 
 use anyhow::Result;
@@ -23,6 +24,20 @@ use std::sync::Arc;
 // Embedded at compile time by build.rs
 const BUILD_COMMIT: &str = env!("AI_CLI_GIT_HASH");
 const REPO_PATH: &str = env!("AI_CLI_REPO_PATH");
+
+/// Shorten a free-form question into something suitable for a trace name in
+/// Langfuse. The trace list view truncates anyway; we just want the leading
+/// 60 chars so different invocations are visually distinguishable.
+fn truncate_for_trace_name(question: &str) -> String {
+    const MAX: usize = 60;
+    let trimmed = question.trim();
+    if trimmed.chars().count() <= MAX {
+        trimmed.to_string()
+    } else {
+        let prefix: String = trimmed.chars().take(MAX).collect();
+        format!("{}…", prefix)
+    }
+}
 
 fn check_binary_staleness() {
     // Skip if repo path is empty or doesn't exist
@@ -147,8 +162,22 @@ async fn main() -> Result<()> {
     // Check if binary matches source (warns if stale)
     check_binary_staleness();
 
-    let cli = Cli::parse();
+    // Initialize OpenTelemetry → Langfuse if creds are present. No-op
+    // otherwise. We capture whether init succeeded so we know whether to
+    // bother flushing on exit.
+    let telemetry_enabled = telemetry::init().is_some();
 
+    let result = run(Cli::parse()).await;
+
+    // Flush pending spans before the process exits. Without this, short-lived
+    // CLI runs lose their last batch — Langfuse never sees the trace.
+    if telemetry_enabled {
+        telemetry::shutdown();
+    }
+    result
+}
+
+async fn run(cli: Cli) -> Result<()> {
     // Handle subcommands
     if let Some(command) = cli.command {
         return match command {
@@ -342,6 +371,29 @@ async fn main() -> Result<()> {
         ctx = ctx.with_search(client, config.search.max_iterations);
     }
 
+    // Root span for the whole CLI invocation. All per-provider spans created
+    // during dispatch become children of this. Dropping `_root_guard` (when
+    // run() returns) detaches the context; dropping `root_span` (when this
+    // function's locals go out of scope) ends the span itself.
+    use opentelemetry::trace::{TraceContextExt, Tracer};
+    let tracer = opentelemetry::global::tracer(telemetry::TRACER_NAME);
+    let root_span = tracer
+        .span_builder("ai.query")
+        .with_attributes(vec![
+            opentelemetry::KeyValue::new("langfuse.trace.input", question.clone()),
+            opentelemetry::KeyValue::new(
+                "langfuse.trace.name",
+                if question.is_empty() {
+                    "interactive session".to_string()
+                } else {
+                    truncate_for_trace_name(&question)
+                },
+            ),
+        ])
+        .start(&tracer);
+    let cx = opentelemetry::Context::current_with_span(root_span);
+    let _root_guard = cx.attach();
+
     // Interactive chat mode takes precedence over other dispatch modes.
     // Multi-provider chat is confusing; pick the first viable provider.
     if cli.interactive {
@@ -397,4 +449,36 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_for_trace_name;
+
+    #[test]
+    fn trace_name_passthrough_for_short_inputs() {
+        assert_eq!(truncate_for_trace_name("hi"), "hi");
+    }
+
+    #[test]
+    fn trace_name_trims_whitespace() {
+        assert_eq!(truncate_for_trace_name("  hi  "), "hi");
+    }
+
+    #[test]
+    fn trace_name_truncates_long_input_with_ellipsis() {
+        let long = "a".repeat(120);
+        let out = truncate_for_trace_name(&long);
+        assert_eq!(out.chars().count(), 61); // 60 chars + ellipsis
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn trace_name_handles_unicode_correctly() {
+        // Char-count truncation, not byte-count: a 60-emoji input should
+        // pass through unchanged (still ≤60 chars). Byte-based truncation
+        // would have split a multi-byte sequence and panicked.
+        let emoji = "🎉".repeat(60);
+        assert_eq!(truncate_for_trace_name(&emoji), emoji);
+    }
 }

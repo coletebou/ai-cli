@@ -61,3 +61,15 @@ API keys resolved via environment variables (ANTHROPIC_API_KEY, OPENAI_API_KEY, 
 - **ratatui/crossterm**: TUI framework and terminal backend
 - **tokio/futures**: Async runtime and concurrent execution
 - **clap**: CLI argument parsing with derive macros
+- **opentelemetry / opentelemetry-otlp**: Optional telemetry export to Langfuse
+
+### Observability
+
+`src/telemetry.rs` initializes OpenTelemetry export to a self-hosted Langfuse
+when `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`, and `LANGFUSE_SECRET_KEY` are set
+(no-op otherwise). Each CLI invocation creates a root `ai.query` span; each
+provider call becomes a child `chat <PROVIDER>` GENERATION span carrying
+`gen_ai.*` semconv attributes plus `langfuse.observation.input/output`. The
+trace name is the first 60 chars of the question. Service is identified as
+`service.name=ai-cli` so traces are filterable in shared Langfuse projects.
+Set `LANGFUSE_ENABLED=false` as a kill switch.

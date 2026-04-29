@@ -155,7 +155,9 @@ impl App {
             senders,
             selected_panel: 0,
             show_tokens,
-            mode: Mode::Normal,
+            // Default to Insert so typing works immediately, like Claude Code.
+            // Power users can press Esc once to drop into Normal for vim nav.
+            mode: Mode::Insert,
             input_buffer: String::new(),
             should_quit: false,
             status_message: None,
@@ -946,9 +948,17 @@ mod tests {
     }
 
     #[test]
+    fn app_starts_in_insert_mode() {
+        // Default to Insert so users can type without first pressing 'i' —
+        // matches Claude Code's no-modal UX.
+        let (app, _rxs) = app_with(1);
+        assert_eq!(app.mode, Mode::Insert);
+    }
+
+    #[test]
     fn normal_mode_i_enters_insert_and_esc_leaves() {
         let (mut app, _rxs) = app_with(1);
-        assert_eq!(app.mode, Mode::Normal);
+        app.mode = Mode::Normal;
         handle_key(
             &mut app,
             crossterm::event::KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
@@ -964,6 +974,7 @@ mod tests {
     #[test]
     fn normal_mode_q_quits() {
         let (mut app, _rxs) = app_with(1);
+        app.mode = Mode::Normal;
         handle_key(
             &mut app,
             crossterm::event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),

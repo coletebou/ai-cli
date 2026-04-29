@@ -328,7 +328,7 @@ impl Default for Config {
                 api_key: None,
                 default_model: "gpt-5-nano".to_string(),
                 fast_model: Some("gpt-5-nano".to_string()),
-                smart_model: Some("gpt-5.4".to_string()),
+                smart_model: Some("gpt-5.5".to_string()),
                 aliases: vec!["chatgpt".to_string(), "gpt".to_string()],
                 color: "green".to_string(),
                 base_url: None,

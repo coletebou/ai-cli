@@ -165,7 +165,7 @@ impl ProviderManager {
     }
 
     pub fn get_providers_for_query(&self, requested: Option<&[String]>) -> Vec<Provider> {
-        let provider_names: Vec<String> = if let Some(requested) = requested {
+        let raw_names: Vec<String> = if let Some(requested) = requested {
             // Resolve aliases
             requested
                 .iter()
@@ -175,6 +175,16 @@ impl ProviderManager {
             // Use default providers from config
             self.config.get_default_providers()
         };
+
+        // Dedupe by canonical name while preserving first-seen order. Users
+        // commonly list multiple aliases for the same provider (e.g. both
+        // "gpt" and "chatgpt"); without this, the TUI would render duplicate
+        // panels and fan out the same query twice.
+        let mut seen = std::collections::HashSet::new();
+        let provider_names: Vec<String> = raw_names
+            .into_iter()
+            .filter(|name| seen.insert(name.clone()))
+            .collect();
 
         // Filter to only providers that have API keys configured
         provider_names
@@ -324,5 +334,69 @@ impl ProviderResponse {
 
     pub fn is_error(&self) -> bool {
         self.error.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ProviderConfig;
+
+    fn fake_provider_config(aliases: Vec<&str>, color: &str) -> ProviderConfig {
+        ProviderConfig {
+            enabled: true,
+            api_key_env: None,
+            api_key: Some("test-key".to_string()),
+            default_model: "test".to_string(),
+            fast_model: Some("test".to_string()),
+            smart_model: Some("test".to_string()),
+            aliases: aliases.into_iter().map(String::from).collect(),
+            color: color.to_string(),
+            base_url: None,
+        }
+    }
+
+    #[test]
+    fn duplicate_aliases_for_same_provider_are_deduped() {
+        // Real-world bug: a config with `multi_providers = ["gpt", "chatgpt"]`
+        // would render two ChatGPT panels because both aliases resolve to
+        // "openai" and there was no dedup pass.
+        let mut config = Config::default();
+        config.providers.clear();
+        config.providers.insert(
+            "openai".to_string(),
+            fake_provider_config(vec!["chatgpt", "gpt"], "green"),
+        );
+        let manager = ProviderManager::new(config, ModelTier::Fast).unwrap();
+        let requested = vec!["gpt".to_string(), "chatgpt".to_string()];
+        let providers = manager.get_providers_for_query(Some(&requested));
+        assert_eq!(providers.len(), 1);
+    }
+
+    #[test]
+    fn dedup_preserves_first_seen_order() {
+        // Stability matters: panel order in the TUI should follow the
+        // user's config order, not be reshuffled by the dedup pass.
+        let mut config = Config::default();
+        config.providers.clear();
+        config.providers.insert(
+            "openai".to_string(),
+            fake_provider_config(vec!["gpt"], "green"),
+        );
+        config.providers.insert(
+            "anthropic".to_string(),
+            fake_provider_config(vec!["claude"], "magenta"),
+        );
+        let manager = ProviderManager::new(config, ModelTier::Fast).unwrap();
+        let requested = vec![
+            "claude".to_string(),
+            "gpt".to_string(),
+            "claude".to_string(),
+            "gpt".to_string(),
+        ];
+        let result = manager.get_providers_for_query(Some(&requested));
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].display_name, "CLAUDE");
+        assert_eq!(result[1].display_name, "GPT");
     }
 }

@@ -209,10 +209,9 @@ impl Renderer {
                     self.lines.push(Line::from(""));
                 }
             }
-            Event::End(TagEnd::Item)
-                if !self.spans.is_empty() => {
-                    self.flush_line();
-                }
+            Event::End(TagEnd::Item) if !self.spans.is_empty() => {
+                self.flush_line();
+            }
 
             // Table end tags
             Event::End(TagEnd::TableCell) => {

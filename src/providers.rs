@@ -193,8 +193,8 @@ impl ProviderManager {
                     .get::<str>(&model.model_name)
                     .map(|(name, kind)| (name.as_str(), Some(*kind)))
                     .unwrap_or_else(|| {
-                        let name = provider_name_for_adapter(model.adapter_kind.as_str())
-                            .unwrap_or("");
+                        let name =
+                            provider_name_for_adapter(model.adapter_kind.as_str()).unwrap_or("");
                         (name, None)
                     });
 

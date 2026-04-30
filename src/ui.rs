@@ -10,6 +10,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use genai::chat::{ChatMessage, ChatRole};
+use opentelemetry::trace::FutureExt;
+use opentelemetry::Context;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -634,6 +636,12 @@ pub async fn run_tui(
     let mut senders: Vec<mpsc::Sender<PanelCommand>> = Vec::with_capacity(providers.len());
     let mut panels: Vec<PanelState> = Vec::with_capacity(providers.len());
 
+    // tokio::spawn does not propagate the OTel Context, so spans created inside
+    // panel_task would otherwise become orphan roots in Langfuse instead of
+    // children of the caller's `ai.query` span. Capture the current Context and
+    // wrap each spawn via `FutureExt::with_context` (mirrors `stream_all`).
+    let parent_cx = Context::current();
+
     for provider in &providers {
         let (cmd_tx, cmd_rx) = mpsc::channel::<PanelCommand>(PANEL_INPUT_CAPACITY);
         senders.push(cmd_tx);
@@ -643,14 +651,19 @@ pub async fn run_tui(
         let task_provider = provider.clone();
         let task_ctx = ctx.clone();
         let task_event_tx = event_tx.clone();
-        tokio::spawn(async move {
-            // DETACH: cmd_rx closes when App drops its senders at the end of
-            // run_tui, which terminates panel_task's while-let loop. Any
-            // in-flight stream_with_messages is abandoned; callers wanting
-            // graceful shutdown must invoke cancel_current_turn() and let the
-            // CancellationToken unwind the stream before dropping the App.
-            panel_task(task_manager, task_provider, task_ctx, cmd_rx, task_event_tx).await;
-        });
+        let task_cx = parent_cx.clone();
+        tokio::spawn(
+            async move {
+                // DETACH: cmd_rx closes when App drops its senders at the end
+                // of run_tui, which terminates panel_task's while-let loop.
+                // Any in-flight stream_with_messages is abandoned; callers
+                // wanting graceful shutdown must invoke cancel_current_turn()
+                // and let the CancellationToken unwind the stream before
+                // dropping the App.
+                panel_task(task_manager, task_provider, task_ctx, cmd_rx, task_event_tx).await;
+            }
+            .with_context(task_cx),
+        );
     }
     drop(event_tx); // only panel tasks should hold senders; drop our copy
 

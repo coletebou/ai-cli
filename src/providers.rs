@@ -9,6 +9,51 @@ use genai::{Client, ClientConfig, ModelIden, ServiceTarget};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+fn adapter_kind_for_provider(name: &str) -> Option<AdapterKind> {
+    match name {
+        "anthropic" => Some(AdapterKind::Anthropic),
+        "openai" => Some(AdapterKind::OpenAI),
+        "google" => Some(AdapterKind::Gemini),
+        "xai" => Some(AdapterKind::Xai),
+        "ollama" => Some(AdapterKind::Ollama),
+        _ => None,
+    }
+}
+
+fn provider_name_for_adapter(kind: &str) -> Option<&'static str> {
+    match kind {
+        "Anthropic" => Some("anthropic"),
+        "OpenAI" => Some("openai"),
+        "Gemini" => Some("google"),
+        "Ollama" => Some("ollama"),
+        "xAi" => Some("xai"),
+        _ => None,
+    }
+}
+
+/// Build a map from every configured model name to its (provider_name, AdapterKind).
+/// This lets both resolvers route models that genai can't detect from prefixes alone
+/// (e.g. Bedrock IDs like "us.anthropic.claude-opus-4-7").
+fn build_model_provider_map(config: &Config) -> HashMap<String, (String, AdapterKind)> {
+    let mut map = HashMap::new();
+    for (provider_name, provider_cfg) in &config.providers {
+        let Some(adapter) = adapter_kind_for_provider(provider_name) else {
+            continue;
+        };
+        let entry = (provider_name.clone(), adapter);
+        for model in [
+            &provider_cfg.default_model,
+            provider_cfg.fast_model.as_deref().unwrap_or_default(),
+            provider_cfg.smart_model.as_deref().unwrap_or_default(),
+        ] {
+            if !model.is_empty() {
+                map.insert(model.to_string(), entry.clone());
+            }
+        }
+    }
+    map
+}
+
 #[derive(Debug, Clone)]
 pub struct Provider {
     pub display_name: String,
@@ -47,6 +92,13 @@ impl Provider {
     }
 }
 
+fn ensure_trailing_slash(mut url: String) -> String {
+    if !url.ends_with('/') {
+        url.push('/');
+    }
+    url
+}
+
 pub struct ProviderManager {
     client: Client,
     config: Arc<Config>,
@@ -58,53 +110,51 @@ pub struct ProviderManager {
 impl ProviderManager {
     pub fn new(config: Config, model_tier: ModelTier) -> Result<Self> {
         let config = Arc::new(config);
+        let model_map = Arc::new(build_model_provider_map(&config));
 
-        // Build custom auth resolver that uses our config
+        // Build custom auth resolver that uses our config.
+        // First tries the model→provider lookup table (handles Bedrock-style IDs),
+        // then falls back to adapter kind matching.
         let auth_config = Arc::clone(&config);
+        let auth_model_map = Arc::clone(&model_map);
         let auth_resolver = AuthResolver::from_resolver_fn(
             move |model_iden: ModelIden| -> Result<Option<AuthData>, genai::resolver::Error> {
-                let adapter_kind = model_iden.adapter_kind;
+                let provider_name = auth_model_map
+                    .get::<str>(&model_iden.model_name)
+                    .map(|(name, _)| name.as_str())
+                    .or_else(|| provider_name_for_adapter(model_iden.adapter_kind.as_str()));
 
-                // Map adapter kind to our provider name
-                let provider_name = match adapter_kind.as_str() {
-                    "Anthropic" => "anthropic",
-                    "OpenAI" => "openai",
-                    "Gemini" => "google",
-                    "Ollama" => "ollama",
-                    "XAi" => "xai",
-                    _ => return Ok(None),
+                let Some(provider_name) = provider_name else {
+                    return Ok(None);
                 };
 
                 if let Some(key) = auth_config.get_api_key(provider_name) {
-                    Ok(Some(AuthData::from_single(key)))
-                } else {
-                    // Try standard env var names as fallback
-                    let env_name = match adapter_kind.as_str() {
-                        "Anthropic" => "ANTHROPIC_API_KEY",
-                        "OpenAI" => "OPENAI_API_KEY",
-                        "Gemini" => "GEMINI_API_KEY",
-                        "XAi" => "XAI_API_KEY",
-                        _ => return Ok(None),
-                    };
+                    return Ok(Some(AuthData::from_single(key)));
+                }
 
-                    if let Ok(key) = std::env::var(env_name) {
-                        Ok(Some(AuthData::from_single(key)))
-                    } else {
-                        Ok(None)
+                let fallback_env = match provider_name {
+                    "anthropic" => Some("ANTHROPIC_API_KEY"),
+                    "openai" => Some("OPENAI_API_KEY"),
+                    "google" => Some("GEMINI_API_KEY"),
+                    "xai" => Some("XAI_API_KEY"),
+                    _ => None,
+                };
+                if let Some(env) = fallback_env {
+                    if let Ok(key) = std::env::var(env) {
+                        return Ok(Some(AuthData::from_single(key)));
                     }
                 }
+                Ok(None)
             },
         );
 
-        // ServiceTargetResolver: redirect OpenRouter models to OpenRouter's endpoint.
-        // OpenRouter models use slash-namespaced IDs (e.g. "google/gemini-2.5-flash"),
-        // so any model containing a '/' is routed through OpenRouter.
         let or_config = Arc::clone(&config);
         let or_enabled = config
             .providers
             .get("openrouter")
             .map(|p| p.enabled)
             .unwrap_or(false);
+        let target_model_map = Arc::clone(&model_map);
 
         let target_resolver = ServiceTargetResolver::from_resolver_fn(
             move |service_target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
@@ -114,27 +164,90 @@ impl ProviderManager {
                     auth,
                 } = service_target;
 
-                // Route slash-namespaced models through OpenRouter
+                // Route slash-namespaced models through OpenRouter.
                 if or_enabled && model.model_name.contains('/') {
-                    let or_endpoint = Endpoint::from_static("https://openrouter.ai/api/v1/");
+                    let or_url = or_config
+                        .providers
+                        .get("openrouter")
+                        .and_then(|p| p.base_url.clone())
+                        .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
+                    let or_url = ensure_trailing_slash(or_url);
+                    let or_endpoint = Endpoint::from_owned(or_url);
                     let or_auth = if let Some(key) = or_config.get_api_key("openrouter") {
                         AuthData::from_single(key)
                     } else {
                         AuthData::from_env("OPENROUTER_API_KEY")
                     };
                     let or_model = ModelIden::new(AdapterKind::OpenAI, model.model_name);
-                    Ok(ServiceTarget {
+                    return Ok(ServiceTarget {
                         endpoint: or_endpoint,
                         auth: or_auth,
                         model: or_model,
-                    })
-                } else {
-                    Ok(ServiceTarget {
-                        model,
-                        endpoint,
-                        auth,
-                    })
+                    });
                 }
+
+                // Resolve the provider for this model: first try our config's model
+                // table (handles Bedrock-style IDs that genai misroutes), then fall
+                // back to adapter-kind matching.
+                let (provider_name, correct_kind) = target_model_map
+                    .get::<str>(&model.model_name)
+                    .map(|(name, kind)| (name.as_str(), Some(*kind)))
+                    .unwrap_or_else(|| {
+                        let name = provider_name_for_adapter(model.adapter_kind.as_str())
+                            .unwrap_or("");
+                        (name, None)
+                    });
+
+                // Fix the adapter kind if genai guessed wrong
+                let kind_was_wrong = correct_kind.is_some_and(|k| k != model.adapter_kind);
+                let model = if kind_was_wrong {
+                    ModelIden::new(correct_kind.unwrap(), model.model_name)
+                } else {
+                    model
+                };
+
+                // Override endpoint: use [providers.<name>].base_url if set,
+                // otherwise if the adapter kind was corrected we must also fix
+                // the endpoint (genai resolved the default for the wrong adapter).
+                let override_endpoint = or_config
+                    .providers
+                    .get(provider_name)
+                    .and_then(|p| p.base_url.clone())
+                    .or_else(|| {
+                        if !kind_was_wrong {
+                            return None;
+                        }
+                        Some(
+                            match model.adapter_kind {
+                                AdapterKind::Anthropic => "https://api.anthropic.com/v1/",
+                                AdapterKind::OpenAI => "https://api.openai.com/v1/",
+                                AdapterKind::Gemini => {
+                                    "https://generativelanguage.googleapis.com/v1beta/"
+                                }
+                                AdapterKind::Xai => "https://api.x.ai/v1/",
+                                _ => return None,
+                            }
+                            .to_string(),
+                        )
+                    })
+                    .map(|u| Endpoint::from_owned(ensure_trailing_slash(u)));
+
+                // Re-resolve auth when adapter kind was corrected, since the auth
+                // resolver ran with the wrong kind earlier
+                let auth = if correct_kind.is_some_and(|k| k != AdapterKind::Ollama) {
+                    or_config
+                        .get_api_key(provider_name)
+                        .map(AuthData::from_single)
+                        .unwrap_or(auth)
+                } else {
+                    auth
+                };
+
+                Ok(ServiceTarget {
+                    model,
+                    endpoint: override_endpoint.unwrap_or(endpoint),
+                    auth,
+                })
             },
         );
 

@@ -449,7 +449,7 @@ impl Config {
         }
     }
 
-    /// Generate default config file
+    /// Generate a richly-commented default config file.
     pub fn init() -> Result<()> {
         let config_path = Self::config_path();
 
@@ -464,20 +464,187 @@ impl Config {
                 .with_context(|| format!("Failed to create config directory: {:?}", parent))?;
         }
 
-        let config = Config::default();
-        let content =
-            toml::to_string_pretty(&config).with_context(|| "Failed to serialize config")?;
+        let content = Self::generate_init_template();
         fs::write(&config_path, &content)
             .with_context(|| format!("Failed to write config file: {:?}", config_path))?;
 
         println!("Created config file: {:?}", config_path);
-        println!("\nYou can now customize your settings:");
-        println!("  - Set default providers");
-        println!("  - Change default models");
-        println!("  - Add a default system prompt");
-        println!("  - Configure API keys (or use environment variables)");
+        println!("\nEdit it directly or run `ai config` for the interactive TUI editor.");
 
         Ok(())
+    }
+
+    fn env_status(var: &str) -> &'static str {
+        if env::var(var).is_ok() {
+            "✓ set"
+        } else {
+            "✗ missing"
+        }
+    }
+
+    fn generate_init_template() -> String {
+        format!(
+            r##"# ─────────────────────────────────────────────────────────────────────
+# ai-cli configuration
+# ─────────────────────────────────────────────────────────────────────
+# Edit this file or run `ai config` for the interactive TUI editor.
+#
+# API key status (detected at generation time):
+#   ANTHROPIC_API_KEY   {anthropic_status}
+#   OPENAI_API_KEY      {openai_status}
+#   XAI_API_KEY         {xai_status}
+#   GEMINI_API_KEY      {gemini_status}
+#   OPENROUTER_API_KEY  {openrouter_status}
+#
+# Providers without a valid API key are silently skipped at query time.
+
+# ── CLI mode (non-TUI) ──────────────────────────────────────────────
+# Controls behavior when running `ai "question"` (no -t flag).
+
+[cli]
+# "single" = query one provider; "multi" = query several in parallel
+default_mode = "single"
+# Which provider to use in single mode (alias name, e.g. "claude")
+single_provider = "claude"
+# Providers queried in multi mode
+multi_providers = ["claude", "gpt", "grok", "gemini"]
+# "fast" = cheaper/faster models; "smart" = best quality models
+model_tier = "fast"
+
+# ── TUI mode ────────────────────────────────────────────────────────
+# Controls behavior when running `ai -t "question"`.
+
+[tui_mode]
+default_mode = "multi"
+single_provider = "claude"
+multi_providers = ["claude", "gpt", "grok", "gemini"]
+model_tier = "fast"
+
+# ── General defaults ────────────────────────────────────────────────
+
+[default]
+# Providers queried when no -p flag is given (alias names)
+providers = ["claude", "chatgpt", "grok", "gemini"]
+# Stream tokens as they arrive (disable with --no-stream)
+stream = true
+# Start in TUI mode by default (override with -t / --no-tui)
+tui = false
+# Optional system prompt applied to every query
+# system_prompt = "You are a helpful assistant."
+
+# ── Response footer ─────────────────────────────────────────────────
+
+[footer]
+show_model = true
+show_time = true
+show_tokens = false
+show_reasoning = true
+
+# ── Web search (--search / -w) ──────────────────────────────────────
+# Primary search backend; the other is used as automatic fallback.
+
+[search]
+# "gemini" (Google Search grounding) or "tavily"
+provider = "gemini"
+# Max results per search call (Tavily only)
+max_results = 5
+# Safety cap on tool-call rounds per query
+max_iterations = 5
+
+[search.gemini]
+api_key_env = "GEMINI_API_KEY"
+fallback_api_key_env = "GOOGLE_API_KEY"
+model = "gemini-3.1-flash-lite-preview"
+
+[search.tavily]
+api_key_env = "TAVILY_API_KEY"
+
+# ── Retry behavior ──────────────────────────────────────────────────
+# Transient errors (429, 5xx, timeouts) are retried with exponential
+# backoff. A Retry-After header from the server takes precedence.
+
+[retry]
+# Total attempts including the first try; 1 disables retry
+max_attempts = 3
+# Initial backoff delay in ms; doubles each subsequent retry
+base_ms = 250
+# Ceiling per-attempt delay in ms
+max_delay_ms = 5000
+
+# ── Providers ────────────────────────────────────────────────────────
+# Each provider maps to a genai adapter. Use aliases to reference them
+# in CLI flags and mode configs (e.g. -p claude,gpt).
+#
+# Fields:
+#   enabled      – include in provider list (default: true)
+#   api_key_env  – env var holding the API key
+#   api_key      – hardcoded key (not recommended; prefer env vars)
+#   fast_model   – model used when model_tier = "fast"
+#   smart_model  – model used when model_tier = "smart"
+#   aliases      – short names for -p flag (first alias used as display name)
+#   color        – header color: red, green, blue, cyan, magenta, yellow, white
+#   base_url     – override the default API endpoint (for proxies, Bedrock, etc.)
+
+[providers.anthropic]
+enabled = true
+api_key_env = "ANTHROPIC_API_KEY"
+fast_model = "claude-haiku-4-5"
+smart_model = "claude-opus-4-6"
+aliases = ["claude"]
+color = "magenta"
+# For AWS Bedrock: set base_url and use a Bedrock API key.
+# Model IDs like "us.anthropic.claude-opus-4-7" are automatically
+# routed to the Anthropic adapter regardless of their prefix.
+# base_url = "https://bedrock-runtime.us-east-1.amazonaws.com/v1/"
+# api_key_env = "AWS_BEARER_TOKEN_BEDROCK"
+
+[providers.openai]
+enabled = true
+api_key_env = "OPENAI_API_KEY"
+fast_model = "gpt-5-nano"
+smart_model = "gpt-5.4"
+aliases = ["chatgpt", "gpt"]
+color = "green"
+
+[providers.xai]
+enabled = true
+api_key_env = "XAI_API_KEY"
+fast_model = "grok-4-1-fast-non-reasoning"
+smart_model = "grok-4"
+aliases = ["grok"]
+color = "blue"
+
+[providers.google]
+enabled = true
+api_key_env = "GEMINI_API_KEY"
+fast_model = "gemini-3.1-flash-lite-preview"
+smart_model = "gemini-3.1-pro-preview"
+aliases = ["gemini"]
+color = "cyan"
+
+[providers.openrouter]
+enabled = true
+api_key_env = "OPENROUTER_API_KEY"
+fast_model = "google/gemini-3.1-flash-lite-preview"
+smart_model = "anthropic/claude-opus-4-6"
+aliases = ["openrouter", "or"]
+color = "yellow"
+base_url = "https://openrouter.ai/api/v1"
+
+[providers.ollama]
+enabled = false
+fast_model = "qwen3:8b"
+smart_model = "qwen3:14b"
+aliases = ["ollama", "local"]
+color = "red"
+base_url = "http://localhost:11434"
+"##,
+            anthropic_status = Self::env_status("ANTHROPIC_API_KEY"),
+            openai_status = Self::env_status("OPENAI_API_KEY"),
+            xai_status = Self::env_status("XAI_API_KEY"),
+            gemini_status = Self::env_status("GEMINI_API_KEY"),
+            openrouter_status = Self::env_status("OPENROUTER_API_KEY"),
+        )
     }
 
     /// Save config to disk
@@ -565,6 +732,22 @@ mod tests {
         assert!(config.providers.contains_key("openai"));
         assert!(config.providers.contains_key("xai"));
         assert!(config.providers.contains_key("google"));
+    }
+
+    #[test]
+    fn test_init_template_parses() {
+        let template = Config::generate_init_template();
+        let config: Config = toml::from_str(&template).expect("init template must be valid TOML");
+        assert!(config.providers.contains_key("anthropic"));
+        assert!(config.providers.contains_key("openai"));
+        assert!(config.providers.contains_key("xai"));
+        assert!(config.providers.contains_key("google"));
+        assert!(config.providers.contains_key("openrouter"));
+        assert!(config.providers.contains_key("ollama"));
+        assert!(!config.providers["ollama"].enabled);
+        assert_eq!(config.cli.single_provider, "claude");
+        assert_eq!(config.search.provider, "gemini");
+        assert_eq!(config.retry.max_attempts, 3);
     }
 
     #[test]

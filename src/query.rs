@@ -96,9 +96,9 @@ impl QueryContext {
 }
 
 /// Map our internal display name (uppercase aliases like "CLAUDE", "CHATGPT")
-/// to the OpenTelemetry GenAI `gen_ai.system` semantic value. Falls back to the
-/// lowercased display name for anything we haven't mapped, so new providers
-/// still get usable telemetry attributes.
+/// to the OpenTelemetry GenAI `gen_ai.system` semantic value. Falls back to
+/// `"unknown"` for anything we haven't mapped; this is a valid semconv value
+/// that Langfuse accepts, so new providers still produce usable telemetry.
 fn gen_ai_system_for(display_name: &str) -> &'static str {
     match display_name.to_ascii_uppercase().as_str() {
         "CLAUDE" => "anthropic",
@@ -282,12 +282,7 @@ pub async fn query_single(
                 span.set_attribute(KeyValue::new("error", true));
                 span.set_attribute(KeyValue::new("exception.message", err_msg.clone()));
                 span.end();
-                return ProviderResponse::error(
-                    provider.clone(),
-                    model,
-                    err_msg,
-                    duration_ms,
-                );
+                return ProviderResponse::error(provider.clone(), model, err_msg, duration_ms);
             }
         };
 
@@ -652,6 +647,10 @@ pub async fn stream_all(
         let tx = tx.clone();
         let parent_cx = parent_cx.clone();
 
+        // DETACH: each task terminates naturally when stream_single returns;
+        // the cloned tx drops with it, and the receiver sees a closed channel
+        // once every task finishes. Cancellation propagates via the CLI's
+        // CancellationToken (held inside ctx), not via JoinHandle.abort().
         tokio::spawn(
             async move { stream_single(&manager, &provider, &ctx, tx).await }
                 .with_context(parent_cx),

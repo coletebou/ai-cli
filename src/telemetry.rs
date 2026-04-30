@@ -56,11 +56,14 @@ pub fn init() -> Option<InitInfo> {
     }
 
     let endpoint = format!("{}/api/public/otel/v1/traces", host.trim_end_matches('/'));
-    let credentials = base64::engine::general_purpose::STANDARD
-        .encode(format!("{}:{}", public, secret));
+    let credentials =
+        base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", public, secret));
 
     let mut headers = HashMap::new();
-    headers.insert("Authorization".to_string(), format!("Basic {}", credentials));
+    headers.insert(
+        "Authorization".to_string(),
+        format!("Basic {}", credentials),
+    );
 
     let exporter = SpanExporter::builder()
         .with_http()

@@ -573,20 +573,18 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     frame.render_widget(input_paragraph, input_area);
 
     if app.mode == Mode::Insert {
-        // Place the cursor one column past the end of the buffer, inside the
-        // bordered area. Width measured in Unicode columns via `width()` so
-        // multi-byte chars don't drift the cursor.
+        // Inner height of the input box is 1 row; clamp the cursor to that row
+        // so wrapped buffers don't push it onto the bottom border or footer.
+        // Width measured in Unicode columns so multi-byte chars don't drift.
         let inner_width = input_area.width.saturating_sub(2) as usize;
         let buf_width = unicode_display_width(&app.input_buffer);
-        let (col_in_inner, row_offset) = if inner_width == 0 {
-            (0, 0)
+        let visible_col = if inner_width == 0 {
+            0
         } else {
-            let col = buf_width % inner_width;
-            let row = buf_width / inner_width;
-            (col as u16, row as u16)
+            buf_width % inner_width
         };
-        let cx = input_area.x + 1 + col_in_inner;
-        let cy = input_area.y + 1 + row_offset;
+        let cx = input_area.x + 1 + visible_col as u16;
+        let cy = input_area.y + 1;
         frame.set_cursor_position((cx, cy));
     }
 
@@ -646,6 +644,11 @@ pub async fn run_tui(
         let task_ctx = ctx.clone();
         let task_event_tx = event_tx.clone();
         tokio::spawn(async move {
+            // DETACH: cmd_rx closes when App drops its senders at the end of
+            // run_tui, which terminates panel_task's while-let loop. Any
+            // in-flight stream_with_messages is abandoned; callers wanting
+            // graceful shutdown must invoke cancel_current_turn() and let the
+            // CancellationToken unwind the stream before dropping the App.
             panel_task(task_manager, task_provider, task_ctx, cmd_rx, task_event_tx).await;
         });
     }
@@ -771,7 +774,10 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
 
 fn handle_normal_key(app: &mut App, key: crossterm::event::KeyEvent) {
     match key.code {
-        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('q') => {
+            app.cancel_current_turn();
+            app.should_quit = true;
+        }
         KeyCode::Esc => {
             // Esc in Normal when a turn is streaming cancels it; otherwise
             // quits. This gives you a single ubiquitous "get out" key.
@@ -838,6 +844,10 @@ fn handle_insert_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 let cmd_name = cmd_lower.split_whitespace().next().unwrap_or("");
                 match cmd_name {
                     "exit" | "quit" | "q" => {
+                        // Cancel any in-flight streams so we don't burn
+                        // provider tokens / TCP connections after the App
+                        // drops; no-op when nothing is streaming.
+                        app.cancel_current_turn();
                         app.should_quit = true;
                     }
                     "clear" | "reset" => {

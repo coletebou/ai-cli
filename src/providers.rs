@@ -331,12 +331,13 @@ impl ProviderManager {
         model: &str,
         messages: &[ChatMessage],
         system_prompt: Option<&str>,
+        tools: Option<&[Tool]>,
     ) -> Result<BedrockOutcome> {
         let cfg = self.retry_cfg();
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            match client.converse(model, messages, system_prompt).await {
+            match client.converse(model, messages, system_prompt, tools).await {
                 Ok(r) => return Ok(r),
                 Err(err) => {
                     if let Some(delay) = should_retry(&err, cfg, attempt) {

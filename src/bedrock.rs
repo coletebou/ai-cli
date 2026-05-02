@@ -1,19 +1,24 @@
-//! Direct client for AWS Bedrock's native Converse API.
+//! Direct client for AWS Bedrock's native Converse / ConverseStream APIs.
 //!
 //! genai's `AdapterKind::Anthropic` speaks Anthropic's native wire protocol
 //! (POST `{base_url}/messages`). Bedrock does not serve that protocol — a
 //! mismatched request yields HTTP 200 with `UnknownOperationException`,
 //! which presents as a silent empty response. This module bypasses genai
 //! entirely for Bedrock-hosted Claude models by calling
-//! `POST /model/{id}/converse` directly with bearer-token auth
-//! (`AWS_BEARER_TOKEN_BEDROCK`, introduced 2025).
+//! `POST /model/{id}/converse[-stream]` directly with bearer-token auth
+//! (`AWS_BEARER_TOKEN_BEDROCK`).
 //!
-//! Currently non-streaming only: the full response is delivered in one shot.
-//! Real streaming (ConverseStream) uses AWS's binary Event Stream framing and
-//! is a follow-up.
-use anyhow::{anyhow, Context, Result};
-use genai::chat::{ChatMessage, ChatRole, ContentPart, MessageContent};
+//! Streaming uses AWS's binary Event Stream framing — the frame decoder
+//! lives in `bedrock_eventstream`; this module converts those raw frames
+//! into `BedrockStreamEvent`s (TextDelta, ToolUseStart, ToolUseInputDelta,
+//! ContentBlockStop, MessageStop, Metadata).
+use crate::bedrock_eventstream::{Frame, FrameDecoder};
+use anyhow::{anyhow, bail, Context, Result};
+use futures::stream::StreamExt;
+use genai::chat::{ChatMessage, ChatRole, ContentPart, MessageContent, Tool, ToolCall};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::sync::mpsc;
 
 /// Detect whether a base_url points at AWS Bedrock. Used by the provider
 /// layer to decide between genai and this direct client.
@@ -57,14 +62,16 @@ impl BedrockClient {
         })
     }
 
-    /// Invoke the Converse API and return the assistant's text plus usage.
+    /// Invoke the Converse API (non-streaming) and return the assistant's
+    /// text, any tool calls, and usage.
     pub async fn converse(
         &self,
         model_id: &str,
         messages: &[ChatMessage],
         system_prompt: Option<&str>,
+        tools: Option<&[Tool]>,
     ) -> Result<BedrockOutcome> {
-        let body = build_converse_request(messages, system_prompt)?;
+        let body = build_converse_request(messages, system_prompt, tools)?;
 
         let url = format!(
             "{}/model/{}/converse",
@@ -103,27 +110,228 @@ impl BedrockClient {
             )
         })?;
 
-        let assistant_text = parsed
-            .output
-            .message
-            .content
-            .iter()
-            .filter_map(|c| c.text.as_deref())
-            .collect::<Vec<_>>()
-            .join("");
+        let mut assistant_text = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        for block in &parsed.output.message.content {
+            if let Some(t) = block.text.as_deref() {
+                assistant_text.push_str(t);
+            }
+            if let Some(tu) = &block.tool_use {
+                tool_calls.push(ToolCall {
+                    call_id: tu.tool_use_id.clone(),
+                    fn_name: tu.name.clone(),
+                    fn_arguments: tu.input.clone(),
+                    thought_signatures: None,
+                });
+            }
+        }
 
         Ok(BedrockOutcome {
             text: assistant_text,
+            tool_calls,
             input_tokens: parsed.usage.as_ref().and_then(|u| u.input_tokens),
             output_tokens: parsed.usage.as_ref().and_then(|u| u.output_tokens),
         })
     }
+
+    /// Invoke the ConverseStream API and emit semantic events over a
+    /// channel. The task returns when the stream ends (naturally or on
+    /// error). On error, a `BedrockStreamEvent::Error` is sent before the
+    /// channel closes.
+    pub async fn converse_stream(
+        &self,
+        model_id: &str,
+        messages: &[ChatMessage],
+        system_prompt: Option<&str>,
+        tools: Option<&[Tool]>,
+        tx: mpsc::Sender<BedrockStreamEvent>,
+    ) {
+        if let Err(e) = self
+            .converse_stream_inner(model_id, messages, system_prompt, tools, &tx)
+            .await
+        {
+            let _ = tx.send(BedrockStreamEvent::Error(format!("{:#}", e))).await;
+        }
+    }
+
+    async fn converse_stream_inner(
+        &self,
+        model_id: &str,
+        messages: &[ChatMessage],
+        system_prompt: Option<&str>,
+        tools: Option<&[Tool]>,
+        tx: &mpsc::Sender<BedrockStreamEvent>,
+    ) -> Result<()> {
+        let body = build_converse_request(messages, system_prompt, tools)?;
+
+        let url = format!(
+            "{}/model/{}/converse-stream",
+            self.host,
+            urlencode_path_segment(model_id)
+        );
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.auth_token)
+            .header("Accept", "application/vnd.amazon.eventstream")
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {}", url))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            bail!(
+                "Bedrock {} returned HTTP {}: {}",
+                model_id,
+                status.as_u16(),
+                truncate_for_error(&text)
+            );
+        }
+
+        let mut decoder = FrameDecoder::new();
+        let mut body_stream = resp.bytes_stream();
+
+        while let Some(chunk) = body_stream.next().await {
+            let chunk =
+                chunk.with_context(|| "reading Bedrock ConverseStream response body")?;
+            decoder.feed(&chunk);
+
+            while let Some(frame) = decoder.next_frame()? {
+                for ev in frame_to_events(frame)? {
+                    // If the receiver dropped, stop reading more bytes.
+                    if tx.send(ev).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
+/// Shape returned from the non-streaming `converse()` call.
 pub struct BedrockOutcome {
     pub text: String,
+    pub tool_calls: Vec<ToolCall>,
     pub input_tokens: Option<i32>,
     pub output_tokens: Option<i32>,
+}
+
+/// Semantic events produced by the streaming `converse_stream()` call.
+/// These normalize Bedrock's on-the-wire event vocabulary into something
+/// the query layer can consume without caring about frame framing.
+#[derive(Debug, Clone)]
+pub enum BedrockStreamEvent {
+    /// Plain text delta for a text content block.
+    TextDelta(String),
+    /// Start of a tool-use content block. The `input` arrives as deltas
+    /// that must be concatenated and JSON-parsed at ContentBlockStop time.
+    ToolUseStart {
+        block_index: usize,
+        tool_use_id: String,
+        name: String,
+    },
+    /// A partial JSON fragment of the tool input for `block_index`.
+    ToolUseInputDelta {
+        block_index: usize,
+        input_fragment: String,
+    },
+    /// A content block (text or tool-use) has ended. The consumer finalizes
+    /// any tool-use input accumulated for this index.
+    ContentBlockStop { block_index: usize },
+    /// Model's stopReason (end_turn, tool_use, max_tokens, etc.).
+    MessageStop { stop_reason: Option<String> },
+    /// Usage metadata (tokens) arriving near end of stream.
+    Metadata {
+        input_tokens: Option<i32>,
+        output_tokens: Option<i32>,
+    },
+    /// Non-recoverable error. Always the last event on the channel.
+    Error(String),
+}
+
+/// Decode a single Event Stream frame into zero or more semantic events.
+fn frame_to_events(frame: Frame) -> Result<Vec<BedrockStreamEvent>> {
+    // Bedrock uses :message-type = "event" for data and "exception" for
+    // server-side errors.
+    if frame.message_type() == Some("exception") {
+        let text = String::from_utf8_lossy(&frame.payload).to_string();
+        return Ok(vec![BedrockStreamEvent::Error(format!(
+            "Bedrock stream exception ({}): {}",
+            frame.event_type().unwrap_or("?"),
+            truncate_for_error(&text),
+        ))]);
+    }
+
+    let event_type = frame.event_type().unwrap_or("");
+    // Empty payload is legal for some frame types; skip JSON parsing then.
+    let payload: Value = if frame.payload.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&frame.payload).with_context(|| {
+            format!(
+                "parsing {} payload as JSON (first 200 bytes: {:?})",
+                event_type,
+                String::from_utf8_lossy(
+                    &frame.payload[..frame.payload.len().min(200)]
+                )
+            )
+        })?
+    };
+
+    match event_type {
+        "messageStart" => Ok(Vec::new()),
+        "contentBlockStart" => {
+            let block_index = payload["contentBlockIndex"].as_u64().unwrap_or(0) as usize;
+            if let Some(tu) = payload["start"].get("toolUse") {
+                let tool_use_id = tu["toolUseId"].as_str().unwrap_or("").to_string();
+                let name = tu["name"].as_str().unwrap_or("").to_string();
+                Ok(vec![BedrockStreamEvent::ToolUseStart {
+                    block_index,
+                    tool_use_id,
+                    name,
+                }])
+            } else {
+                // Text content block start — nothing semantic to emit.
+                Ok(Vec::new())
+            }
+        }
+        "contentBlockDelta" => {
+            let block_index = payload["contentBlockIndex"].as_u64().unwrap_or(0) as usize;
+            let delta = &payload["delta"];
+            if let Some(text) = delta["text"].as_str() {
+                Ok(vec![BedrockStreamEvent::TextDelta(text.to_string())])
+            } else if let Some(fragment) = delta["toolUse"]["input"].as_str() {
+                Ok(vec![BedrockStreamEvent::ToolUseInputDelta {
+                    block_index,
+                    input_fragment: fragment.to_string(),
+                }])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        "contentBlockStop" => {
+            let block_index = payload["contentBlockIndex"].as_u64().unwrap_or(0) as usize;
+            Ok(vec![BedrockStreamEvent::ContentBlockStop { block_index }])
+        }
+        "messageStop" => {
+            let stop_reason = payload["stopReason"].as_str().map(String::from);
+            Ok(vec![BedrockStreamEvent::MessageStop { stop_reason }])
+        }
+        "metadata" => {
+            let usage = &payload["usage"];
+            Ok(vec![BedrockStreamEvent::Metadata {
+                input_tokens: usage["inputTokens"].as_i64().map(|v| v as i32),
+                output_tokens: usage["outputTokens"].as_i64().map(|v| v as i32),
+            }])
+        }
+        // Unknown event types are ignored (forward-compat with new Bedrock
+        // event kinds — the critical ones above are stable).
+        _ => Ok(Vec::new()),
+    }
 }
 
 fn truncate_for_error(s: &str) -> String {
@@ -160,6 +368,8 @@ struct ConverseRequest {
     messages: Vec<BedrockMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<Vec<BedrockSystemBlock>>,
+    #[serde(rename = "toolConfig", skip_serializing_if = "Option::is_none")]
+    tool_config: Option<BedrockToolConfig>,
 }
 
 #[derive(Serialize)]
@@ -168,14 +378,67 @@ struct BedrockMessage {
     content: Vec<BedrockContentOut>,
 }
 
-#[derive(Serialize)]
+/// Content block variants we serialize. Only one field is set per instance;
+/// serde will emit the non-None one. Bedrock rejects requests that include
+/// multiple keys in a single content object.
+#[derive(Serialize, Default)]
 struct BedrockContentOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(rename = "toolUse", skip_serializing_if = "Option::is_none")]
+    tool_use: Option<BedrockToolUseOut>,
+    #[serde(rename = "toolResult", skip_serializing_if = "Option::is_none")]
+    tool_result: Option<BedrockToolResultOut>,
+}
+
+#[derive(Serialize)]
+struct BedrockToolUseOut {
+    #[serde(rename = "toolUseId")]
+    tool_use_id: String,
+    name: String,
+    input: Value,
+}
+
+#[derive(Serialize)]
+struct BedrockToolResultOut {
+    #[serde(rename = "toolUseId")]
+    tool_use_id: String,
+    content: Vec<BedrockToolResultContent>,
+}
+
+#[derive(Serialize)]
+struct BedrockToolResultContent {
     text: String,
 }
 
 #[derive(Serialize)]
 struct BedrockSystemBlock {
     text: String,
+}
+
+#[derive(Serialize)]
+struct BedrockToolConfig {
+    tools: Vec<BedrockToolSpec>,
+}
+
+#[derive(Serialize)]
+struct BedrockToolSpec {
+    #[serde(rename = "toolSpec")]
+    tool_spec: BedrockToolSpecInner,
+}
+
+#[derive(Serialize)]
+struct BedrockToolSpecInner {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(rename = "inputSchema")]
+    input_schema: BedrockInputSchema,
+}
+
+#[derive(Serialize)]
+struct BedrockInputSchema {
+    json: Value,
 }
 
 #[derive(Deserialize)]
@@ -200,6 +463,17 @@ struct ConverseMessage {
 struct ConverseContent {
     #[serde(default)]
     text: Option<String>,
+    #[serde(default, rename = "toolUse")]
+    tool_use: Option<ConverseToolUseIn>,
+}
+
+#[derive(Deserialize)]
+struct ConverseToolUseIn {
+    #[serde(rename = "toolUseId")]
+    tool_use_id: String,
+    name: String,
+    #[serde(default)]
+    input: Value,
 }
 
 #[derive(Deserialize)]
@@ -213,12 +487,11 @@ struct ConverseUsage {
 fn build_converse_request(
     messages: &[ChatMessage],
     system_prompt: Option<&str>,
+    tools: Option<&[Tool]>,
 ) -> Result<ConverseRequest> {
     // Bedrock puts the system prompt in its own field (not a role). Pull any
     // genai `ChatRole::System` messages out and fold them in with the
-    // caller-provided system_prompt. Assistant tool-call messages and tool
-    // responses are currently unsupported (we error out so the caller can
-    // decide whether to degrade or fail loudly).
+    // caller-provided system_prompt.
     let mut system_texts: Vec<String> = Vec::new();
     if let Some(s) = system_prompt {
         if !s.is_empty() {
@@ -234,23 +507,37 @@ fn build_converse_request(
                     system_texts.push(t);
                 }
             }
-            ChatRole::User | ChatRole::Assistant => {
-                let text = content_to_text(&msg.content).ok_or_else(|| {
-                    anyhow!("Bedrock routing does not yet support non-text content (tool calls, images, etc.)")
-                })?;
+            ChatRole::User => {
+                let blocks = convert_user_content(&msg.content)?;
+                if blocks.is_empty() {
+                    continue;
+                }
                 out_messages.push(BedrockMessage {
-                    role: match msg.role {
-                        ChatRole::User => "user",
-                        ChatRole::Assistant => "assistant",
-                        _ => unreachable!(),
-                    },
-                    content: vec![BedrockContentOut { text }],
+                    role: "user",
+                    content: blocks,
+                });
+            }
+            ChatRole::Assistant => {
+                let blocks = convert_assistant_content(&msg.content)?;
+                if blocks.is_empty() {
+                    continue;
+                }
+                out_messages.push(BedrockMessage {
+                    role: "assistant",
+                    content: blocks,
                 });
             }
             ChatRole::Tool => {
-                return Err(anyhow!(
-                    "Bedrock routing does not yet support tool messages (web search etc.)"
-                ));
+                // genai uses a synthetic "tool" role for tool responses;
+                // Bedrock expects these as a user turn with toolResult blocks.
+                let blocks = convert_tool_content(&msg.content)?;
+                if blocks.is_empty() {
+                    continue;
+                }
+                out_messages.push(BedrockMessage {
+                    role: "user",
+                    content: blocks,
+                });
             }
         }
     }
@@ -266,20 +553,49 @@ fn build_converse_request(
         )
     };
 
+    let tool_config = tools.and_then(|ts| {
+        if ts.is_empty() {
+            None
+        } else {
+            Some(BedrockToolConfig {
+                tools: ts
+                    .iter()
+                    .map(|t| BedrockToolSpec {
+                        tool_spec: BedrockToolSpecInner {
+                            name: t.name.clone(),
+                            description: t.description.clone(),
+                            input_schema: BedrockInputSchema {
+                                json: t
+                                    .schema
+                                    .clone()
+                                    // Bedrock requires a valid JSON schema; if
+                                    // the caller provided none, send an empty
+                                    // object schema ("any input shape").
+                                    .unwrap_or_else(|| {
+                                        serde_json::json!({"type": "object"})
+                                    }),
+                            },
+                        },
+                    })
+                    .collect(),
+            })
+        }
+    });
+
     Ok(ConverseRequest {
         messages: out_messages,
         system,
+        tool_config,
     })
 }
 
 fn content_to_text(content: &MessageContent) -> Option<String> {
-    // Only emit if the content is plain text (possibly multi-part).
-    // If any non-text parts exist, return None so the caller can error.
     let mut text = String::new();
     for part in content.parts() {
-        match part {
-            ContentPart::Text(t) => text.push_str(t),
-            _ => return None,
+        if let ContentPart::Text(t) = part {
+            text.push_str(t);
+        } else {
+            return None;
         }
     }
     if text.is_empty() {
@@ -287,6 +603,97 @@ fn content_to_text(content: &MessageContent) -> Option<String> {
     } else {
         Some(text)
     }
+}
+
+/// User turns support text and toolResult (genai's tool-response mode — see
+/// ChatRole::Tool handling above — is a separate path; this function stays
+/// lenient in case a ToolResponse sneaks in via a user-tagged message).
+fn convert_user_content(content: &MessageContent) -> Result<Vec<BedrockContentOut>> {
+    let mut out = Vec::new();
+    for part in content.parts() {
+        match part {
+            ContentPart::Text(t) if !t.is_empty() => out.push(BedrockContentOut {
+                text: Some(t.clone()),
+                ..Default::default()
+            }),
+            ContentPart::ToolResponse(tr) => {
+                out.push(BedrockContentOut {
+                    tool_result: Some(BedrockToolResultOut {
+                        tool_use_id: tr.call_id.clone(),
+                        content: vec![BedrockToolResultContent {
+                            text: tr.content.clone(),
+                        }],
+                    }),
+                    ..Default::default()
+                });
+            }
+            ContentPart::Text(_) => {}
+            ContentPart::ThoughtSignature(_) => {} // drop; Bedrock has no wire equivalent
+            other => {
+                return Err(anyhow!(
+                    "Bedrock routing: unsupported user content part: {:?}",
+                    std::mem::discriminant(other)
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Assistant turns support text and toolUse content blocks.
+fn convert_assistant_content(content: &MessageContent) -> Result<Vec<BedrockContentOut>> {
+    let mut out = Vec::new();
+    for part in content.parts() {
+        match part {
+            ContentPart::Text(t) if !t.is_empty() => out.push(BedrockContentOut {
+                text: Some(t.clone()),
+                ..Default::default()
+            }),
+            ContentPart::ToolCall(tc) => {
+                out.push(BedrockContentOut {
+                    tool_use: Some(BedrockToolUseOut {
+                        tool_use_id: tc.call_id.clone(),
+                        name: tc.fn_name.clone(),
+                        input: tc.fn_arguments.clone(),
+                    }),
+                    ..Default::default()
+                });
+            }
+            ContentPart::Text(_) => {}
+            ContentPart::ThoughtSignature(_) => {} // drop; Bedrock has no wire equivalent
+            other => {
+                return Err(anyhow!(
+                    "Bedrock routing: unsupported assistant content part: {:?}",
+                    std::mem::discriminant(other)
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `ChatRole::Tool` messages from genai carry ToolResponse parts. In Bedrock
+/// these ride on a user turn with toolResult blocks.
+fn convert_tool_content(content: &MessageContent) -> Result<Vec<BedrockContentOut>> {
+    let mut out = Vec::new();
+    for part in content.parts() {
+        if let ContentPart::ToolResponse(tr) = part {
+            out.push(BedrockContentOut {
+                tool_result: Some(BedrockToolResultOut {
+                    tool_use_id: tr.call_id.clone(),
+                    content: vec![BedrockToolResultContent {
+                        text: tr.content.clone(),
+                    }],
+                }),
+                ..Default::default()
+            });
+        } else {
+            return Err(anyhow!(
+                "Bedrock routing: tool-role message contained non-ToolResponse content"
+            ));
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -333,11 +740,12 @@ mod tests {
     #[test]
     fn builds_basic_request() {
         let msgs = vec![ChatMessage::user("hello")];
-        let req = build_converse_request(&msgs, None).unwrap();
+        let req = build_converse_request(&msgs, None, None).unwrap();
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["messages"][0]["role"], "user");
         assert_eq!(json["messages"][0]["content"][0]["text"], "hello");
         assert!(json.get("system").is_none_or(|v| v.is_null()));
+        assert!(json.get("toolConfig").is_none_or(|v| v.is_null()));
     }
 
     #[test]
@@ -346,7 +754,7 @@ mod tests {
             ChatMessage::system("be brief"),
             ChatMessage::user("hi"),
         ];
-        let req = build_converse_request(&msgs, Some("also: polite")).unwrap();
+        let req = build_converse_request(&msgs, Some("also: polite"), None).unwrap();
         let json = serde_json::to_value(&req).unwrap();
         let sys = json["system"].as_array().unwrap();
         assert_eq!(sys.len(), 2);
@@ -358,20 +766,186 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tool_messages() {
+    fn encodes_assistant_tool_calls_and_tool_responses() {
         use genai::chat::{ToolCall, ToolResponse};
         let tool_call = ToolCall {
             call_id: "c1".into(),
             fn_name: "web_search".into(),
-            fn_arguments: serde_json::json!({"query": "x"}),
+            fn_arguments: serde_json::json!({"query": "rust"}),
             thought_signatures: None,
         };
         let msgs = vec![
-            ChatMessage::user("hi"),
+            ChatMessage::user("search for rust info"),
             ChatMessage::from(vec![tool_call.clone()]),
-            ChatMessage::from(ToolResponse::new("c1", "result")),
+            ChatMessage::from(ToolResponse::new("c1", "search results here")),
         ];
-        assert!(build_converse_request(&msgs, None).is_err());
+        let req = build_converse_request(&msgs, None, None).unwrap();
+        let json = serde_json::to_value(&req).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        // Assistant turn carries the toolUse block.
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"][0]["toolUse"]["toolUseId"], "c1");
+        assert_eq!(messages[1]["content"][0]["toolUse"]["name"], "web_search");
+        assert_eq!(
+            messages[1]["content"][0]["toolUse"]["input"]["query"],
+            "rust"
+        );
+        // genai's ChatRole::Tool becomes a user turn with toolResult.
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(
+            messages[2]["content"][0]["toolResult"]["toolUseId"],
+            "c1"
+        );
+        assert_eq!(
+            messages[2]["content"][0]["toolResult"]["content"][0]["text"],
+            "search results here"
+        );
+    }
+
+    #[test]
+    fn includes_tool_config_when_tools_provided() {
+        use genai::chat::Tool;
+        let tool = Tool::new("web_search")
+            .with_description("Search the web.")
+            .with_schema(serde_json::json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }));
+        let msgs = vec![ChatMessage::user("find something")];
+        let req = build_converse_request(&msgs, None, Some(&[tool])).unwrap();
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            json["toolConfig"]["tools"][0]["toolSpec"]["name"],
+            "web_search"
+        );
+        assert_eq!(
+            json["toolConfig"]["tools"][0]["toolSpec"]["description"],
+            "Search the web."
+        );
+        assert_eq!(
+            json["toolConfig"]["tools"][0]["toolSpec"]["inputSchema"]["json"]["type"],
+            "object"
+        );
+    }
+
+    #[test]
+    fn omits_tool_config_when_tools_empty() {
+        let msgs = vec![ChatMessage::user("hi")];
+        let req = build_converse_request(&msgs, None, Some(&[])).unwrap();
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("toolConfig").is_none_or(|v| v.is_null()));
+    }
+
+    #[test]
+    fn parses_non_streaming_tool_use_response() {
+        // Payload matches what we observed from real Bedrock responses
+        // during the streaming probe (tooluse_... id, input object).
+        let json = r#"{
+            "output": {"message": {"role": "assistant", "content": [
+                {"toolUse": {
+                    "toolUseId": "tooluse_abc123",
+                    "name": "multiply",
+                    "input": {"a": 7, "b": 13}
+                }}
+            ]}},
+            "usage": {"inputTokens": 790, "outputTokens": 84, "totalTokens": 874},
+            "stopReason": "tool_use"
+        }"#;
+        let parsed: ConverseResponse = serde_json::from_str(json).unwrap();
+        let tc = parsed.output.message.content[0].tool_use.as_ref().unwrap();
+        assert_eq!(tc.tool_use_id, "tooluse_abc123");
+        assert_eq!(tc.name, "multiply");
+        assert_eq!(tc.input["a"], 7);
+        assert_eq!(tc.input["b"], 13);
+    }
+
+    #[test]
+    fn frame_to_events_handles_text_delta() {
+        let payload = br#"{"contentBlockIndex":0,"delta":{"text":"hello"}}"#;
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(":event-type".to_string(), "contentBlockDelta".to_string());
+        headers.insert(":message-type".to_string(), "event".to_string());
+        let frame = Frame {
+            headers,
+            payload: payload.to_vec(),
+        };
+        let events = frame_to_events(frame).unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            BedrockStreamEvent::TextDelta(t) => assert_eq!(t, "hello"),
+            other => panic!("expected TextDelta, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn frame_to_events_handles_tool_use_start_and_deltas() {
+        // contentBlockStart with toolUse
+        let start_payload =
+            br#"{"contentBlockIndex":0,"start":{"toolUse":{"name":"mul","toolUseId":"tu_x"}}}"#;
+        let mut h = std::collections::HashMap::new();
+        h.insert(":event-type".to_string(), "contentBlockStart".to_string());
+        h.insert(":message-type".to_string(), "event".to_string());
+        let frame = Frame {
+            headers: h,
+            payload: start_payload.to_vec(),
+        };
+        let events = frame_to_events(frame).unwrap();
+        match &events[0] {
+            BedrockStreamEvent::ToolUseStart {
+                block_index,
+                tool_use_id,
+                name,
+            } => {
+                assert_eq!(*block_index, 0);
+                assert_eq!(tool_use_id, "tu_x");
+                assert_eq!(name, "mul");
+            }
+            other => panic!("expected ToolUseStart, got {:?}", other),
+        }
+
+        // contentBlockDelta with toolUse.input fragment
+        let delta_payload =
+            br#"{"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\"a\": 1"}}}"#;
+        let mut h = std::collections::HashMap::new();
+        h.insert(":event-type".to_string(), "contentBlockDelta".to_string());
+        h.insert(":message-type".to_string(), "event".to_string());
+        let frame = Frame {
+            headers: h,
+            payload: delta_payload.to_vec(),
+        };
+        let events = frame_to_events(frame).unwrap();
+        match &events[0] {
+            BedrockStreamEvent::ToolUseInputDelta {
+                block_index,
+                input_fragment,
+            } => {
+                assert_eq!(*block_index, 0);
+                assert_eq!(input_fragment, r#"{"a": 1"#);
+            }
+            other => panic!("expected ToolUseInputDelta, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn frame_to_events_surfaces_exceptions() {
+        let mut h = std::collections::HashMap::new();
+        h.insert(":event-type".to_string(), "throttlingException".to_string());
+        h.insert(":message-type".to_string(), "exception".to_string());
+        let frame = Frame {
+            headers: h,
+            payload: b"rate limited".to_vec(),
+        };
+        let events = frame_to_events(frame).unwrap();
+        match &events[0] {
+            BedrockStreamEvent::Error(msg) => {
+                assert!(msg.contains("throttlingException"), "got: {}", msg);
+                assert!(msg.contains("rate limited"), "got: {}", msg);
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
     }
 
     #[test]

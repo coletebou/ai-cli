@@ -3,7 +3,8 @@ use crate::search::{format_results_for_model, SearchEngine};
 use futures::future::join_all;
 use futures::StreamExt as FuturesStreamExt;
 use genai::chat::{
-    ChatMessage, ChatOptions, ChatStreamEvent, ReasoningEffort, Tool, ToolCall, ToolResponse,
+    ChatMessage, ChatOptions, ChatStreamEvent, ContentPart, ReasoningEffort, Tool, ToolCall,
+    ToolResponse,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -296,6 +297,282 @@ pub async fn query_single(
     )
 }
 
+/// Real streaming branch for Bedrock. Drives ConverseStream, forwards text
+/// deltas to the main display channel, reconstructs any tool calls from
+/// split input deltas, and loops through tool-use iterations in the same
+/// way the genai streaming path does.
+async fn stream_bedrock(
+    bedrock: &crate::bedrock::BedrockClient,
+    provider: &Provider,
+    mut messages: Vec<ChatMessage>,
+    ctx: &QueryContext,
+    tx: mpsc::Sender<StreamEvent>,
+    cancel: &CancellationToken,
+    start: Instant,
+) -> Vec<ChatMessage> {
+    use crate::bedrock::BedrockStreamEvent as BE;
+    use genai::chat::{MessageContent, ToolResponse};
+    use std::collections::HashMap;
+
+    let provider_name = provider.display_name.clone();
+    let model = provider.model.clone();
+
+    let _ = tx
+        .send(StreamEvent::Start {
+            provider: provider_name.clone(),
+            model: model.clone(),
+        })
+        .await;
+
+    let mut total_input: Option<i32> = None;
+    let mut total_output: Option<i32> = None;
+    let mut final_text = String::new();
+
+    // Per-call streaming state. Declared here so helpers below can borrow.
+    for iteration in 0..ctx.max_iterations.max(1) {
+        // Spin up a child channel that the Bedrock client drives.
+        let (child_tx, mut child_rx) = mpsc::channel::<BE>(64);
+        let bedrock_clone = bedrock; // reborrow
+        let msgs_clone = messages.clone();
+        let system = ctx.system_prompt.clone();
+        let tools = ctx.tools.clone();
+        let model_for_call = model.clone();
+        let stream_task = async move {
+            bedrock_clone
+                .converse_stream(
+                    &model_for_call,
+                    &msgs_clone,
+                    system.as_deref(),
+                    tools.as_deref(),
+                    child_tx,
+                )
+                .await;
+        };
+
+        tokio::pin!(stream_task);
+
+        // State accumulated during this iteration.
+        let mut iter_text = String::new();
+        // block_index -> (tool_use_id, name, input_fragment_buffer)
+        let mut tool_builders: HashMap<usize, (String, String, String)> = HashMap::new();
+        let mut finalized_tool_calls: Vec<ToolCall> = Vec::new();
+        let mut stop_reason: Option<String> = None;
+        let mut stream_error: Option<String> = None;
+
+        // Pump both the stream task and events from the child channel.
+        // The task running the HTTP request is kept polling so that
+        // `child_rx.recv()` can observe events as they arrive.
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let _ = tx
+                        .send(StreamEvent::Error {
+                            provider: provider_name,
+                            model,
+                            error: "cancelled".to_string(),
+                            duration_ms,
+                        })
+                        .await;
+                    return messages;
+                }
+                _ = &mut stream_task => {
+                    // Stream task has finished sending; drain any remaining
+                    // events, then break the select loop.
+                    while let Ok(ev) = child_rx.try_recv() {
+                        handle_bedrock_event(
+                            ev,
+                            &provider_name,
+                            &tx,
+                            &mut iter_text,
+                            &mut tool_builders,
+                            &mut finalized_tool_calls,
+                            &mut stop_reason,
+                            &mut total_input,
+                            &mut total_output,
+                            &mut stream_error,
+                        ).await;
+                    }
+                    break;
+                }
+                ev = child_rx.recv() => match ev {
+                    Some(e) => handle_bedrock_event(
+                        e,
+                        &provider_name,
+                        &tx,
+                        &mut iter_text,
+                        &mut tool_builders,
+                        &mut finalized_tool_calls,
+                        &mut stop_reason,
+                        &mut total_input,
+                        &mut total_output,
+                        &mut stream_error,
+                    ).await,
+                    None => break, // channel closed — stream_task will complete next
+                },
+            }
+        }
+
+        // Surface any stream-level error and stop the iteration loop.
+        if let Some(err) = stream_error {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            let _ = tx
+                .send(StreamEvent::Error {
+                    provider: provider_name,
+                    model,
+                    error: err,
+                    duration_ms,
+                })
+                .await;
+            return messages;
+        }
+
+        // Terminal iteration: no tool calls, or we can't execute them.
+        let no_tools = finalized_tool_calls.is_empty();
+        let no_search = ctx.search_client.is_none();
+        let last_iter = iteration + 1 >= ctx.max_iterations;
+
+        if no_tools || no_search || last_iter {
+            final_text = iter_text;
+            break;
+        }
+
+        // Tool-use iteration: append assistant message with tool calls,
+        // execute each, append tool responses, and loop. Note: if the
+        // assistant produced narrative text alongside tool calls, include it
+        // too so Bedrock sees a well-formed assistant turn.
+        let mut parts: Vec<ContentPart> = Vec::new();
+        if !iter_text.is_empty() {
+            parts.push(ContentPart::Text(iter_text.clone()));
+        }
+        for tc in &finalized_tool_calls {
+            parts.push(ContentPart::ToolCall(tc.clone()));
+        }
+        messages.push(ChatMessage::assistant(MessageContent::from_parts(parts)));
+
+        for tool_call in &finalized_tool_calls {
+            let result_text = execute_tool_call(tool_call, ctx, &provider_name, Some(&tx)).await;
+            let tool_response = ToolResponse::new(tool_call.call_id.clone(), result_text);
+            messages.push(ChatMessage::from(tool_response));
+        }
+    }
+
+    // Silent-failure guard (mirrors the genai path): a terminal iteration
+    // that produced neither text nor tool calls is reported as an error.
+    let duration_ms = start.elapsed().as_millis() as u64;
+    if final_text.is_empty() {
+        let _ = tx
+            .send(StreamEvent::Error {
+                provider: provider_name,
+                model,
+                error: "Bedrock returned an empty response (no text content)".to_string(),
+                duration_ms,
+            })
+            .await;
+        return messages;
+    }
+
+    messages.push(ChatMessage::assistant(final_text));
+
+    let _ = tx
+        .send(StreamEvent::Done {
+            provider: provider_name,
+            model,
+            input_tokens: total_input,
+            output_tokens: total_output,
+            duration_ms,
+        })
+        .await;
+
+    messages
+}
+
+/// Per-event handler for the Bedrock streaming branch. Kept separate to
+/// keep the main loop readable; mutates the accumulator state passed in.
+#[allow(clippy::too_many_arguments)]
+async fn handle_bedrock_event(
+    ev: crate::bedrock::BedrockStreamEvent,
+    provider_name: &str,
+    tx: &mpsc::Sender<StreamEvent>,
+    iter_text: &mut String,
+    tool_builders: &mut std::collections::HashMap<usize, (String, String, String)>,
+    finalized: &mut Vec<ToolCall>,
+    stop_reason: &mut Option<String>,
+    total_input: &mut Option<i32>,
+    total_output: &mut Option<i32>,
+    stream_error: &mut Option<String>,
+) {
+    use crate::bedrock::BedrockStreamEvent as BE;
+    match ev {
+        BE::TextDelta(text) => {
+            iter_text.push_str(&text);
+            let _ = tx
+                .send(StreamEvent::Chunk {
+                    provider: provider_name.to_string(),
+                    text,
+                })
+                .await;
+        }
+        BE::ToolUseStart {
+            block_index,
+            tool_use_id,
+            name,
+        } => {
+            tool_builders.insert(block_index, (tool_use_id, name, String::new()));
+        }
+        BE::ToolUseInputDelta {
+            block_index,
+            input_fragment,
+        } => {
+            if let Some(b) = tool_builders.get_mut(&block_index) {
+                b.2.push_str(&input_fragment);
+            }
+        }
+        BE::ContentBlockStop { block_index } => {
+            if let Some((tool_use_id, name, input_buf)) = tool_builders.remove(&block_index) {
+                // Tool-use blocks: parse the accumulated JSON input. If
+                // parsing fails, the model emitted invalid JSON — surface it
+                // as a stream error rather than fabricating a tool call.
+                match serde_json::from_str::<serde_json::Value>(
+                    if input_buf.is_empty() { "{}" } else { &input_buf },
+                ) {
+                    Ok(input) => finalized.push(ToolCall {
+                        call_id: tool_use_id,
+                        fn_name: name,
+                        fn_arguments: input,
+                        thought_signatures: None,
+                    }),
+                    Err(e) => {
+                        *stream_error = Some(format!(
+                            "Bedrock streamed invalid tool-use JSON for {}: {} (raw: {:?})",
+                            name, e, input_buf
+                        ));
+                    }
+                }
+            }
+            // Text block stops need no action (text is already streamed).
+        }
+        BE::MessageStop { stop_reason: sr } => {
+            *stop_reason = sr;
+        }
+        BE::Metadata {
+            input_tokens,
+            output_tokens,
+        } => {
+            if let Some(v) = input_tokens {
+                *total_input = Some(total_input.unwrap_or(0) + v);
+            }
+            if let Some(v) = output_tokens {
+                *total_output = Some(total_output.unwrap_or(0) + v);
+            }
+        }
+        BE::Error(msg) => {
+            *stream_error = Some(msg);
+        }
+    }
+}
+
 /// Non-streaming Bedrock branch for `query_single`. Bedrock doesn't support
 /// genai-style tool-use in this codepath yet, so any tools in `ctx` are
 /// ignored (and a warning is not emitted — query_single keeps the same
@@ -307,40 +584,91 @@ async fn query_single_bedrock(
     bedrock: &crate::bedrock::BedrockClient,
     start: Instant,
 ) -> ProviderResponse {
-    let messages = build_initial_messages(&ctx.question, ctx.system_prompt.as_deref());
-    match manager
-        .exec_bedrock_converse(bedrock, &provider.model, &messages, ctx.system_prompt.as_deref())
-        .await
-    {
-        Ok(outcome) => {
-            let duration_ms = start.elapsed().as_millis() as u64;
-            if outcome.text.is_empty() {
+    use genai::chat::MessageContent;
+
+    let mut messages = build_initial_messages(&ctx.question, ctx.system_prompt.as_deref());
+    let mut total_input: Option<i32> = None;
+    let mut total_output: Option<i32> = None;
+    let mut final_text = String::new();
+
+    for iteration in 0..ctx.max_iterations.max(1) {
+        let outcome = match manager
+            .exec_bedrock_converse(
+                bedrock,
+                &provider.model,
+                &messages,
+                ctx.system_prompt.as_deref(),
+                ctx.tools.as_deref(),
+            )
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
                 return ProviderResponse::error(
                     provider.clone(),
                     provider.model.clone(),
-                    "Bedrock returned an empty response (no text content)".to_string(),
+                    format!("{:#}", e),
                     duration_ms,
                 );
             }
-            ProviderResponse::success(
-                provider.clone(),
-                provider.model.clone(),
-                outcome.text,
-                outcome.input_tokens,
-                outcome.output_tokens,
-                duration_ms,
-            )
+        };
+
+        if let Some(v) = outcome.input_tokens {
+            total_input = Some(total_input.unwrap_or(0) + v);
         }
-        Err(e) => {
-            let duration_ms = start.elapsed().as_millis() as u64;
-            ProviderResponse::error(
-                provider.clone(),
-                provider.model.clone(),
-                format!("{:#}", e),
-                duration_ms,
-            )
+        if let Some(v) = outcome.output_tokens {
+            total_output = Some(total_output.unwrap_or(0) + v);
+        }
+
+        if !outcome.text.is_empty() {
+            final_text = outcome.text.clone();
+        }
+
+        // No tool calls -> we have our final answer.
+        if outcome.tool_calls.is_empty()
+            || ctx.search_client.is_none()
+            || iteration + 1 >= ctx.max_iterations
+        {
+            break;
+        }
+
+        // Assistant turn: text (if any) plus the tool-use blocks.
+        let mut parts: Vec<ContentPart> = Vec::new();
+        if !outcome.text.is_empty() {
+            parts.push(ContentPart::Text(outcome.text.clone()));
+        }
+        for tc in &outcome.tool_calls {
+            parts.push(ContentPart::ToolCall(tc.clone()));
+        }
+        messages.push(ChatMessage::assistant(MessageContent::from_parts(parts)));
+
+        // Execute tool calls and append responses (user turns with toolResult).
+        for tool_call in &outcome.tool_calls {
+            let result_text =
+                execute_tool_call(tool_call, ctx, &provider.display_name, None).await;
+            let tool_response = ToolResponse::new(tool_call.call_id.clone(), result_text);
+            messages.push(ChatMessage::from(tool_response));
         }
     }
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    if final_text.is_empty() {
+        return ProviderResponse::error(
+            provider.clone(),
+            provider.model.clone(),
+            "Bedrock returned an empty response (no text content)".to_string(),
+            duration_ms,
+        );
+    }
+    ProviderResponse::success(
+        provider.clone(),
+        provider.model.clone(),
+        final_text,
+        total_input,
+        total_output,
+        duration_ms,
+    )
 }
 
 pub async fn query_all(
@@ -393,82 +721,21 @@ pub async fn stream_with_messages(
     let provider_name = provider.display_name.clone();
     let model = provider.model.clone();
 
-    // Bedrock-hosted models: use the direct Converse client. We simulate a
-    // stream by emitting Start -> Chunk (full text) -> Done so downstream
-    // display/TUI code can remain unchanged. Real token-level streaming is
-    // a follow-up (requires AWS binary Event Stream framing).
+    // Bedrock-hosted models: bypass genai and drive ConverseStream directly.
+    // Supports text streaming, tool use, and the standard tool-use iteration
+    // loop (identical semantics to the genai path below, just a different
+    // wire protocol).
     if let Some(bedrock) = manager.bedrock_for(&model) {
-        let _ = tx
-            .send(StreamEvent::Start {
-                provider: provider_name.clone(),
-                model: model.clone(),
-            })
-            .await;
-
-        let bedrock_result = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                let duration_ms = start.elapsed().as_millis() as u64;
-                let _ = tx
-                    .send(StreamEvent::Error {
-                        provider: provider_name,
-                        model,
-                        error: "cancelled".to_string(),
-                        duration_ms,
-                    })
-                    .await;
-                return messages;
-            }
-            r = manager.exec_bedrock_converse(
-                &bedrock,
-                &model,
-                &messages,
-                ctx.system_prompt.as_deref(),
-            ) => r,
-        };
-
-        let duration_ms = start.elapsed().as_millis() as u64;
-        match bedrock_result {
-            Ok(outcome) if outcome.text.is_empty() => {
-                let _ = tx
-                    .send(StreamEvent::Error {
-                        provider: provider_name,
-                        model,
-                        error: "Bedrock returned an empty response (no text content)".to_string(),
-                        duration_ms,
-                    })
-                    .await;
-            }
-            Ok(outcome) => {
-                let _ = tx
-                    .send(StreamEvent::Chunk {
-                        provider: provider_name.clone(),
-                        text: outcome.text.clone(),
-                    })
-                    .await;
-                messages.push(ChatMessage::assistant(outcome.text));
-                let _ = tx
-                    .send(StreamEvent::Done {
-                        provider: provider_name,
-                        model,
-                        input_tokens: outcome.input_tokens,
-                        output_tokens: outcome.output_tokens,
-                        duration_ms,
-                    })
-                    .await;
-            }
-            Err(e) => {
-                let _ = tx
-                    .send(StreamEvent::Error {
-                        provider: provider_name,
-                        model,
-                        error: format!("{:#}", e),
-                        duration_ms,
-                    })
-                    .await;
-            }
-        }
-        return messages;
+        return stream_bedrock(
+            &bedrock,
+            provider,
+            messages,
+            ctx,
+            tx,
+            cancel,
+            start,
+        )
+        .await;
     }
 
     let options = build_options(ctx);

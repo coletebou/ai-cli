@@ -1,4 +1,5 @@
 mod bedrock;
+mod bedrock_eventstream;
 mod chat;
 mod config;
 mod config_ui;

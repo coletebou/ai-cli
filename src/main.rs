@@ -1,3 +1,4 @@
+mod bedrock;
 mod chat;
 mod config;
 mod config_ui;

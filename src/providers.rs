@@ -1,3 +1,4 @@
+use crate::bedrock::{is_bedrock_base_url, BedrockClient, BedrockOutcome};
 use crate::config::{Config, ModelTier, ProviderConfig, RetryConfig};
 use crate::retry::{self, Retryable};
 use anyhow::{Context, Result};
@@ -105,6 +106,10 @@ pub struct ProviderManager {
     providers: HashMap<String, Provider>,
     #[allow(dead_code)]
     model_tier: ModelTier,
+    /// Map from model name -> Bedrock client. Populated for providers whose
+    /// `base_url` points at AWS Bedrock (genai cannot speak Bedrock's wire
+    /// protocol, so those requests bypass genai entirely).
+    bedrock_by_model: HashMap<String, Arc<BedrockClient>>,
 }
 
 impl ProviderManager {
@@ -265,12 +270,89 @@ impl ProviderManager {
             providers.insert(name.clone(), provider);
         }
 
+        // Build Bedrock clients for any provider whose base_url points at
+        // AWS Bedrock. Every configured model for that provider gets mapped
+        // to the same shared client so query_single() can dispatch by model.
+        let mut bedrock_by_model: HashMap<String, Arc<BedrockClient>> = HashMap::new();
+        for (name, p) in &config.providers {
+            if !p.enabled {
+                continue;
+            }
+            let Some(base_url) = p.base_url.as_deref() else {
+                continue;
+            };
+            if !is_bedrock_base_url(base_url) {
+                continue;
+            }
+            let Some(env_var) = p.api_key_env.as_deref() else {
+                eprintln!(
+                    "[warn] provider {} has a Bedrock base_url but no api_key_env; skipping",
+                    name
+                );
+                continue;
+            };
+            let Some(client) = BedrockClient::from_env(base_url, env_var) else {
+                eprintln!(
+                    "[warn] Bedrock provider {} has no {} set; skipping",
+                    name, env_var
+                );
+                continue;
+            };
+            let shared = Arc::new(client);
+            for model in [
+                &p.default_model,
+                p.fast_model.as_deref().unwrap_or_default(),
+                p.smart_model.as_deref().unwrap_or_default(),
+            ] {
+                if !model.is_empty() {
+                    bedrock_by_model.insert(model.to_string(), Arc::clone(&shared));
+                }
+            }
+        }
+
         Ok(ProviderManager {
             client,
             config,
             providers,
             model_tier,
+            bedrock_by_model,
         })
+    }
+
+    /// If this model is served by Bedrock, return the client for it.
+    pub fn bedrock_for(&self, model: &str) -> Option<Arc<BedrockClient>> {
+        self.bedrock_by_model.get(model).cloned()
+    }
+
+    /// Non-streaming Bedrock Converse invocation with retry on transient errors.
+    pub async fn exec_bedrock_converse(
+        &self,
+        client: &BedrockClient,
+        model: &str,
+        messages: &[ChatMessage],
+        system_prompt: Option<&str>,
+    ) -> Result<BedrockOutcome> {
+        let cfg = self.retry_cfg();
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            match client.converse(model, messages, system_prompt).await {
+                Ok(r) => return Ok(r),
+                Err(err) => {
+                    if let Some(delay) = should_retry(&err, cfg, attempt) {
+                        eprintln!(
+                            "[retry] {} attempt {}/{} after {:?}",
+                            model, attempt, cfg.max_attempts, delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(err).with_context(|| {
+                        format!("Failed to execute Bedrock Converse request for model: {}", model)
+                    });
+                }
+            }
+        }
     }
 
     pub fn resolve_alias(&self, alias: &str) -> Option<String> {

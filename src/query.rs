@@ -198,6 +198,13 @@ pub async fn query_single(
 ) -> ProviderResponse {
     let start = Instant::now();
     let model = provider.model.clone();
+
+    // Bedrock-hosted models bypass genai (which cannot speak Bedrock's wire
+    // protocol) and go through the direct Converse client.
+    if let Some(bedrock) = manager.bedrock_for(&model) {
+        return query_single_bedrock(manager, provider, ctx, &bedrock, start).await;
+    }
+
     let mut messages = build_initial_messages(&ctx.question, ctx.system_prompt.as_deref());
     let options = build_options(ctx);
 
@@ -271,6 +278,14 @@ pub async fn query_single(
     }
 
     let duration_ms = start.elapsed().as_millis() as u64;
+    if final_text.is_empty() {
+        return ProviderResponse::error(
+            provider.clone(),
+            model,
+            "provider returned an empty response (likely a wire-protocol mismatch; check base_url)".to_string(),
+            duration_ms,
+        );
+    }
     ProviderResponse::success(
         provider.clone(),
         model,
@@ -279,6 +294,53 @@ pub async fn query_single(
         total_output,
         duration_ms,
     )
+}
+
+/// Non-streaming Bedrock branch for `query_single`. Bedrock doesn't support
+/// genai-style tool-use in this codepath yet, so any tools in `ctx` are
+/// ignored (and a warning is not emitted — query_single keeps the same
+/// silent-skip behavior for missing search capability).
+async fn query_single_bedrock(
+    manager: &ProviderManager,
+    provider: &Provider,
+    ctx: &QueryContext,
+    bedrock: &crate::bedrock::BedrockClient,
+    start: Instant,
+) -> ProviderResponse {
+    let messages = build_initial_messages(&ctx.question, ctx.system_prompt.as_deref());
+    match manager
+        .exec_bedrock_converse(bedrock, &provider.model, &messages, ctx.system_prompt.as_deref())
+        .await
+    {
+        Ok(outcome) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            if outcome.text.is_empty() {
+                return ProviderResponse::error(
+                    provider.clone(),
+                    provider.model.clone(),
+                    "Bedrock returned an empty response (no text content)".to_string(),
+                    duration_ms,
+                );
+            }
+            ProviderResponse::success(
+                provider.clone(),
+                provider.model.clone(),
+                outcome.text,
+                outcome.input_tokens,
+                outcome.output_tokens,
+                duration_ms,
+            )
+        }
+        Err(e) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            ProviderResponse::error(
+                provider.clone(),
+                provider.model.clone(),
+                format!("{:#}", e),
+                duration_ms,
+            )
+        }
+    }
 }
 
 pub async fn query_all(
@@ -330,6 +392,84 @@ pub async fn stream_with_messages(
     let start = Instant::now();
     let provider_name = provider.display_name.clone();
     let model = provider.model.clone();
+
+    // Bedrock-hosted models: use the direct Converse client. We simulate a
+    // stream by emitting Start -> Chunk (full text) -> Done so downstream
+    // display/TUI code can remain unchanged. Real token-level streaming is
+    // a follow-up (requires AWS binary Event Stream framing).
+    if let Some(bedrock) = manager.bedrock_for(&model) {
+        let _ = tx
+            .send(StreamEvent::Start {
+                provider: provider_name.clone(),
+                model: model.clone(),
+            })
+            .await;
+
+        let bedrock_result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                let _ = tx
+                    .send(StreamEvent::Error {
+                        provider: provider_name,
+                        model,
+                        error: "cancelled".to_string(),
+                        duration_ms,
+                    })
+                    .await;
+                return messages;
+            }
+            r = manager.exec_bedrock_converse(
+                &bedrock,
+                &model,
+                &messages,
+                ctx.system_prompt.as_deref(),
+            ) => r,
+        };
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        match bedrock_result {
+            Ok(outcome) if outcome.text.is_empty() => {
+                let _ = tx
+                    .send(StreamEvent::Error {
+                        provider: provider_name,
+                        model,
+                        error: "Bedrock returned an empty response (no text content)".to_string(),
+                        duration_ms,
+                    })
+                    .await;
+            }
+            Ok(outcome) => {
+                let _ = tx
+                    .send(StreamEvent::Chunk {
+                        provider: provider_name.clone(),
+                        text: outcome.text.clone(),
+                    })
+                    .await;
+                messages.push(ChatMessage::assistant(outcome.text));
+                let _ = tx
+                    .send(StreamEvent::Done {
+                        provider: provider_name,
+                        model,
+                        input_tokens: outcome.input_tokens,
+                        output_tokens: outcome.output_tokens,
+                        duration_ms,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(StreamEvent::Error {
+                        provider: provider_name,
+                        model,
+                        error: format!("{:#}", e),
+                        duration_ms,
+                    })
+                    .await;
+            }
+        }
+        return messages;
+    }
 
     let options = build_options(ctx);
 
@@ -492,13 +632,29 @@ pub async fn stream_with_messages(
         }
     }
 
-    // Persist the final assistant reply in the message history so multi-turn
-    // callers see it on subsequent turns.
-    if !final_text.is_empty() {
-        messages.push(ChatMessage::assistant(final_text));
+    // Silent-failure guard: a stream that ended with no text AND no tool
+    // calls is almost always a wire-protocol mismatch (e.g. an adapter
+    // pointed at a server that doesn't speak its protocol — Bedrock's
+    // 200 + UnknownOperationException is the canonical trigger). Report
+    // it as an error so the user sees something instead of "[complete]"
+    // with an empty body.
+    let duration_ms = start.elapsed().as_millis() as u64;
+    if final_text.is_empty() {
+        let _ = tx
+            .send(StreamEvent::Error {
+                provider: provider_name,
+                model,
+                error: "provider returned an empty response (likely a wire-protocol mismatch; check base_url)".to_string(),
+                duration_ms,
+            })
+            .await;
+        return messages;
     }
 
-    let duration_ms = start.elapsed().as_millis() as u64;
+    // Persist the final assistant reply in the message history so multi-turn
+    // callers see it on subsequent turns.
+    messages.push(ChatMessage::assistant(final_text));
+
     let _ = tx
         .send(StreamEvent::Done {
             provider: provider_name,

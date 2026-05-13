@@ -56,3 +56,10 @@ tokio-stream = "0.1"
 # HTTP-date parsing for the `Retry-After` header (RFC 7231 allows
 # integer-seconds OR an HTTP-date; httpdate handles the date form).
 httpdate = "1"
+
+# Observability — OpenTelemetry traces shipped to a self-hosted Langfuse
+# via OTLP/HTTP. No-op when LANGFUSE_PUBLIC_KEY/SECRET_KEY are unset.
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client", "reqwest-rustls"] }
+base64 = "0.22"

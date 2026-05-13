@@ -1,11 +1,14 @@
 use crate::providers::{Provider, ProviderManager, ProviderResponse};
 use crate::search::{format_results_for_model, SearchEngine};
+use crate::telemetry::TRACER_NAME;
 use futures::future::join_all;
 use futures::StreamExt as FuturesStreamExt;
 use genai::chat::{
     ChatMessage, ChatOptions, ChatStreamEvent, ContentPart, ReasoningEffort, Tool, ToolCall,
     ToolResponse,
 };
+use opentelemetry::trace::{FutureExt, Span, Tracer};
+use opentelemetry::{global, Context, KeyValue};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -91,6 +94,46 @@ impl QueryContext {
         self.max_iterations = max_iterations;
         self
     }
+}
+
+/// Map our internal display name (uppercase aliases like "CLAUDE", "CHATGPT")
+/// to the OpenTelemetry GenAI `gen_ai.system` semantic value. Falls back to
+/// `"unknown"` for anything we haven't mapped; this is a valid semconv value
+/// that Langfuse accepts, so new providers still produce usable telemetry.
+fn gen_ai_system_for(display_name: &str) -> &'static str {
+    match display_name.to_ascii_uppercase().as_str() {
+        "CLAUDE" => "anthropic",
+        "CHATGPT" | "GPT" => "openai",
+        "GROK" => "xai",
+        "GEMINI" => "google_vertex_ai",
+        "OLLAMA" | "LOCAL" => "ollama",
+        "OPENROUTER" | "OR" => "openrouter",
+        _ => "unknown",
+    }
+}
+
+/// Best-effort JSON-encode a message list for the `langfuse.observation.input`
+/// attribute. We use `serde_json::Value` rather than the genai types directly
+/// because `ChatMessage` doesn't implement Serialize. Failing to encode just
+/// drops the attribute — telemetry is opportunistic, not load-bearing.
+fn messages_to_json(messages: &[ChatMessage]) -> Option<String> {
+    let parts: Vec<serde_json::Value> = messages
+        .iter()
+        .filter_map(|m| {
+            let role = match m.role {
+                genai::chat::ChatRole::System => "system",
+                genai::chat::ChatRole::User => "user",
+                genai::chat::ChatRole::Assistant => "assistant",
+                genai::chat::ChatRole::Tool => "tool",
+            };
+            let text = m.content.texts().join("");
+            if text.is_empty() {
+                return None;
+            }
+            Some(serde_json::json!({ "role": role, "content": text }))
+        })
+        .collect();
+    serde_json::to_string(&parts).ok()
 }
 
 fn build_initial_messages(question: &str, system_prompt: Option<&str>) -> Vec<ChatMessage> {
@@ -209,6 +252,23 @@ pub async fn query_single(
     let mut messages = build_initial_messages(&ctx.question, ctx.system_prompt.as_deref());
     let options = build_options(ctx);
 
+    // OTel span — same shape as `stream_with_messages` so both code paths
+    // produce comparable Langfuse generations.
+    let tracer = global::tracer(TRACER_NAME);
+    let mut span = tracer
+        .span_builder(format!("chat {}", provider.display_name))
+        .with_attributes(vec![
+            KeyValue::new("gen_ai.system", gen_ai_system_for(&provider.display_name)),
+            KeyValue::new("gen_ai.request.model", model.clone()),
+            KeyValue::new("gen_ai.operation.name", "chat"),
+            KeyValue::new("langfuse.observation.type", "generation"),
+            KeyValue::new("langfuse.observation.model.name", model.clone()),
+        ])
+        .start(&tracer);
+    if let Some(input_json) = messages_to_json(&messages) {
+        span.set_attribute(KeyValue::new("langfuse.observation.input", input_json));
+    }
+
     let mut total_input: Option<i32> = None;
     let mut total_output: Option<i32> = None;
     let mut final_text = String::new();
@@ -226,12 +286,11 @@ pub async fn query_single(
             Ok(r) => r,
             Err(e) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
-                return ProviderResponse::error(
-                    provider.clone(),
-                    model,
-                    format!("{:#}", e),
-                    duration_ms,
-                );
+                let err_msg = format!("{:#}", e);
+                span.set_attribute(KeyValue::new("error", true));
+                span.set_attribute(KeyValue::new("exception.message", err_msg.clone()));
+                span.end();
+                return ProviderResponse::error(provider.clone(), model, err_msg, duration_ms);
             }
         };
 
@@ -279,7 +338,23 @@ pub async fn query_single(
     }
 
     let duration_ms = start.elapsed().as_millis() as u64;
+    if let Some(t) = total_input {
+        span.set_attribute(KeyValue::new("gen_ai.usage.input_tokens", t as i64));
+    }
+    if let Some(t) = total_output {
+        span.set_attribute(KeyValue::new("gen_ai.usage.output_tokens", t as i64));
+    }
+    span.set_attribute(KeyValue::new(
+        "langfuse.observation.output",
+        final_text.clone(),
+    ));
     if final_text.is_empty() {
+        span.set_attribute(KeyValue::new("error", true));
+        span.set_attribute(KeyValue::new(
+            "exception.message",
+            "empty response (likely wire-protocol mismatch)",
+        ));
+        span.end();
         return ProviderResponse::error(
             provider.clone(),
             model,
@@ -287,6 +362,7 @@ pub async fn query_single(
             duration_ms,
         );
     }
+    span.end();
     ProviderResponse::success(
         provider.clone(),
         model,
@@ -721,21 +797,32 @@ pub async fn stream_with_messages(
     let provider_name = provider.display_name.clone();
     let model = provider.model.clone();
 
-    // Bedrock-hosted models: bypass genai and drive ConverseStream directly.
-    // Supports text streaming, tool use, and the standard tool-use iteration
-    // loop (identical semantics to the genai path below, just a different
-    // wire protocol).
+    // Bedrock-hosted models bypass genai (which cannot speak Bedrock's wire
+    // protocol) and drive ConverseStream directly. The dispatch happens before
+    // telemetry span setup so Bedrock requests stay on a clean codepath; the
+    // root `ai.query` span still wraps this call via the calling task's Context.
     if let Some(bedrock) = manager.bedrock_for(&model) {
-        return stream_bedrock(
-            &bedrock,
-            provider,
-            messages,
-            ctx,
-            tx,
-            cancel,
-            start,
-        )
-        .await;
+        return stream_bedrock(&bedrock, provider, messages, ctx, tx, cancel, start).await;
+    }
+
+    // Open a per-call OTel span. Inherits the current Context as parent —
+    // when wrapped by a root "ai.query" span via `Context::attach`, this
+    // becomes a child generation in Langfuse.
+    let tracer = global::tracer(TRACER_NAME);
+    let mut span = tracer
+        .span_builder(format!("chat {}", provider_name))
+        .with_attributes(vec![
+            KeyValue::new("gen_ai.system", gen_ai_system_for(&provider_name)),
+            KeyValue::new("gen_ai.request.model", model.clone()),
+            KeyValue::new("gen_ai.operation.name", "chat"),
+            // Tells Langfuse to render this span as a generation, not a
+            // generic span — unlocks token/cost rollups in the UI.
+            KeyValue::new("langfuse.observation.type", "generation"),
+            KeyValue::new("langfuse.observation.model.name", model.clone()),
+        ])
+        .start(&tracer);
+    if let Some(input_json) = messages_to_json(&messages) {
+        span.set_attribute(KeyValue::new("langfuse.observation.input", input_json));
     }
 
     let options = build_options(ctx);
@@ -767,11 +854,15 @@ pub async fn stream_with_messages(
             Ok(r) => r,
             Err(e) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
+                let err_msg = format!("{:#}", e);
+                span.set_attribute(KeyValue::new("error", true));
+                span.set_attribute(KeyValue::new("exception.message", err_msg.clone()));
+                span.end();
                 let _ = tx
                     .send(StreamEvent::Error {
                         provider: provider_name,
                         model,
-                        error: format!("{:#}", e),
+                        error: err_msg,
                         duration_ms,
                     })
                     .await;
@@ -795,6 +886,8 @@ pub async fn stream_with_messages(
                 biased;
                 _ = cancel.cancelled() => {
                     let duration_ms = start.elapsed().as_millis() as u64;
+                    span.set_attribute(KeyValue::new("cancelled", true));
+                    span.end();
                     let _ = tx
                         .send(StreamEvent::Error {
                             provider: provider_name,
@@ -849,11 +942,15 @@ pub async fn stream_with_messages(
                 Ok(_) => {} // ignore Start, ReasoningChunk, ToolCallChunk, ThoughtSignatureChunk
                 Err(e) => {
                     let duration_ms = start.elapsed().as_millis() as u64;
+                    let err_msg = format!("{:#}", e);
+                    span.set_attribute(KeyValue::new("error", true));
+                    span.set_attribute(KeyValue::new("exception.message", err_msg.clone()));
+                    span.end();
                     let _ = tx
                         .send(StreamEvent::Error {
                             provider: provider_name,
                             model,
-                            error: format!("{:#}", e),
+                            error: err_msg,
                             duration_ms,
                         })
                         .await;
@@ -899,14 +996,33 @@ pub async fn stream_with_messages(
         }
     }
 
+    // Finalize span attributes before moving `final_text` into the message
+    // history below.
+    let duration_ms = start.elapsed().as_millis() as u64;
+    if let Some(t) = total_input {
+        span.set_attribute(KeyValue::new("gen_ai.usage.input_tokens", t as i64));
+    }
+    if let Some(t) = total_output {
+        span.set_attribute(KeyValue::new("gen_ai.usage.output_tokens", t as i64));
+    }
+    span.set_attribute(KeyValue::new(
+        "langfuse.observation.output",
+        final_text.clone(),
+    ));
+
     // Silent-failure guard: a stream that ended with no text AND no tool
     // calls is almost always a wire-protocol mismatch (e.g. an adapter
     // pointed at a server that doesn't speak its protocol — Bedrock's
-    // 200 + UnknownOperationException is the canonical trigger). Report
+    // 200 + UnknownOperationException was the canonical trigger). Report
     // it as an error so the user sees something instead of "[complete]"
     // with an empty body.
-    let duration_ms = start.elapsed().as_millis() as u64;
     if final_text.is_empty() {
+        span.set_attribute(KeyValue::new("error", true));
+        span.set_attribute(KeyValue::new(
+            "exception.message",
+            "empty response (likely wire-protocol mismatch)",
+        ));
+        span.end();
         let _ = tx
             .send(StreamEvent::Error {
                 provider: provider_name,
@@ -917,10 +1033,12 @@ pub async fn stream_with_messages(
             .await;
         return messages;
     }
+    span.end();
 
     // Persist the final assistant reply in the message history so multi-turn
     // callers see it on subsequent turns.
     messages.push(ChatMessage::assistant(final_text));
+
 
     let _ = tx
         .send(StreamEvent::Done {
@@ -942,15 +1060,70 @@ pub async fn stream_all(
 ) -> mpsc::Receiver<StreamEvent> {
     let (tx, rx) = mpsc::channel(100);
 
+    // tokio::spawn does not propagate the OTel Context. Capture it here and
+    // wrap each spawned future with `.with_context(parent_cx)` so per-provider
+    // spans inside `stream_single` become children of the caller's root
+    // "ai.query" span rather than orphans. We use `with_context` (a
+    // FutureExt method) instead of `Context::attach()` because the returned
+    // ContextGuard is `!Send` and can't be held across await points.
+    let parent_cx = Context::current();
+
     for provider in providers {
         let manager = Arc::clone(&manager);
         let ctx = ctx.clone();
         let tx = tx.clone();
+        let parent_cx = parent_cx.clone();
 
-        tokio::spawn(async move {
-            stream_single(&manager, &provider, &ctx, tx).await;
-        });
+        // DETACH: each task terminates naturally when stream_single returns;
+        // the cloned tx drops with it, and the receiver sees a closed channel
+        // once every task finishes. Cancellation propagates via the CLI's
+        // CancellationToken (held inside ctx), not via JoinHandle.abort().
+        tokio::spawn(
+            async move { stream_single(&manager, &provider, &ctx, tx).await }
+                .with_context(parent_cx),
+        );
     }
 
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gen_ai_system_maps_known_aliases() {
+        // Maps each canonical UI display name to the OpenTelemetry GenAI
+        // semconv value Langfuse uses for cost/usage rollups by provider.
+        assert_eq!(gen_ai_system_for("CLAUDE"), "anthropic");
+        assert_eq!(gen_ai_system_for("CHATGPT"), "openai");
+        assert_eq!(gen_ai_system_for("GPT"), "openai");
+        assert_eq!(gen_ai_system_for("GROK"), "xai");
+        assert_eq!(gen_ai_system_for("GEMINI"), "google_vertex_ai");
+        assert_eq!(gen_ai_system_for("OLLAMA"), "ollama");
+    }
+
+    #[test]
+    fn gen_ai_system_falls_back_to_unknown_for_new_providers() {
+        // Forward-compat: a provider added later that we forgot to map here
+        // still gets a usable, non-panicking attribute value.
+        assert_eq!(gen_ai_system_for("FANCY_NEW_PROVIDER"), "unknown");
+    }
+
+    #[test]
+    fn messages_to_json_skips_empty_text_and_preserves_order() {
+        let messages = vec![
+            ChatMessage::system("you are helpful"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+        ];
+        let json = messages_to_json(&messages).expect("encodes");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["role"], "system");
+        assert_eq!(arr[0]["content"], "you are helpful");
+        assert_eq!(arr[1]["role"], "user");
+        assert_eq!(arr[2]["role"], "assistant");
+    }
 }

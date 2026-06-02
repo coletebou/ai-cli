@@ -356,8 +356,8 @@ impl Default for Config {
                 enabled: true,
                 api_key_env: Some("GEMINI_API_KEY".to_string()),
                 api_key: None,
-                default_model: "gemini-3.1-flash-lite-preview".to_string(),
-                fast_model: Some("gemini-3.1-flash-lite-preview".to_string()),
+                default_model: "gemini-3.5-flash".to_string(),
+                fast_model: Some("gemini-3.5-flash".to_string()),
                 smart_model: Some("gemini-3.1-pro-preview".to_string()),
                 aliases: vec!["gemini".to_string()],
                 color: "cyan".to_string(),
@@ -617,7 +617,7 @@ color = "blue"
 [providers.google]
 enabled = true
 api_key_env = "GEMINI_API_KEY"
-fast_model = "gemini-3.1-flash-lite-preview"
+fast_model = "gemini-3.5-flash"
 smart_model = "gemini-3.1-pro-preview"
 aliases = ["gemini"]
 color = "cyan"

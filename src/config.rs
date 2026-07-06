@@ -173,6 +173,25 @@ pub enum ModelTier {
     Smart,
 }
 
+/// How a provider authenticates its requests.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// Standard metered API billing via `api_key` / `api_key_env`.
+    #[default]
+    ApiKey,
+    /// Anthropic only. Rides a Claude Pro/Max subscription's included usage
+    /// by replaying the OAuth token Claude Code stores after `claude login`,
+    /// instead of billing against a separate API key. This is unofficial and
+    /// reverse-engineered (not a documented Anthropic API): it swaps in a
+    /// `Bearer` token and an `anthropic-beta: oauth-2025-04-20` header in
+    /// place of `x-api-key`. It can stop working without notice, and using a
+    /// subscription-scoped credential outside Anthropic's own clients is
+    /// outside the letter of Anthropic's usage terms — there's real risk of
+    /// the token or account getting flagged. See `anthropic_oauth.rs`.
+    Subscription,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModeConfig {
     #[serde(default)]
@@ -272,6 +291,10 @@ pub struct ProviderConfig {
     #[serde(default = "default_color")]
     pub color: String,
     pub base_url: Option<String>,
+    /// How this provider authenticates. Defaults to `api_key`; `subscription`
+    /// only has an effect for the `anthropic` provider.
+    #[serde(default)]
+    pub auth_mode: AuthMode,
 }
 
 impl ProviderConfig {
@@ -317,6 +340,7 @@ impl Default for Config {
                 aliases: vec!["claude".to_string()],
                 color: "magenta".to_string(),
                 base_url: None,
+                auth_mode: AuthMode::ApiKey,
             },
         );
 
@@ -332,6 +356,7 @@ impl Default for Config {
                 aliases: vec!["chatgpt".to_string(), "gpt".to_string()],
                 color: "green".to_string(),
                 base_url: None,
+                auth_mode: AuthMode::ApiKey,
             },
         );
 
@@ -347,6 +372,7 @@ impl Default for Config {
                 aliases: vec!["grok".to_string()],
                 color: "blue".to_string(),
                 base_url: None,
+                auth_mode: AuthMode::ApiKey,
             },
         );
 
@@ -362,6 +388,7 @@ impl Default for Config {
                 aliases: vec!["gemini".to_string()],
                 color: "cyan".to_string(),
                 base_url: None,
+                auth_mode: AuthMode::ApiKey,
             },
         );
 
@@ -377,6 +404,7 @@ impl Default for Config {
                 aliases: vec!["openrouter".to_string(), "or".to_string()],
                 color: "yellow".to_string(),
                 base_url: Some("https://openrouter.ai/api/v1".to_string()),
+                auth_mode: AuthMode::ApiKey,
             },
         );
 
@@ -392,6 +420,7 @@ impl Default for Config {
                 aliases: vec!["ollama".to_string(), "local".to_string()],
                 color: "red".to_string(),
                 base_url: Some("http://localhost:11434".to_string()),
+                auth_mode: AuthMode::ApiKey,
             },
         );
 
@@ -584,6 +613,7 @@ max_delay_ms = 5000
 #   aliases      – short names for -p flag (first alias used as display name)
 #   color        – header color: red, green, blue, cyan, magenta, yellow, white
 #   base_url     – override the default API endpoint (for proxies, Bedrock, etc.)
+#   auth_mode    – "api_key" (default) or "subscription" (Anthropic only, see below)
 
 [providers.anthropic]
 enabled = true
@@ -597,6 +627,12 @@ color = "magenta"
 # routed to the Anthropic adapter regardless of their prefix.
 # base_url = "https://bedrock-runtime.us-east-1.amazonaws.com/v1/"
 # api_key_env = "AWS_BEARER_TOKEN_BEDROCK"
+#
+# To bill against a Claude Pro/Max subscription instead of the metered API,
+# replay the OAuth token Claude Code stores at ~/.claude/.credentials.json
+# after `claude login`. This is unofficial/reverse-engineered — not a
+# documented Anthropic API — and can break or get flagged without notice.
+# auth_mode = "subscription"
 
 [providers.openai]
 enabled = true

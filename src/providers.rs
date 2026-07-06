@@ -1,5 +1,6 @@
+use crate::anthropic_oauth;
 use crate::bedrock::{is_bedrock_base_url, BedrockClient, BedrockOutcome};
-use crate::config::{Config, ModelTier, ProviderConfig, RetryConfig};
+use crate::config::{AuthMode, Config, ModelTier, ProviderConfig, RetryConfig};
 use crate::retry::{self, Retryable};
 use anyhow::{Context, Result};
 use colored::Color;
@@ -30,6 +31,46 @@ fn provider_name_for_adapter(kind: &str) -> Option<&'static str> {
         "xAi" => Some("xai"),
         _ => None,
     }
+}
+
+/// Resolve auth for one provider, honoring `auth_mode`. Shared by both the
+/// initial auth resolver and the service-target resolver's re-resolution
+/// pass, so a `subscription`-mode provider doesn't get silently clobbered
+/// back to plain API-key auth when the target resolver re-resolves auth
+/// after correcting a misdetected adapter kind (see `ServiceTargetResolver`
+/// below — it used to call `get_api_key` directly for that case).
+fn resolve_provider_auth(config: &Config, provider_name: &str) -> Option<AuthData> {
+    let provider_cfg = config.providers.get(provider_name)?;
+
+    if provider_cfg.auth_mode == AuthMode::Subscription {
+        // Only Anthropic has a subscription-OAuth path; other providers
+        // ignore this mode rather than misusing Anthropic's token format.
+        if provider_name != "anthropic" {
+            return None;
+        }
+        return match anthropic_oauth::subscription_auth_data(provider_cfg.base_url.as_deref()) {
+            Ok(auth) => Some(auth),
+            Err(err) => {
+                eprintln!("[warn] {} subscription auth unavailable: {}", provider_name, err);
+                None
+            }
+        };
+    }
+
+    if let Some(key) = config.get_api_key(provider_name) {
+        return Some(AuthData::from_single(key));
+    }
+
+    let fallback_env = match provider_name {
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "openai" => Some("OPENAI_API_KEY"),
+        "google" => Some("GEMINI_API_KEY"),
+        "xai" => Some("XAI_API_KEY"),
+        _ => None,
+    };
+    fallback_env
+        .and_then(|env| std::env::var(env).ok())
+        .map(AuthData::from_single)
 }
 
 /// Build a map from every configured model name to its (provider_name, AdapterKind).
@@ -133,23 +174,7 @@ impl ProviderManager {
                     return Ok(None);
                 };
 
-                if let Some(key) = auth_config.get_api_key(provider_name) {
-                    return Ok(Some(AuthData::from_single(key)));
-                }
-
-                let fallback_env = match provider_name {
-                    "anthropic" => Some("ANTHROPIC_API_KEY"),
-                    "openai" => Some("OPENAI_API_KEY"),
-                    "google" => Some("GEMINI_API_KEY"),
-                    "xai" => Some("XAI_API_KEY"),
-                    _ => None,
-                };
-                if let Some(env) = fallback_env {
-                    if let Ok(key) = std::env::var(env) {
-                        return Ok(Some(AuthData::from_single(key)));
-                    }
-                }
-                Ok(None)
+                Ok(resolve_provider_auth(&auth_config, provider_name))
             },
         );
 
@@ -238,12 +263,11 @@ impl ProviderManager {
                     .map(|u| Endpoint::from_owned(ensure_trailing_slash(u)));
 
                 // Re-resolve auth when adapter kind was corrected, since the auth
-                // resolver ran with the wrong kind earlier
+                // resolver ran with the wrong kind earlier. Goes through the same
+                // resolve_provider_auth() as the initial pass so subscription-mode
+                // auth doesn't get clobbered back to a plain API key here.
                 let auth = if correct_kind.is_some_and(|k| k != AdapterKind::Ollama) {
-                    or_config
-                        .get_api_key(provider_name)
-                        .map(AuthData::from_single)
-                        .unwrap_or(auth)
+                    resolve_provider_auth(&or_config, provider_name).unwrap_or(auth)
                 } else {
                     auth
                 };
@@ -382,13 +406,24 @@ impl ProviderManager {
             .filter(|name| seen.insert(name.clone()))
             .collect();
 
-        // Filter to only providers that have API keys configured
+        // Filter to only providers that can actually authenticate: ollama
+        // needs nothing, subscription-mode needs a live Claude Code OAuth
+        // token, everything else needs an API key. Same silent-skip UX for
+        // all three so an unconfigured provider just doesn't show a panel.
         provider_names
             .into_iter()
             .filter_map(|name| {
                 let provider = self.providers.get(&name)?;
-                // Check if API key is available (skip for ollama)
-                if name != "ollama" && self.config.get_api_key(&name).is_none() {
+                let auth_mode = self
+                    .config
+                    .providers
+                    .get(&name)
+                    .map(|c| c.auth_mode)
+                    .unwrap_or_default();
+                let available = name == "ollama"
+                    || (auth_mode == AuthMode::Subscription && anthropic_oauth::is_available())
+                    || self.config.get_api_key(&name).is_some();
+                if !available {
                     return None;
                 }
                 Some(provider.clone())
@@ -549,6 +584,7 @@ mod tests {
             aliases: aliases.into_iter().map(String::from).collect(),
             color: color.to_string(),
             base_url: None,
+            auth_mode: AuthMode::ApiKey,
         }
     }
 

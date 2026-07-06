@@ -1,3 +1,4 @@
+mod anthropic_oauth;
 mod bedrock;
 mod bedrock_eventstream;
 mod chat;

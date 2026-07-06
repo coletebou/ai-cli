@@ -313,7 +313,7 @@ impl Default for Config {
                 api_key: None,
                 default_model: "claude-haiku-4-5".to_string(),
                 fast_model: Some("claude-haiku-4-5".to_string()),
-                smart_model: Some("claude-opus-4-6".to_string()),
+                smart_model: Some("claude-opus-4-8".to_string()),
                 aliases: vec!["claude".to_string()],
                 color: "magenta".to_string(),
                 base_url: None,
@@ -373,7 +373,7 @@ impl Default for Config {
                 api_key: None,
                 default_model: "google/gemini-3.1-flash-lite-preview".to_string(),
                 fast_model: Some("google/gemini-3.1-flash-lite-preview".to_string()),
-                smart_model: Some("anthropic/claude-opus-4-6".to_string()),
+                smart_model: Some("anthropic/claude-opus-4-8".to_string()),
                 aliases: vec!["openrouter".to_string(), "or".to_string()],
                 color: "yellow".to_string(),
                 base_url: Some("https://openrouter.ai/api/v1".to_string()),
@@ -589,7 +589,7 @@ max_delay_ms = 5000
 enabled = true
 api_key_env = "ANTHROPIC_API_KEY"
 fast_model = "claude-haiku-4-5"
-smart_model = "claude-opus-4-6"
+smart_model = "claude-opus-4-8"
 aliases = ["claude"]
 color = "magenta"
 # For AWS Bedrock: set base_url and use a Bedrock API key.
@@ -626,7 +626,7 @@ color = "cyan"
 enabled = true
 api_key_env = "OPENROUTER_API_KEY"
 fast_model = "google/gemini-3.1-flash-lite-preview"
-smart_model = "anthropic/claude-opus-4-6"
+smart_model = "anthropic/claude-opus-4-8"
 aliases = ["openrouter", "or"]
 color = "yellow"
 base_url = "https://openrouter.ai/api/v1"

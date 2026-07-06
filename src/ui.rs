@@ -17,7 +17,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Line,
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
 use std::io::{self, Stdout};
@@ -454,16 +454,35 @@ fn draw_panel(
     } else {
         "idle"
     };
-    let title = format!(" {} [{}] ", panel.provider.display_name, status);
+    let title_text = format!(" {} [{}] ", panel.provider.display_name, status);
 
-    let mut border_style = Style::default().fg(color);
-    if is_selected {
-        border_style = border_style.add_modifier(Modifier::BOLD);
-    }
+    // Bold alone is unreliable here: box-drawing glyphs don't always render
+    // visibly heavier under the ANSI bold attribute, which is why the old
+    // "just bold the border" selection cue was hard to spot. BorderType::Thick
+    // swaps in different box-drawing characters entirely, so the selected
+    // panel is unmistakable regardless of terminal/font. The reverse-video
+    // title reinforces it as an "active tab".
+    let (border_type, border_style, title_style) = if is_selected {
+        (
+            BorderType::Thick,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Black)
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            BorderType::Plain,
+            Style::default().fg(color),
+            Style::default().fg(color),
+        )
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(title)
+        .border_type(border_type)
+        .title(Line::styled(title_text, title_style))
         .border_style(border_style);
 
     // Compose lines from all completed turns plus the in-flight streaming text.

@@ -27,7 +27,13 @@ fn main() {
     println!("cargo:rustc-env=AI_CLI_GIT_HASH={}", commit_hash);
     println!("cargo:rustc-env=AI_CLI_REPO_PATH={}", repo_path);
 
-    // Rerun if git HEAD changes
+    // Rerun if git HEAD changes. HEAD itself only changes on branch switch;
+    // commits on the current branch update the ref file it points to, so
+    // track that too or the embedded hash goes stale.
     println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/index");
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
+        if let Some(ref_path) = head.strip_prefix("ref: ") {
+            println!("cargo:rerun-if-changed=.git/{}", ref_path.trim());
+        }
+    }
 }

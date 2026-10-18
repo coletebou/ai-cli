@@ -49,7 +49,7 @@ There's no Homebrew formula yet; that's tracked in [#13](https://github.com/cole
 
 ### Build from source
 
-Requires Rust 1.75+.
+Requires Rust 1.88+ (the minimum set by the dependency graph; checked in CI).
 
 ```bash
 git clone https://github.com/coletebou/ai-cli
@@ -348,25 +348,37 @@ Providers that are disabled (`enabled = false`) or have no API key are skipped. 
 
 ```
 src/
-├── main.rs       CLI parsing, mode selection
-├── config.rs     TOML config, alias resolution, search settings
-├── config_ui.rs  TUI config editor
-├── context.rs    @file expansion and stdin context merging
-├── providers.rs  ProviderManager wrapping genai::Client + AuthResolver
-├── query.rs      Query execution, tool-use loop, StreamEvent enum
-├── search.rs     SearchEngine: Tavily + Gemini grounding, fallback logic
-├── markdown.rs   pulldown-cmark → ratatui styled lines
-├── display.rs    Sequential + streaming terminal output
-├── pricing.rs    Per-model prices and the footer's cost estimate
-├── doctor.rs     `ai doctor`: config, credential and connectivity diagnostics
-├── chat.rs       Interactive chat (rustyline) with slash commands
-├── models.rs     OpenRouter model listing
-└── ui.rs         Ratatui TUI — interactive side-by-side chat panels
+├── main.rs                CLI parsing, mode selection, exit status
+├── config.rs              TOML config: path resolution, defaults merge, safe writes
+├── config_ui.rs           TUI config editor (`ai config`)
+├── context.rs             @file expansion and stdin context merging
+├── providers.rs           ProviderManager: genai client, model routing, auth, retries
+├── query.rs               Query execution, tool-use loop, StreamEvent enum
+├── retry.rs               Transient-error classification and backoff
+├── bedrock.rs             Direct AWS Bedrock Converse / ConverseStream client
+├── bedrock_eventstream.rs AWS event-stream frame decoder
+├── search.rs              SearchEngine: Tavily + Gemini grounding, fallback logic
+├── markdown.rs            pulldown-cmark → ratatui styled lines
+├── display.rs             CLI output: progressive streaming, multi-provider blocks, --raw
+├── pricing.rs             Per-model prices and the footer's cost estimate
+├── chat.rs                Interactive chat (rustyline) with slash commands
+├── sessions.rs            Saved chat sessions (/save, /load, --continue)
+├── ui.rs                  Ratatui TUI — interactive side-by-side chat panels
+├── term.rs                Terminal guard for the full-screen UIs
+├── diag.rs                Diagnostics held back while a full-screen UI is up
+├── models.rs              OpenRouter model listing
+├── doctor.rs              `ai doctor`: config, credential and connectivity diagnostics
+├── telemetry.rs           Optional OpenTelemetry → Langfuse export
+└── anthropic_oauth.rs     Subscription auth mode (Anthropic)
 ```
 
-**Data flow:** CLI → Config → `ProviderManager` → `query_all`/`stream_all` (concurrent) → `Display` / TUI panels.
+**Data flow:** CLI → Config → `ProviderManager` → `select_providers`, then by mode:
 
-**Streaming:** per-provider `tokio::spawn` tasks emit `StreamEvent`s through an `mpsc` channel that the display layer consumes.
+- **One-shot** (default): `stream_all` / `query_all` (concurrent) → display.
+- **Chat** (`-i`): the first selected provider; each turn calls `stream_with_messages` directly with the conversation so far.
+- **TUI** (`-t`): one task per panel, each calling `stream_with_messages` with its own history.
+
+**Streaming:** per-provider `tokio::spawn` tasks emit `StreamEvent`s through an `mpsc` channel that the display layer consumes. A single provider renders progressively as its markdown arrives; with several, each prints as soon as it finishes.
 
 **Tool use:** when `--search` is set, the model gets a `web_search` tool. The query loop runs up to `max_iterations` turns, executing tool calls and feeding results back until the model returns a final answer.
 

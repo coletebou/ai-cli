@@ -22,8 +22,11 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use config::Config;
 use genai::chat::ReasoningEffort;
-use providers::ProviderManager;
+use providers::{ProviderManager, ProviderRequest, SkipReason};
+use std::ffi::OsString;
+use std::io::IsTerminal;
 use std::process::Command as ProcessCommand;
+use std::process::ExitCode;
 use std::sync::Arc;
 
 // Embedded at compile time by build.rs
@@ -111,9 +114,13 @@ struct Cli {
     #[arg(long)]
     no_stream: bool,
 
-    /// Hide token usage statistics
+    /// Hide token usage statistics (overrides `show_tokens` in the config)
     #[arg(long)]
     no_tokens: bool,
+
+    /// Show token usage statistics (overrides `show_tokens` in the config)
+    #[arg(long, conflicts_with = "no_tokens")]
+    tokens: bool,
 
     /// Side-by-side TUI display
     #[arg(short = 't', long)]
@@ -162,8 +169,63 @@ enum Command {
     },
 }
 
+/// Parse argv, treating a question that merely *starts* with a subcommand
+/// name as a question. Unquoted `ai models are getting cheaper, why?` or
+/// `ai help me write a regex` used to die with a subcommand usage error.
+fn parse_cli() -> Cli {
+    let args: Vec<OsString> = std::env::args_os().collect();
+    match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(err) => question_retry(&args, &err).unwrap_or_else(|| err.exit()),
+    }
+}
+
+/// If parsing failed on a word that names a subcommand and only plain words
+/// follow it, re-parse with `--` before that word so the rest is taken as
+/// the question. A flag after the word (e.g. `ai models --fre`) suggests the
+/// subcommand really was meant, so that keeps clap's error.
+fn question_retry(args: &[OsString], err: &clap::Error) -> Option<Cli> {
+    use clap::error::ErrorKind;
+    // Only errors that mean "more words than this subcommand takes". A bad
+    // value (e.g. `ai completions bas`) or a missing argument is a real
+    // usage mistake: turning it into a prompt would silently send a billed
+    // request instead of showing clap's diagnostic.
+    if !matches!(
+        err.kind(),
+        ErrorKind::UnknownArgument | ErrorKind::InvalidSubcommand
+    ) {
+        return None;
+    }
+    // `completions` takes a fixed shell name, so extra words there are a
+    // mistake too, never a question.
+    let mut subcommands: Vec<String> = Cli::command()
+        .get_subcommands()
+        .map(|s| s.get_name().to_string())
+        .filter(|name| name != "completions")
+        .collect();
+    subcommands.push("help".to_string());
+
+    for i in 1..args.len() {
+        let word = args[i].to_string_lossy();
+        if !subcommands.iter().any(|s| *s == word) {
+            continue;
+        }
+        let rest = &args[i + 1..];
+        if rest.is_empty() || rest.iter().any(|a| a.to_string_lossy().starts_with('-')) {
+            return None;
+        }
+        let mut retry = args[..i].to_vec();
+        retry.push(OsString::from("--"));
+        retry.extend_from_slice(&args[i..]);
+        return Cli::try_parse_from(retry)
+            .ok()
+            .filter(|cli| cli.command.is_none());
+    }
+    None
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
     // Check if binary matches source (warns if stale)
     check_binary_staleness();
 
@@ -172,7 +234,7 @@ async fn main() -> Result<()> {
     // bother flushing on exit.
     let telemetry_enabled = telemetry::init().is_some();
 
-    let result = run(Cli::parse()).await;
+    let result = run(parse_cli()).await;
 
     // Flush pending spans before the process exits. Without this, short-lived
     // CLI runs lose their last batch — Langfuse never sees the trace.
@@ -182,29 +244,117 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn run(cli: Cli) -> Result<()> {
+/// Exit status for a finished run: non-zero when any provider failed, so
+/// `ai "..." || fallback` and `set -e` scripts can tell something broke.
+fn exit_status(any_failed: bool) -> ExitCode {
+    if any_failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Which settings and which display a one-shot run uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Mode {
+    /// Take the providers and model tier from `[tui_mode]` instead of `[cli]`.
+    tui_settings: bool,
+    /// Draw the TUI; otherwise responses are printed as plain output.
+    tui_display: bool,
+}
+
+/// Pick the mode for this run. `-i` is its own mode and never picks up the
+/// TUI's providers or tier, and `--no-tui` asks for the CLI mode, `[cli]`
+/// settings included.
+///
+/// A TUI that only comes from `[default] tui = true` falls back to plain
+/// output when stdout isn't a terminal, so `ai "q" | less` works. Only the
+/// display falls back: the run keeps `[tui_mode]`'s providers and tier, so
+/// piping or redirecting a question gets the same answers as asking it on
+/// screen. The user didn't ask for the CLI mode; the TUI just can't be drawn.
+/// An explicit `-t` never falls back, so it still errors without a terminal
+/// and the mistake is visible.
+fn select_mode(cli: &Cli, config_tui: bool, stdout_is_terminal: bool) -> Mode {
+    let tui_requested = !cli.interactive && !cli.no_tui && (cli.tui || config_tui);
+    Mode {
+        tui_settings: tui_requested,
+        tui_display: tui_requested && (cli.tui || stdout_is_terminal),
+    }
+}
+
+/// Parse `-r/--reasoning`. Returns the effort plus the label shown in the
+/// footer. Unknown values are an error rather than a silent (and pricier)
+/// fallback to medium.
+fn parse_reasoning(value: &str) -> Result<(ReasoningEffort, String)> {
+    let parsed = match value.to_lowercase().as_str() {
+        "none" | "off" | "0" => (ReasoningEffort::None, "none".to_string()),
+        "low" | "l" | "1" => (ReasoningEffort::Low, "low".to_string()),
+        "medium" | "med" | "m" | "2" => (ReasoningEffort::Medium, "medium".to_string()),
+        "high" | "h" | "3" => (ReasoningEffort::High, "high".to_string()),
+        s => match s.parse::<u32>() {
+            Ok(budget) => (
+                ReasoningEffort::Budget(budget),
+                format!("budget {}", budget),
+            ),
+            Err(_) => anyhow::bail!(
+                "unknown reasoning level '{}': use none, low, medium, high, or a token budget \
+                 (a number; 0-3 are shorthand for none..high)",
+                value
+            ),
+        },
+    };
+    Ok(parsed)
+}
+
+/// Explain an empty provider selection: why each requested provider was
+/// skipped, and which env vars would enable the configured ones.
+fn no_providers_message(manager: &ProviderManager, skipped: &[(String, SkipReason)]) -> String {
+    let mut msg = String::from("No providers available.\n");
+    if !skipped.is_empty() {
+        msg.push('\n');
+        for (name, reason) in skipped {
+            msg.push_str(&format!("  {}: {}\n", name, reason));
+        }
+    }
+    if skipped
+        .iter()
+        .any(|(_, reason)| *reason == SkipReason::Unknown)
+    {
+        msg.push_str(&format!(
+            "\nKnown providers: {}\n",
+            manager.known_provider_names().join(", ")
+        ));
+    }
+    msg.push_str(
+        "\nSet an API key for at least one provider (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, \
+         XAI_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY), or run `ai --init` / `ai config`.",
+    );
+    msg
+}
+
+async fn run(cli: Cli) -> Result<ExitCode> {
     // Handle subcommands
     if let Some(command) = cli.command {
-        return match command {
-            Command::Config => config_ui::run_config_ui().await,
+        match command {
+            Command::Config => config_ui::run_config_ui().await?,
             Command::Models {
                 search,
                 refresh,
                 free,
-            } => models::list_models(search.as_deref(), refresh, free).await,
+            } => models::list_models(search.as_deref(), refresh, free).await?,
             Command::Completions { shell } => {
                 let mut cmd = Cli::command();
                 let bin_name = cmd.get_name().to_string();
                 generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
-                Ok(())
             }
-        };
+        }
+        return Ok(ExitCode::SUCCESS);
     }
 
     // Handle --init flag
     if cli.init {
         Config::init()?;
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     // Gather context from piped stdin and inline @file references so the
@@ -218,8 +368,21 @@ async fn run(cli: Cli) -> Result<()> {
     // Load configuration
     let config = Config::load()?;
 
-    // Determine TUI mode first — it affects provider and model tier selection
-    let use_tui = !cli.no_tui && (cli.tui || config.default.tui);
+    // Parse reasoning effort and get display string. Done before provider
+    // selection so a bad flag is reported as such, not masked by a
+    // missing-API-key error.
+    let (reasoning_effort, reasoning_str) = match cli.reasoning.as_deref() {
+        Some(r) => {
+            let (effort, label) = parse_reasoning(r)?;
+            (Some(effort), Some(label))
+        }
+        None => (None, None), // Default: no reasoning specified
+    };
+
+    // Determine the mode first — it affects provider and model tier selection
+    // as well as the display (see `select_mode` for the non-terminal fallback).
+    let mode = select_mode(&cli, config.default.tui, std::io::stdout().is_terminal());
+    let use_tui = mode.tui_display;
 
     // Require a question only for one-shot modes. Interactive chat (-i) and
     // the TUI both now launch into a prompt/input box, so an empty question
@@ -229,7 +392,7 @@ async fn run(cli: Cli) -> Result<()> {
             "Missing required argument: <QUESTION>\n\nUsage: ai <QUESTION>\n       cat file | ai <QUESTION>\n       ai -i [QUESTION]\n       ai -t [QUESTION]\n       ai --init"
         );
     }
-    let mode_config = if use_tui {
+    let mode_config = if mode.tui_settings {
         &config.tui_mode
     } else {
         &config.cli
@@ -242,28 +405,36 @@ async fn run(cli: Cli) -> Result<()> {
     )?);
 
     // Determine which providers to query based on CLI args and active mode config
-    let providers_to_query = if cli.all {
-        manager.get_providers_for_query(None)
+    let request = if cli.all {
+        ProviderRequest::All
     } else if let Some(ref requested) = cli.providers {
-        manager.get_providers_for_query(Some(requested))
+        ProviderRequest::Explicit(requested)
     } else {
         use config::QueryMode;
         match mode_config.default_mode {
-            QueryMode::Single => manager
-                .get_providers_for_query(Some(std::slice::from_ref(&mode_config.single_provider))),
-            QueryMode::Multi => manager.get_providers_for_query(Some(&mode_config.multi_providers)),
+            QueryMode::Single => {
+                ProviderRequest::Configured(std::slice::from_ref(&mode_config.single_provider))
+            }
+            QueryMode::Multi => ProviderRequest::Configured(&mode_config.multi_providers),
         }
     };
+    let selection = manager.select_providers(request);
 
-    if providers_to_query.is_empty() {
-        eprintln!("Error: No providers available. Please check your API keys and configuration.");
-        eprintln!("Expected environment variables:");
-        eprintln!("  - ANTHROPIC_API_KEY (for Claude)");
-        eprintln!("  - OPENAI_API_KEY (for ChatGPT)");
-        eprintln!("  - XAI_API_KEY (for Grok)");
-        eprintln!("  - GEMINI_API_KEY or GOOGLE_API_KEY (for Gemini)");
-        std::process::exit(1);
+    if selection.providers.is_empty() {
+        anyhow::bail!(no_providers_message(&manager, &selection.skipped));
     }
+
+    // Say why something the user asked for by name was dropped. Providers
+    // missing from the configured multi list are skipped quietly (a default
+    // setup lists four providers and most people have keys for one or two),
+    // but a typo'd name in the config is still worth a note.
+    for (name, reason) in &selection.skipped {
+        let explicit = matches!(request, ProviderRequest::Explicit(_));
+        if explicit || *reason == SkipReason::Unknown {
+            eprintln!("note: skipping {}: {}", name, reason);
+        }
+    }
+    let providers_to_query = selection.providers;
 
     // Determine system prompt
     let system_prompt = cli
@@ -271,32 +442,15 @@ async fn run(cli: Cli) -> Result<()> {
         .as_deref()
         .or(config.default.system_prompt.as_deref());
 
-    // Determine display options
-    let _stream = !cli.no_stream && config.default.stream; // Reserved for future multi-provider streaming
-    let footer = config.footer.clone();
-
-    // Parse reasoning effort and get display string
-    let (reasoning_effort, reasoning_str) = match cli.reasoning.as_ref() {
-        Some(r) => {
-            let (effort, display) = match r.to_lowercase().as_str() {
-                "none" | "off" | "0" => (ReasoningEffort::None, "none"),
-                "low" | "l" | "1" => (ReasoningEffort::Low, "low"),
-                "medium" | "med" | "m" | "2" => (ReasoningEffort::Medium, "medium"),
-                "high" | "h" | "3" => (ReasoningEffort::High, "high"),
-                s => {
-                    // Try to parse as a budget number
-                    if let Ok(budget) = s.parse::<u32>() {
-                        (ReasoningEffort::Budget(budget), "budget")
-                    } else {
-                        eprintln!("Warning: Unknown reasoning level '{}', using Medium", s);
-                        (ReasoningEffort::Medium, "medium")
-                    }
-                }
-            };
-            (Some(effort), Some(display.to_string()))
-        }
-        None => (None, None), // Default: no reasoning specified
-    };
+    // Determine display options. `[default] stream = false` and --no-stream
+    // both switch to waiting for complete responses.
+    let stream = !cli.no_stream && config.default.stream;
+    let mut footer = config.footer.clone();
+    if cli.no_tokens {
+        footer.show_tokens = false;
+    } else if cli.tokens {
+        footer.show_tokens = true;
+    }
 
     // Build search engine (primary + optional fallback) if --search flag set
     let search_client = if cli.search {
@@ -326,33 +480,25 @@ async fn run(cli: Cli) -> Result<()> {
         };
 
         // Primary must build successfully — user explicitly chose it
+        // Returned as an error (not process::exit) so telemetry still flushes.
         let primary = match build(&primary_name) {
             Some(p) => p,
-            None => {
-                match primary_name.as_str() {
-                    "gemini" => {
-                        eprintln!(
-                            "Error: search provider 'gemini' requires {} or {} to be set.",
-                            config.search.gemini.api_key_env,
-                            config.search.gemini.fallback_api_key_env,
-                        );
-                    }
-                    "tavily" => {
-                        eprintln!(
-                            "Error: search provider 'tavily' requires {} to be set.",
-                            config.search.tavily.api_key_env,
-                        );
-                        eprintln!("Get a free Tavily API key at https://tavily.com");
-                    }
-                    other => {
-                        eprintln!(
-                            "Error: unknown search provider '{}'. Valid options: gemini, tavily.",
-                            other
-                        );
-                    }
-                }
-                std::process::exit(1);
-            }
+            None => match primary_name.as_str() {
+                "gemini" => anyhow::bail!(
+                    "search provider 'gemini' requires {} or {} to be set.",
+                    config.search.gemini.api_key_env,
+                    config.search.gemini.fallback_api_key_env,
+                ),
+                "tavily" => anyhow::bail!(
+                    "search provider 'tavily' requires {} to be set.\n\
+                     Get a free Tavily API key at https://tavily.com",
+                    config.search.tavily.api_key_env,
+                ),
+                other => anyhow::bail!(
+                    "unknown search provider '{}'. Valid options: gemini, tavily.",
+                    other
+                ),
+            },
         };
 
         // Fallback: whichever provider the primary isn't, if its key is available
@@ -417,11 +563,13 @@ async fn run(cli: Cli) -> Result<()> {
         } else {
             Some(question.clone())
         };
-        return crate::chat::run_interactive(manager, provider, ctx, footer, initial).await;
+        crate::chat::run_interactive(manager, provider, ctx, footer, initial).await?;
+        return Ok(ExitCode::SUCCESS);
     }
 
-    if use_tui {
-        // Phase 2: TUI mode
+    let any_failed = if use_tui {
+        // Phase 2: TUI mode. Per-panel errors are shown in the panels; the
+        // exit status only reflects whether the TUI itself failed.
         crate::ui::run_tui(
             manager,
             providers_to_query,
@@ -430,8 +578,9 @@ async fn run(cli: Cli) -> Result<()> {
             footer.show_tokens,
         )
         .await?;
-    } else if providers_to_query.len() == 1 && !cli.no_stream {
-        // Single provider: always stream (no interleaving issue) unless explicitly disabled
+        false
+    } else if providers_to_query.len() == 1 && stream {
+        // Single provider: always stream (no interleaving issue) unless disabled
         let rx = query::stream_all(Arc::clone(&manager), providers_to_query.clone(), ctx).await;
 
         display::display_streaming(
@@ -441,7 +590,7 @@ async fn run(cli: Cli) -> Result<()> {
             cli.raw,
             reasoning_str.clone(),
         )
-        .await;
+        .await
     } else {
         // Non-streaming mode
         let responses = query::query_all(Arc::clone(&manager), providers_to_query, ctx).await;
@@ -451,9 +600,107 @@ async fn run(cli: Cli) -> Result<()> {
         } else {
             display::print_responses(&responses, &footer, reasoning_str.as_deref());
         }
+        responses.iter().any(|r| r.is_error())
+    };
+
+    Ok(exit_status(any_failed))
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn parse(words: &[&str]) -> Option<Cli> {
+        let args: Vec<OsString> = std::iter::once("ai")
+            .chain(words.iter().copied())
+            .map(OsString::from)
+            .collect();
+        match Cli::try_parse_from(&args) {
+            Ok(cli) => Some(cli),
+            Err(err) => question_retry(&args, &err),
+        }
     }
 
-    Ok(())
+    #[test]
+    fn questions_starting_with_a_subcommand_word_are_questions() {
+        let cli = parse(&["models", "are", "getting", "cheaper?"]).expect("parses");
+        assert!(cli.command.is_none());
+        assert_eq!(cli.question.join(" "), "models are getting cheaper?");
+
+        let cli = parse(&["help", "me", "write", "a", "regex"]).expect("parses");
+        assert!(cli.command.is_none());
+        assert_eq!(cli.question[0], "help");
+
+        let cli = parse(&["-p", "claude", "config", "files", "vs", "env", "vars"]).expect("parses");
+        assert_eq!(cli.question.join(" "), "config files vs env vars");
+        assert_eq!(cli.providers.as_deref(), Some(&["claude".to_string()][..]));
+    }
+
+    #[test]
+    fn real_subcommands_still_parse() {
+        assert!(matches!(
+            parse(&["models", "llama"]).and_then(|c| c.command),
+            Some(Command::Models { .. })
+        ));
+        assert!(matches!(
+            parse(&["config"]).and_then(|c| c.command),
+            Some(Command::Config)
+        ));
+        // A flag after the subcommand means the subcommand was intended, so
+        // a typo there stays a usage error instead of becoming a prompt.
+        assert!(parse(&["models", "--fre"]).is_none());
+        // Bad or extra values for a structured subcommand stay errors too:
+        // they must never turn into a (billed) question.
+        assert!(parse(&["completions", "bas"]).is_none());
+        assert!(parse(&["completions", "zsh", "extra"]).is_none());
+    }
+
+    #[test]
+    fn reasoning_levels_parse_and_unknown_values_error() {
+        assert_eq!(parse_reasoning("high").unwrap().1, "high");
+        assert_eq!(parse_reasoning("2").unwrap().1, "medium");
+        assert_eq!(parse_reasoning("4096").unwrap().1, "budget 4096");
+        assert!(matches!(
+            parse_reasoning("4096").unwrap().0,
+            ReasoningEffort::Budget(4096)
+        ));
+        // Used to silently fall back to Medium.
+        assert!(parse_reasoning("hihg").is_err());
+    }
+
+    #[test]
+    fn tokens_flags_conflict() {
+        assert!(Cli::try_parse_from(["ai", "--tokens", "--no-tokens", "q"]).is_err());
+    }
+
+    #[test]
+    fn nonterminal_tui_fallback_changes_only_the_display() {
+        const TUI: Mode = Mode {
+            tui_settings: true,
+            tui_display: true,
+        };
+        const TUI_SETTINGS_PLAIN_OUTPUT: Mode = Mode {
+            tui_settings: true,
+            tui_display: false,
+        };
+        const CLI: Mode = Mode {
+            tui_settings: false,
+            tui_display: false,
+        };
+        let q = parse(&["q"]).expect("parses");
+        // `tui = true` with stdout piped: plain output, `[tui_mode]` settings.
+        assert_eq!(select_mode(&q, true, false), TUI_SETTINGS_PLAIN_OUTPUT);
+        assert_eq!(select_mode(&q, true, true), TUI);
+        assert_eq!(select_mode(&q, false, true), CLI);
+        // An explicit `-t` never falls back.
+        let t = parse(&["-t", "q"]).expect("parses");
+        assert_eq!(select_mode(&t, false, false), TUI);
+        // `--no-tui` and `-i` pick the CLI settings even with `tui = true`.
+        for flag in ["--no-tui", "-i"] {
+            let cli = parse(&[flag, "q"]).expect("parses");
+            assert_eq!(select_mode(&cli, true, true), CLI, "{flag}");
+        }
+    }
 }
 
 #[cfg(test)]

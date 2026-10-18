@@ -454,16 +454,27 @@ impl StreamingDisplay {
     }
 }
 
+/// Render streamed events until every provider task has finished. Returns
+/// true if any provider failed — reported an error, or ended without ever
+/// sending `Done` (e.g. its task panicked) — so the caller can exit non-zero.
 pub async fn display_streaming(
     mut rx: mpsc::Receiver<StreamEvent>,
     providers: &[Provider],
     footer: &FooterConfig,
     raw_mode: bool,
     reasoning: Option<String>,
-) {
+) -> bool {
     let mut display = StreamingDisplay::new(providers, footer.clone(), raw_mode, reasoning);
+    let mut any_error = false;
+    let mut completed = 0usize;
 
     while let Some(event) = rx.recv().await {
+        match &event {
+            StreamEvent::Error { .. } => any_error = true,
+            StreamEvent::Done { .. } => completed += 1,
+            _ => {}
+        }
         display.handle_event(event);
     }
+    any_error || completed < providers.len()
 }

@@ -1092,26 +1092,6 @@ base_url = "http://localhost:11434"
         }
         None
     }
-
-    pub fn get_enabled_providers(&self) -> Vec<String> {
-        self.providers
-            .iter()
-            .filter(|(_, config)| config.enabled)
-            .map(|(name, _)| name.clone())
-            .collect()
-    }
-
-    pub fn get_default_providers(&self) -> Vec<String> {
-        if self.default.providers.is_empty() {
-            self.get_enabled_providers()
-        } else {
-            self.default
-                .providers
-                .iter()
-                .filter_map(|alias| self.resolve_provider_alias(alias))
-                .collect()
-        }
-    }
 }
 
 #[cfg(test)]

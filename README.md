@@ -203,7 +203,7 @@ Mouse capture is enabled so the wheel scrolls panels natively. To text-select in
 | Flag                        | Description                                       |
 |-----------------------------|---------------------------------------------------|
 | `-p, --providers <list>`    | Comma-separated providers (`claude,gpt,grok,gemini`) |
-| `-a, --all`                 | Query every configured provider                   |
+| `-a, --all`                 | Query every enabled provider that has credentials |
 | `-s, --system <prompt>`     | System prompt / persona                           |
 | `-r, --reasoning <level>`   | `none`, `low`, `medium`, `high`, or numeric budget |
 | `-w, --search`              | Enable web search tool                            |
@@ -213,8 +213,12 @@ Mouse capture is enabled so the wheel scrolls panels natively. To text-select in
 | `-i, --interactive`         | Interactive chat mode                             |
 | `--raw`                     | No formatting, pipeable                           |
 | `--no-stream`               | Wait for complete responses                       |
-| `--no-tokens`               | Hide token usage                                  |
+| `--no-tokens` / `--tokens`  | Hide / show token usage (overrides config)        |
 | `--init`                    | Generate default config                           |
+
+Providers that are disabled (`enabled = false`) or have no API key are skipped. When you name one explicitly with `-p`, `ai` prints a note saying why it was skipped; if nothing is left to query, it lists every reason.
+
+**Exit status:** for a one-shot question, `0` when every queried provider answered and `1` if any provider failed or nothing could be queried, so `ai "..." || fallback` works in scripts. Interactive chat (`-i`) and the TUI show provider errors on screen instead: they exit `0` after the session, and `1` only when nothing could be queried or the session itself fails (for example, no terminal).
 
 ## Architecture
 

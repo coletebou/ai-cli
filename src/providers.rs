@@ -108,6 +108,79 @@ fn build_model_provider_map(config: &Config) -> HashMap<String, (String, Adapter
     map
 }
 
+/// The conventional key variable for a built-in provider. A provider section
+/// without `api_key_env` still authenticates with this at request time
+/// (genai falls back to it), so availability checks must accept it too —
+/// otherwise such a provider is silently dropped even though it would work.
+fn standard_key_env(provider_name: &str) -> Option<&'static str> {
+    match provider_name {
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "openai" => Some("OPENAI_API_KEY"),
+        "google" => Some("GEMINI_API_KEY"),
+        "xai" => Some("XAI_API_KEY"),
+        "openrouter" => Some("OPENROUTER_API_KEY"),
+        _ => None,
+    }
+}
+
+fn env_is_set(var: &str) -> bool {
+    std::env::var(var).is_ok_and(|v| !v.trim().is_empty())
+}
+
+/// Where the list of providers for a query came from. It changes how
+/// skipped providers are reported, not which ones are skipped.
+#[derive(Debug, Clone, Copy)]
+pub enum ProviderRequest<'a> {
+    /// Named explicitly with `-p`.
+    Explicit(&'a [String]),
+    /// From the active mode's config (`single_provider` / `multi_providers`).
+    Configured(&'a [String]),
+    /// `-a/--all`: every configured provider.
+    All,
+}
+
+/// Why a requested provider was left out of a query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// The name matches no provider or alias in the config.
+    Unknown,
+    /// `enabled = false` in the provider's config section.
+    Disabled,
+    /// No API key is available.
+    NoCredentials { env_var: Option<String> },
+    /// `auth_mode = "subscription"` but no usable login token was found
+    /// (and no API key to fall back on).
+    NoSubscriptionToken,
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SkipReason::Unknown => write!(f, "not a configured provider or alias"),
+            SkipReason::Disabled => write!(
+                f,
+                "disabled in config (set `enabled = true`, or toggle it in `ai config`)"
+            ),
+            SkipReason::NoCredentials { env_var: Some(var) } => {
+                write!(f, "no API key ({} is not set)", var)
+            }
+            SkipReason::NoCredentials { env_var: None } => {
+                write!(f, "no API key configured (set api_key_env in the config)")
+            }
+            SkipReason::NoSubscriptionToken => write!(
+                f,
+                "auth_mode is \"subscription\" but no valid login token was found"
+            ),
+        }
+    }
+}
+
+pub struct ProviderSelection {
+    pub providers: Vec<Provider>,
+    /// `(name as requested, reason)` for each provider that was left out.
+    pub skipped: Vec<(String, SkipReason)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Provider {
     pub display_name: String,
@@ -325,7 +398,7 @@ impl ProviderManager {
         // AWS Bedrock. Every configured model for that provider gets mapped
         // to the same shared client so query_single() can dispatch by model.
         let mut bedrock_by_model: HashMap<String, Arc<BedrockClient>> = HashMap::new();
-        for (name, p) in &config.providers {
+        for p in config.providers.values() {
             if !p.enabled {
                 continue;
             }
@@ -335,18 +408,13 @@ impl ProviderManager {
             if !is_bedrock_base_url(base_url) {
                 continue;
             }
+            // No warning here: this runs on every invocation, even when the
+            // Bedrock provider isn't being queried. If it *is* requested,
+            // select_providers() reports the missing token.
             let Some(env_var) = p.api_key_env.as_deref() else {
-                eprintln!(
-                    "[warn] provider {} has a Bedrock base_url but no api_key_env; skipping",
-                    name
-                );
                 continue;
             };
             let Some(client) = BedrockClient::from_env(base_url, env_var) else {
-                eprintln!(
-                    "[warn] Bedrock provider {} has no {} set; skipping",
-                    name, env_var
-                );
                 continue;
             };
             let shared = Arc::new(client);
@@ -414,16 +482,31 @@ impl ProviderManager {
         self.config.resolve_provider_alias(alias)
     }
 
-    pub fn get_providers_for_query(&self, requested: Option<&[String]>) -> Vec<Provider> {
-        let raw_names: Vec<String> = if let Some(requested) = requested {
-            // Resolve aliases
-            requested
+    /// Resolve which providers a query should go to, and why any requested
+    /// ones were left out. Disabled providers and providers without
+    /// credentials are skipped; the caller decides how loudly to report
+    /// that (silently for the configured multi list, with a note for an
+    /// explicit `-p`, and in full when nothing is left).
+    pub fn select_providers(&self, request: ProviderRequest<'_>) -> ProviderSelection {
+        let mut skipped: Vec<(String, SkipReason)> = Vec::new();
+
+        // (what the user/config asked for, canonical provider name)
+        let candidates: Vec<(String, String)> = match request {
+            ProviderRequest::Explicit(names) | ProviderRequest::Configured(names) => names
                 .iter()
-                .filter_map(|alias| self.resolve_alias(alias))
-                .collect()
-        } else {
-            // Use default providers from config
-            self.config.get_default_providers()
+                .filter_map(|alias| match self.resolve_alias(alias) {
+                    Some(name) => Some((alias.clone(), name)),
+                    None => {
+                        skipped.push((alias.clone(), SkipReason::Unknown));
+                        None
+                    }
+                })
+                .collect(),
+            ProviderRequest::All => self
+                .all_providers_in_display_order()
+                .into_iter()
+                .map(|name| (name.clone(), name))
+                .collect(),
         };
 
         // Dedupe by canonical name while preserving first-seen order. Users
@@ -431,34 +514,94 @@ impl ProviderManager {
         // "gpt" and "chatgpt"); without this, the TUI would render duplicate
         // panels and fan out the same query twice.
         let mut seen = std::collections::HashSet::new();
-        let provider_names: Vec<String> = raw_names
-            .into_iter()
-            .filter(|name| seen.insert(name.clone()))
-            .collect();
+        let mut providers = Vec::new();
+        for (requested_as, name) in candidates {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let (Some(provider), Some(cfg)) =
+                (self.providers.get(&name), self.config.providers.get(&name))
+            else {
+                skipped.push((requested_as, SkipReason::Unknown));
+                continue;
+            };
+            if !cfg.enabled {
+                skipped.push((requested_as, SkipReason::Disabled));
+                continue;
+            }
+            // Only providers that can actually authenticate: ollama needs
+            // nothing, subscription-mode needs a live Claude Code OAuth
+            // token, everything else needs an API key.
+            let available = name == "ollama"
+                || (cfg.auth_mode == AuthMode::Subscription && anthropic_oauth::is_available())
+                || self.config.get_api_key(&name).is_some()
+                // Only when no api_key_env is configured: a section pointing
+                // at, say, AWS_BEARER_TOKEN_BEDROCK must not be "rescued" by
+                // ANTHROPIC_API_KEY and sent to the Bedrock URL with it.
+                || (cfg.api_key_env.is_none()
+                    && standard_key_env(&name).is_some_and(env_is_set));
+            if !available {
+                let reason = if cfg.auth_mode == AuthMode::Subscription {
+                    SkipReason::NoSubscriptionToken
+                } else {
+                    SkipReason::NoCredentials {
+                        env_var: cfg
+                            .api_key_env
+                            .clone()
+                            .or_else(|| standard_key_env(&name).map(String::from)),
+                    }
+                };
+                skipped.push((requested_as, reason));
+                continue;
+            }
+            providers.push(provider.clone());
+        }
 
-        // Filter to only providers that can actually authenticate: ollama
-        // needs nothing, subscription-mode needs a live Claude Code OAuth
-        // token, everything else needs an API key. Same silent-skip UX for
-        // all three so an unconfigured provider just doesn't show a panel.
-        provider_names
-            .into_iter()
-            .filter_map(|name| {
-                let provider = self.providers.get(&name)?;
-                let auth_mode = self
-                    .config
-                    .providers
-                    .get(&name)
-                    .map(|c| c.auth_mode)
-                    .unwrap_or_default();
-                let available = name == "ollama"
-                    || (auth_mode == AuthMode::Subscription && anthropic_oauth::is_available())
-                    || self.config.get_api_key(&name).is_some();
-                if !available {
-                    return None;
+        ProviderSelection { providers, skipped }
+    }
+
+    /// Every configured provider name for `--all`: the `[default].providers`
+    /// order first (so panel order stays familiar), then the rest sorted by
+    /// name. HashMap iteration order would otherwise reshuffle panels on
+    /// every run.
+    fn all_providers_in_display_order(&self) -> Vec<String> {
+        let mut ordered: Vec<String> = self
+            .config
+            .default
+            .providers
+            .iter()
+            .filter_map(|alias| self.resolve_alias(alias))
+            .collect();
+        let mut rest: Vec<String> = self
+            .config
+            .providers
+            .keys()
+            .filter(|name| !ordered.contains(name))
+            .cloned()
+            .collect();
+        rest.sort();
+        ordered.extend(rest);
+        ordered
+    }
+
+    /// Names users can pass to `-p`: each provider's aliases (or its name
+    /// when it has none), sorted.
+    pub fn known_provider_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .config
+            .providers
+            .iter()
+            .flat_map(|(name, cfg)| {
+                if cfg.aliases.is_empty() {
+                    vec![name.clone()]
+                } else {
+                    cfg.aliases.clone()
                 }
-                Some(provider.clone())
             })
-            .collect()
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     fn retry_cfg(&self) -> &RetryConfig {
@@ -679,7 +822,9 @@ mod tests {
         );
         let manager = ProviderManager::new(config, ModelTier::Fast).unwrap();
         let requested = vec!["gpt".to_string(), "chatgpt".to_string()];
-        let providers = manager.get_providers_for_query(Some(&requested));
+        let providers = manager
+            .select_providers(ProviderRequest::Explicit(&requested))
+            .providers;
         assert_eq!(providers.len(), 1);
     }
 
@@ -704,9 +849,95 @@ mod tests {
             "claude".to_string(),
             "gpt".to_string(),
         ];
-        let result = manager.get_providers_for_query(Some(&requested));
+        let result = manager
+            .select_providers(ProviderRequest::Explicit(&requested))
+            .providers;
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].display_name, "CLAUDE");
         assert_eq!(result[1].display_name, "GPT");
+    }
+
+    fn two_provider_manager(openai_enabled: bool) -> ProviderManager {
+        let mut config = Config::default();
+        config.providers.clear();
+        let mut openai = fake_provider_config(vec!["gpt"], "green");
+        openai.enabled = openai_enabled;
+        config.providers.insert("openai".to_string(), openai);
+        config.providers.insert(
+            "anthropic".to_string(),
+            fake_provider_config(vec!["claude"], "magenta"),
+        );
+        ProviderManager::new(config, ModelTier::Fast).unwrap()
+    }
+
+    #[test]
+    fn disabled_providers_are_skipped_with_a_reason() {
+        // `enabled = false` used to be ignored: a disabled provider with a
+        // key set was still queried.
+        let manager = two_provider_manager(false);
+        let requested = vec!["claude".to_string(), "gpt".to_string()];
+        let selection = manager.select_providers(ProviderRequest::Configured(&requested));
+        assert_eq!(selection.providers.len(), 1);
+        assert_eq!(selection.providers[0].display_name, "CLAUDE");
+        assert_eq!(
+            selection.skipped,
+            vec![("gpt".to_string(), SkipReason::Disabled)]
+        );
+    }
+
+    #[test]
+    fn unknown_aliases_are_reported_not_silently_dropped() {
+        let manager = two_provider_manager(true);
+        let requested = vec!["claud".to_string(), "gpt".to_string()];
+        let selection = manager.select_providers(ProviderRequest::Explicit(&requested));
+        assert_eq!(selection.providers.len(), 1);
+        assert_eq!(
+            selection.skipped,
+            vec![("claud".to_string(), SkipReason::Unknown)]
+        );
+    }
+
+    #[test]
+    fn missing_credentials_name_the_env_var() {
+        let mut config = Config::default();
+        config.providers.clear();
+        let mut cfg = fake_provider_config(vec!["grok"], "blue");
+        cfg.api_key = None;
+        cfg.api_key_env = Some("AI_CLI_TEST_DEFINITELY_UNSET_KEY".to_string());
+        config.providers.insert("xai".to_string(), cfg);
+        let manager = ProviderManager::new(config, ModelTier::Fast).unwrap();
+        let requested = vec!["grok".to_string()];
+        let selection = manager.select_providers(ProviderRequest::Explicit(&requested));
+        assert!(selection.providers.is_empty());
+        let (_, reason) = &selection.skipped[0];
+        assert!(reason
+            .to_string()
+            .contains("AI_CLI_TEST_DEFINITELY_UNSET_KEY"));
+    }
+
+    #[test]
+    fn all_means_every_enabled_provider_in_a_stable_order() {
+        // `-a` used to query only `[default].providers`, leaving out
+        // openrouter/ollama/custom providers.
+        let mut config = Config::default();
+        config.providers.clear();
+        config.default.providers = vec!["claude".to_string()];
+        for (name, alias) in [("zeta", "z"), ("anthropic", "claude"), ("alpha", "a")] {
+            config
+                .providers
+                .insert(name.to_string(), fake_provider_config(vec![alias], "white"));
+        }
+        let mut off = fake_provider_config(vec!["off"], "white");
+        off.enabled = false;
+        config.providers.insert("disabled".to_string(), off);
+        let manager = ProviderManager::new(config, ModelTier::Fast).unwrap();
+        let names: Vec<String> = manager
+            .select_providers(ProviderRequest::All)
+            .providers
+            .into_iter()
+            .map(|p| p.display_name)
+            .collect();
+        // [default].providers first, then the rest alphabetically.
+        assert_eq!(names, ["CLAUDE", "A", "Z"]);
     }
 }

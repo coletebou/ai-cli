@@ -579,8 +579,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         )
         .await?;
         false
-    } else if providers_to_query.len() == 1 && stream {
-        // Single provider: always stream (no interleaving issue) unless disabled
+    } else if stream && (providers_to_query.len() == 1 || !cli.raw) {
+        // One provider renders progressively as it streams. Several
+        // providers each print as one block the moment they finish, so the
+        // fastest answer shows first instead of waiting for the slowest.
+        // (Raw multi-provider output stays non-streaming below, so its
+        // order is deterministic for scripts.)
         let rx = query::stream_all(Arc::clone(&manager), providers_to_query.clone(), ctx).await;
 
         display::display_streaming(

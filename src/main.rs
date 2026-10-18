@@ -32,8 +32,11 @@ use std::process::Command as ProcessCommand;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-// Embedded at compile time by build.rs
+// Embedded at compile time by build.rs. Builds that don't come from their
+// own git checkout (crates.io tarball, vendored copy, no `.git`) get
+// "unknown" for both hashes and an empty repo path.
 const BUILD_COMMIT: &str = env!("AI_CLI_GIT_HASH");
+const BUILD_COMMIT_SHORT: &str = env!("AI_CLI_GIT_SHORT");
 const REPO_PATH: &str = env!("AI_CLI_REPO_PATH");
 
 /// Shorten a free-form question into something suitable for a trace name in
@@ -50,15 +53,30 @@ fn truncate_for_trace_name(question: &str) -> String {
     }
 }
 
+/// Warn when the binary is older than the checkout it was built from, e.g.
+/// after a `git pull` without reinstalling.
+///
+/// This runs before every command and spawning `git` is slow on
+/// Windows/WSL, so it bails out before doing so whenever the warning can't
+/// help: builds without git metadata, scripts and pipes (stderr isn't a
+/// terminal), and users who opted out with `AI_CLI_NO_STALE_CHECK=1`.
 fn check_binary_staleness() {
-    // Skip if repo path is empty or doesn't exist
-    if REPO_PATH.is_empty() || !std::path::Path::new(REPO_PATH).exists() {
+    if BUILD_COMMIT == "unknown"
+        || REPO_PATH.is_empty()
+        || !staleness_check_enabled(
+            std::env::var_os("AI_CLI_NO_STALE_CHECK").as_deref(),
+            std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        )
+        || !std::path::Path::new(REPO_PATH).exists()
+    {
         return;
     }
 
-    // Get current HEAD commit
+    // Compare full hashes. Abbreviations grow as the repository does, so
+    // the `--short` hash recorded at build time can differ from today's
+    // `--short` for the very same commit.
     let output = ProcessCommand::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
+        .args(["rev-parse", "HEAD"])
         .current_dir(REPO_PATH)
         .output()
         .ok();
@@ -68,22 +86,95 @@ fn check_binary_staleness() {
         _ => return, // Can't determine current hash, skip check
     };
 
-    // Compare with build commit
-    if BUILD_COMMIT != "unknown" && BUILD_COMMIT != current_hash {
+    if is_stale(BUILD_COMMIT, &current_hash) {
+        // Abbreviate the current hash to the build's length for display.
+        let current_short = current_hash
+            .get(..BUILD_COMMIT_SHORT.len())
+            .unwrap_or(&current_hash);
         eprintln!(
             "\x1b[33m[warn]\x1b[0m ai binary is stale (built: {}, current: {})",
-            BUILD_COMMIT, current_hash
+            BUILD_COMMIT_SHORT, current_short
         );
         eprintln!(
-            "\x1b[33m[warn]\x1b[0m Run 'ai-rebuild' or 'cargo install --path {}' to update\n",
+            "\x1b[33m[warn]\x1b[0m Run 'cargo install --path {}' to update (AI_CLI_NO_STALE_CHECK=1 silences this)\n",
             REPO_PATH
+        );
+    }
+}
+
+/// Whether the staleness check should run. `opt_out` is the value of
+/// `AI_CLI_NO_STALE_CHECK`; an empty value counts as unset.
+fn staleness_check_enabled(opt_out: Option<&std::ffi::OsStr>, stderr_is_terminal: bool) -> bool {
+    stderr_is_terminal && opt_out.is_none_or(|v| v.is_empty())
+}
+
+/// A build is stale when both full hashes are known and differ.
+fn is_stale(built: &str, current: &str) -> bool {
+    built != "unknown" && !current.is_empty() && built != current
+}
+
+#[cfg(test)]
+mod staleness_tests {
+    use super::{
+        is_stale, staleness_check_enabled, Cli, BUILD_COMMIT, BUILD_COMMIT_SHORT, REPO_PATH,
+    };
+    use clap::CommandFactory;
+    use std::ffi::OsStr;
+
+    const A: &str = "0123456789abcdef0123456789abcdef01234567";
+    const B: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn check_runs_only_for_interactive_stderr_without_opt_out() {
+        assert!(staleness_check_enabled(None, true));
+        assert!(!staleness_check_enabled(None, false));
+        assert!(!staleness_check_enabled(Some(OsStr::new("1")), true));
+        // `AI_CLI_NO_STALE_CHECK= ai ...` clears the opt-out.
+        assert!(staleness_check_enabled(Some(OsStr::new("")), true));
+    }
+
+    #[test]
+    fn stale_only_when_both_hashes_known_and_different() {
+        assert!(!is_stale(A, A));
+        assert!(is_stale(A, B));
+        assert!(!is_stale("unknown", B));
+        assert!(!is_stale(A, ""));
+    }
+
+    #[test]
+    fn build_metadata_is_all_known_or_all_unknown() {
+        if BUILD_COMMIT == "unknown" {
+            assert_eq!(BUILD_COMMIT_SHORT, "unknown");
+            assert_eq!(REPO_PATH, "");
+        } else {
+            // SHA-1 or SHA-256 object names, never an abbreviation.
+            assert!(
+                matches!(BUILD_COMMIT.len(), 40 | 64),
+                "not a full hash: {BUILD_COMMIT}"
+            );
+            assert!(BUILD_COMMIT.starts_with(BUILD_COMMIT_SHORT));
+            assert!(!BUILD_COMMIT_SHORT.is_empty());
+            assert!(!REPO_PATH.is_empty());
+        }
+    }
+
+    #[test]
+    fn version_includes_package_version_and_commit() {
+        let version = Cli::command().get_version().map(str::to_string);
+        assert_eq!(
+            version,
+            Some(format!(
+                "{} ({})",
+                env!("CARGO_PKG_VERSION"),
+                BUILD_COMMIT_SHORT
+            ))
         );
     }
 }
 
 #[derive(Parser)]
 #[command(name = "ai")]
-#[command(version = "0.1.0")]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("AI_CLI_GIT_SHORT"), ")"))]
 #[command(about = "Query multiple AI providers simultaneously")]
 #[command(author = "Cole Tebou")]
 struct Cli {

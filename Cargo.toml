@@ -2,8 +2,16 @@
 name = "ai-cli"
 version = "0.1.0"
 edition = "2021"
+# Minimum supported Rust version, enforced by the `msrv` CI job. It is set
+# by the locked dependency graph, not by our own code: ratatui's
+# `instability` macro crate (via darling 0.23) and rustyline's `home`
+# dependency declare rust-version 1.88.
+rust-version = "1.88"
 description = "Multi-provider AI CLI - query Grok, ChatGPT, Gemini, Claude simultaneously"
 authors = ["Cole Tebou"]
+repository = "https://github.com/coletebou/ai-cli"
+license = "MIT"
+readme = "README.md"
 
 [[bin]]
 name = "ai"

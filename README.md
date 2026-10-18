@@ -22,6 +22,33 @@ $ ai -w "latest release of tokio?"          # with web search
 
 ## Install
 
+### Install from a release
+
+On Linux and macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/coletebou/ai-cli/master/install.sh | sh
+```
+
+The script picks the build for your OS and CPU from the [latest release](https://github.com/coletebou/ai-cli/releases/latest), checks it against the published SHA-256, and puts `ai` in `~/.local/bin`. It never uses `sudo`. To change what it does, set these on the `sh` side of the pipe, e.g. `curl -fsSL ... | AI_VERSION=0.2.0 sh`:
+
+| Variable         | Effect                                           |
+|------------------|--------------------------------------------------|
+| `AI_VERSION`     | Install this release instead of the latest one   |
+| `AI_INSTALL_DIR` | Install here instead of `~/.local/bin`           |
+
+Prebuilt binaries:
+
+- Linux x86_64 and aarch64 (glibc 2.34+ and OpenSSL 3, e.g. Ubuntu 22.04+, Debian 12+, RHEL 9+).
+- macOS Intel and Apple Silicon. The binaries aren't notarized, so if you download one with a browser instead of using the script, clear the quarantine flag before running it: `xattr -d com.apple.quarantine ai`.
+- Windows x86_64. Download the `.zip` from the [releases page](https://github.com/coletebou/ai-cli/releases) and put `ai.exe` on your `PATH`.
+
+You can also download an archive by hand and check it against the release's `SHA256SUMS` (`sha256sum -c SHA256SUMS --ignore-missing`).
+
+There's no Homebrew formula yet; that's tracked in [#13](https://github.com/coletebou/ai-cli/issues/13).
+
+### Build from source
+
 Requires Rust 1.75+.
 
 ```bash

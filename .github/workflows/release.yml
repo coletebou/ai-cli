@@ -1,0 +1,233 @@
+# Release builds.
+#
+# Pushing a `v*` tag builds `ai` for every target below and uploads the
+# archives, a `.sha256` for each, and a combined `SHA256SUMS` to the GitHub
+# Release for that tag (creating the release if it doesn't exist yet). Only
+# the default GITHUB_TOKEN is used.
+#
+# To cut a release:
+#   1. Bump `version` in Cargo.toml, build once so Cargo.lock follows, and
+#      merge both to master.
+#   2. git tag v0.2.0 && git push origin v0.2.0
+#
+# The tag has to match the Cargo.toml version, or the run stops before
+# building anything.
+#
+# Running the workflow by hand (Actions > Release > Run workflow), or from a
+# pull request that changes this file or install.sh, is a dry run: every
+# target is built, packaged and install-tested, and the archives are attached
+# to the run as artifacts, but nothing is published.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - install.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel a release that is uploading; pull request dry runs are
+# superseded by the next push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  version:
+    name: check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "ai-cli") | .version')
+          locked=$(awk '$0 == "name = \"ai-cli\"" { getline; gsub(/^version = "|"$/, ""); print; exit }' Cargo.lock)
+          echo "Cargo.toml: $version, Cargo.lock: $locked, ref: $GITHUB_REF_TYPE $GITHUB_REF_NAME"
+          if [ -z "$version" ]; then
+            echo "::error file=Cargo.toml::could not read the ai-cli version"
+            exit 1
+          fi
+          # `cargo build --locked` would stop on this too, but only after
+          # every runner has spent minutes compiling dependencies.
+          if [ "$locked" != "$version" ]; then
+            echo "::error file=Cargo.lock::Cargo.lock has ai-cli $locked but Cargo.toml says $version; build once and commit Cargo.lock"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error file=Cargo.toml::tag $GITHUB_REF_NAME does not match the Cargo.toml version $version (expected v$version)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux binaries need the glibc and OpenSSL major version of the
+          # distro they were built on, or newer. Built on 22.04 they need
+          # glibc 2.34 and OpenSSL 3 (Ubuntu 22.04, Debian 12, RHEL 9); built
+          # on 24.04 they need glibc 2.39 and won't start on 22.04. Move to
+          # 24.04 only when GitHub retires the 22.04 images.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          # Native arm64 runner, so no cross-compiling OpenSSL.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          # macos-latest is Apple Silicon and cross-compiles the Intel build.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            exe: .exe
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.version.outputs.version }}
+      EXE: ${{ matrix.exe }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # reqwest's native-tls backend links the system OpenSSL on Linux.
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends libssl-dev pkg-config
+      # No build cache on purpose: release binaries start from a clean
+      # target directory, so nothing written by another run can end up in
+      # them.
+      - run: cargo build --release --locked --target "$TARGET"
+      - name: Smoke test
+        # The Intel macOS binary can't be run on the Apple Silicon runner.
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: |
+          out=$("target/$TARGET/release/ai$EXE" --version)
+          echo "$out"
+          # `ai 0.2.0`, or `ai 0.2.0 (<commit>)`
+          reported=$(echo "$out" | awk '{ print $2 }')
+          if [ "$reported" != "$VERSION" ]; then
+            echo "::error::the binary reports version '$reported', expected $VERSION"
+            exit 1
+          fi
+      - name: Package
+        env:
+          # Keep macOS tar from adding AppleDouble `._*` metadata entries.
+          COPYFILE_DISABLE: 1
+        run: |
+          name="ai-$VERSION-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/ai$EXE" README.md LICENSE "dist/$name/"
+          cd dist
+          if [ "$RUNNER_OS" = Windows ]; then
+            archive="$name.zip"
+            7z a -tzip "$archive" "$name" > /dev/null
+          else
+            archive="$name.tar.gz"
+            tar -czf "$archive" "$name"
+          fi
+          rm -r "$name"
+          # Same `<hash>  <file>` line everywhere (Windows sha256sum writes
+          # `<hash> *<file>`), so `sha256sum -c` and install.sh can read it.
+          if command -v sha256sum > /dev/null; then
+            sum=$(sha256sum "$archive")
+          else
+            sum=$(shasum -a 256 "$archive")
+          fi
+          printf '%s  %s\n' "${sum%% *}" "$archive" > "$archive.sha256"
+          ls -l
+          cat "$archive.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Run install.sh against the archives just built, served the way GitHub
+  # lays out release downloads, before anything is published.
+  install-test:
+    name: install.sh (${{ matrix.os }})
+    needs: [version, build]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest]
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: releases/download/v${{ needs.version.outputs.version }}
+          merge-multiple: true
+      - run: |
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory releases > /dev/null 2>&1 &
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            curl -fsS -o /dev/null http://127.0.0.1:8765/ && break
+            sleep 1
+          done
+          AI_RELEASES_URL=http://127.0.0.1:8765 AI_VERSION="$VERSION" \
+            AI_INSTALL_DIR="$RUNNER_TEMP/bin" sh ./install.sh
+          "$RUNNER_TEMP/bin/ai" --version
+
+  publish:
+    name: publish release
+    needs: [version, build, install-test]
+    # Tag pushes only; manual runs and pull requests are dry runs.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -c ./*.sha256
+          cat ./*.sha256 > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            # Already there (created by hand, or this is a re-run): replace
+            # the assets and leave the title and notes alone.
+            gh release upload "$TAG" dist/* --clobber
+          else
+            args=(--verify-tag --title "$TAG" --generate-notes)
+            # v1.2.0-rc.1 and the like aren't offered as the latest release.
+            case $TAG in *-*) args+=(--prerelease) ;; esac
+            gh release create "$TAG" dist/* "${args[@]}"
+          fi

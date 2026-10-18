@@ -145,19 +145,44 @@ fn build_initial_messages(question: &str, system_prompt: Option<&str>) -> Vec<Ch
     messages
 }
 
-fn build_options(ctx: &QueryContext) -> Option<ChatOptions> {
-    let needs_options = ctx.reasoning_effort.is_some() || ctx.tools.is_some();
-    if !needs_options {
-        return None;
-    }
-    let mut options = ChatOptions::default();
+fn build_options(ctx: &QueryContext) -> ChatOptions {
+    // Always capture usage: genai's streamers only report token counts in
+    // `StreamEnd.captured_usage` when this is set (and only then ask
+    // OpenAI-compatible servers for them via `stream_options.include_usage`).
+    // Without it, streamed replies never show tokens in the footer and the
+    // Langfuse spans carry no gen_ai.usage.* attributes. Non-streaming
+    // responses always include usage, so this is a no-op there.
+    let mut options = ChatOptions::default().with_capture_usage(true);
     if let Some(r) = ctx.reasoning_effort.clone() {
         options = options.with_reasoning_effort(r);
     }
     if ctx.tools.is_some() {
         options = options.with_capture_tool_calls(true);
     }
-    Some(options)
+    options
+}
+
+/// Error for a genai run that ended with no answer text. Two very different
+/// causes end up here: the search tool loop hit `max_iterations` while the
+/// model still wanted to search (so the last round had only tool calls), or
+/// the provider sent nothing we could parse, which is almost always a
+/// wire-protocol mismatch (e.g. an adapter pointed at a server that doesn't
+/// speak its protocol).
+fn empty_response_error(hit_search_cap: bool, max_iterations: usize) -> String {
+    if hit_search_cap {
+        // The cap only triggers on the last iteration, and every earlier
+        // iteration ran a search round (otherwise the loop would have ended).
+        let rounds = max_iterations.max(1) - 1;
+        format!(
+            "stopped after {} search round{} without a final answer (raise [search] max_iterations, currently {})",
+            rounds,
+            if rounds == 1 { "" } else { "s" },
+            max_iterations
+        )
+    } else {
+        "provider returned an empty response (likely a wire-protocol mismatch; check base_url)"
+            .to_string()
+    }
 }
 
 /// Report a turn that was cancelled (Ctrl+C / Esc / `/clear`).
@@ -289,13 +314,14 @@ pub async fn query_single(
     let mut total_input: Option<i32> = None;
     let mut total_output: Option<i32> = None;
     let mut final_text = String::new();
+    let mut hit_search_cap = false;
 
     for iteration in 0..ctx.max_iterations.max(1) {
         let response = match manager
             .exec_chat(
                 &provider.model,
                 messages.clone(),
-                options.as_ref(),
+                Some(&options),
                 ctx.tools.clone(),
             )
             .await
@@ -340,6 +366,7 @@ pub async fn query_single(
         // Don't execute tool calls on the final iteration: we'd spend search
         // quota but the results would never be fed back (loop exits next).
         if iteration + 1 >= ctx.max_iterations {
+            hit_search_cap = true;
             break;
         }
 
@@ -366,19 +393,11 @@ pub async fn query_single(
         final_text.clone(),
     ));
     if final_text.is_empty() {
+        let err_msg = empty_response_error(hit_search_cap, ctx.max_iterations);
         span.set_attribute(KeyValue::new("error", true));
-        span.set_attribute(KeyValue::new(
-            "exception.message",
-            "empty response (likely wire-protocol mismatch)",
-        ));
+        span.set_attribute(KeyValue::new("exception.message", err_msg.clone()));
         span.end();
-        return ProviderResponse::error(
-            provider.clone(),
-            model,
-            "provider returned an empty response (likely a wire-protocol mismatch; check base_url)"
-                .to_string(),
-            duration_ms,
-        );
+        return ProviderResponse::error(provider.clone(), model, err_msg, duration_ms);
     }
     span.end();
     ProviderResponse::success(
@@ -941,6 +960,7 @@ pub async fn stream_with_messages(
     // iterations may also emit narration before returning a tool call — we
     // discard that so it doesn't leak into the persisted assistant reply.
     let mut final_text = String::new();
+    let mut hit_search_cap = false;
 
     for iteration in 0..ctx.max_iterations.max(1) {
         // Opening the stream includes connecting, the first response bytes,
@@ -952,7 +972,7 @@ pub async fn stream_with_messages(
             r = manager.exec_chat_stream(
                 &provider.model,
                 messages.clone(),
-                options.as_ref(),
+                Some(&options),
                 ctx.tools.clone(),
             ) => r,
         };
@@ -1079,6 +1099,7 @@ pub async fn stream_with_messages(
         // Safety: stop if we're at the last iteration (results would not be used)
         if iteration + 1 >= ctx.max_iterations {
             final_text = iter_text;
+            hit_search_cap = true;
             break;
         }
 
@@ -1130,24 +1151,23 @@ pub async fn stream_with_messages(
         final_text.clone(),
     ));
 
-    // Silent-failure guard: a stream that ended with no text AND no tool
-    // calls is almost always a wire-protocol mismatch (e.g. an adapter
-    // pointed at a server that doesn't speak its protocol — Bedrock's
-    // 200 + UnknownOperationException was the canonical trigger). Report
-    // it as an error so the user sees something instead of "[complete]"
-    // with an empty body.
+    // Silent-failure guard: report an empty final answer as an error so the
+    // user sees something instead of "[complete]" with an empty body. Either
+    // the search loop ran out of rounds while the model still wanted to
+    // search, or (no text AND no tool calls) it's almost always a
+    // wire-protocol mismatch, e.g. an adapter pointed at a server that
+    // doesn't speak its protocol (Bedrock's 200 + UnknownOperationException
+    // was the canonical trigger).
     if final_text.is_empty() {
+        let err_msg = empty_response_error(hit_search_cap, ctx.max_iterations);
         span.set_attribute(KeyValue::new("error", true));
-        span.set_attribute(KeyValue::new(
-            "exception.message",
-            "empty response (likely wire-protocol mismatch)",
-        ));
+        span.set_attribute(KeyValue::new("exception.message", err_msg.clone()));
         span.end();
         let _ = tx
             .send(StreamEvent::Error {
                 provider: provider_name,
                 model,
-                error: "provider returned an empty response (likely a wire-protocol mismatch; check base_url)".to_string(),
+                error: err_msg,
                 duration_ms,
             })
             .await;
@@ -1328,5 +1348,45 @@ mod tests {
         assert_eq!(arr[0]["content"], "you are helpful");
         assert_eq!(arr[1]["role"], "user");
         assert_eq!(arr[2]["role"], "assistant");
+    }
+
+    #[test]
+    fn build_options_always_captures_usage() {
+        // genai only fills StreamEnd.captured_usage when capture_usage is
+        // set; a plain query (no reasoning, no tools) must still get tokens.
+        let options = build_options(&QueryContext::new("hi"));
+        assert_eq!(options.capture_usage, Some(true));
+        assert_eq!(options.capture_tool_calls, None);
+        assert!(options.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn build_options_keeps_reasoning_and_tool_capture() {
+        let mut ctx = QueryContext::new("hi").with_reasoning(Some(ReasoningEffort::High));
+        ctx.tools = Some(vec![crate::search::web_search_tool()]);
+        let options = build_options(&ctx);
+        assert_eq!(options.capture_usage, Some(true));
+        assert_eq!(options.capture_tool_calls, Some(true));
+        assert!(matches!(
+            options.reasoning_effort,
+            Some(ReasoningEffort::High)
+        ));
+    }
+
+    #[test]
+    fn empty_response_error_names_the_search_cap() {
+        // With -w, running out of search rounds used to be reported as a
+        // wire-protocol mismatch.
+        let msg = empty_response_error(true, 5);
+        assert!(msg.contains("stopped after 4 search rounds"), "{msg}");
+        assert!(msg.contains("[search] max_iterations"), "{msg}");
+        assert!(!msg.contains("wire-protocol"), "{msg}");
+        assert!(empty_response_error(true, 2).contains("after 1 search round without"));
+
+        let msg = empty_response_error(false, 5);
+        assert!(
+            msg.contains("wire-protocol mismatch; check base_url"),
+            "{msg}"
+        );
     }
 }

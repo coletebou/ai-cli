@@ -34,7 +34,9 @@ fn adapter_kind_for_provider(name: &str) -> Option<AdapterKind> {
 fn provider_name_for_adapter(kind: &str) -> Option<&'static str> {
     match kind {
         "Anthropic" => Some("anthropic"),
-        "OpenAI" => Some("openai"),
+        // genai sends GPT "pro"/"codex" model names to its Responses API
+        // adapter; those are still served by the openai provider.
+        "OpenAI" | "OpenAIResp" => Some("openai"),
         "Gemini" => Some("google"),
         "Ollama" => Some("ollama"),
         "xAi" => Some("xai"),
@@ -42,12 +44,18 @@ fn provider_name_for_adapter(kind: &str) -> Option<&'static str> {
     }
 }
 
-/// Resolve auth for one provider, honoring `auth_mode`. Shared by both the
-/// initial auth resolver and the service-target resolver's re-resolution
-/// pass, so a `subscription`-mode provider doesn't get silently clobbered
-/// back to plain API-key auth when the target resolver re-resolves auth
-/// after correcting a misdetected adapter kind (see `ServiceTargetResolver`
-/// below — it used to call `get_api_key` directly for that case).
+/// Provider name that gets the OpenAI-compatible OpenRouter treatment.
+const OPENROUTER_PROVIDER: &str = "openrouter";
+const OPENROUTER_DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1/";
+const OPENROUTER_KEY_ENV: &str = "OPENROUTER_API_KEY";
+
+/// Resolve auth for one provider, honoring `auth_mode`. This is the single
+/// place credentials are picked (see `ModelRouter::auth`), so a
+/// `subscription`-mode provider can't get silently clobbered back to plain
+/// API-key auth by a second resolution pass. The service-target resolver
+/// used to re-resolve auth after correcting a misdetected adapter kind; that
+/// pass was redundant because the auth resolver already routes by the same
+/// model name.
 fn resolve_provider_auth(config: &Config, provider_name: &str) -> Option<AuthData> {
     let provider_cfg = config.providers.get(provider_name)?;
 
@@ -78,6 +86,7 @@ fn resolve_provider_auth(config: &Config, provider_name: &str) -> Option<AuthDat
         "openai" => Some("OPENAI_API_KEY"),
         "google" => Some("GEMINI_API_KEY"),
         "xai" => Some("XAI_API_KEY"),
+        OPENROUTER_PROVIDER => Some(OPENROUTER_KEY_ENV),
         _ => None,
     };
     fallback_env
@@ -85,23 +94,49 @@ fn resolve_provider_auth(config: &Config, provider_name: &str) -> Option<AuthDat
         .map(AuthData::from_single)
 }
 
-/// Build a map from every configured model name to its (provider_name, AdapterKind).
-/// This lets both resolvers route models that genai can't detect from prefixes alone
-/// (e.g. Bedrock IDs like "us.anthropic.claude-opus-4-7").
-fn build_model_provider_map(config: &Config) -> HashMap<String, (String, AdapterKind)> {
+/// The `[providers.<name>]` entry that lists a model, plus the adapter that
+/// provider speaks. `adapter` is `None` for provider names we have no fixed
+/// adapter for: those keep genai's name-based guess but still get their own
+/// base_url and credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelOwner {
+    provider: String,
+    adapter: Option<AdapterKind>,
+}
+
+/// Build a map from every configured model name to the provider that lists it.
+/// This lets both resolvers route models that genai can't detect from prefixes
+/// alone (e.g. Bedrock IDs like "us.anthropic.claude-opus-4-7"), and stops a
+/// model configured under one provider from being claimed by another (e.g. a
+/// local vLLM's "Qwen/Qwen2.5-7B-Instruct" under `openai` must not go to
+/// OpenRouter just because it contains a '/').
+///
+/// If two providers list the same model name, the winner is deterministic:
+/// enabled before disabled, direct providers before OpenRouter (the catch-all
+/// aggregator), then by provider name. `config.providers` is a HashMap, so
+/// without the sort the winner would change from run to run.
+fn build_model_provider_map(config: &Config) -> HashMap<String, ModelOwner> {
+    let mut providers: Vec<(&String, &ProviderConfig)> = config.providers.iter().collect();
+    providers
+        .sort_by_key(|&(name, cfg)| (!cfg.enabled, name == OPENROUTER_PROVIDER, name.as_str()));
+
     let mut map = HashMap::new();
-    for (provider_name, provider_cfg) in &config.providers {
-        let Some(adapter) = adapter_kind_for_provider(provider_name) else {
-            continue;
+    for (provider_name, provider_cfg) in providers {
+        let adapter = if provider_name == OPENROUTER_PROVIDER {
+            Some(AdapterKind::OpenAI)
+        } else {
+            adapter_kind_for_provider(provider_name)
         };
-        let entry = (provider_name.clone(), adapter);
         for model in [
             &provider_cfg.default_model,
             provider_cfg.fast_model.as_deref().unwrap_or_default(),
             provider_cfg.smart_model.as_deref().unwrap_or_default(),
         ] {
             if !model.is_empty() {
-                map.insert(model.to_string(), entry.clone());
+                map.entry(model.to_string()).or_insert_with(|| ModelOwner {
+                    provider: provider_name.clone(),
+                    adapter,
+                });
             }
         }
     }
@@ -181,6 +216,192 @@ pub struct ProviderSelection {
     pub skipped: Vec<(String, SkipReason)>,
 }
 
+/// genai's default base URL for each adapter a `[providers.*]` entry can
+/// resolve to. Needed when we override genai's adapter guess, because genai
+/// has already picked the default endpoint for the adapter it guessed.
+/// (genai's own table, `AdapterDispatcher::default_endpoint`, is
+/// crate-private; `default_base_urls_match_genai` keeps these in sync.)
+fn default_base_url(kind: AdapterKind) -> Option<&'static str> {
+    Some(match kind {
+        AdapterKind::Anthropic => "https://api.anthropic.com/v1/",
+        AdapterKind::OpenAI | AdapterKind::OpenAIResp => "https://api.openai.com/v1/",
+        AdapterKind::Gemini => "https://generativelanguage.googleapis.com/v1beta/",
+        AdapterKind::Xai => "https://api.x.ai/v1/",
+        AdapterKind::Ollama => "http://localhost:11434/v1/",
+        _ => return None,
+    })
+}
+
+/// Turn a configured `base_url` into the base genai expects. genai joins
+/// request paths (`chat/completions`, `messages`, ...) onto it, so it must end
+/// in '/'. The Ollama adapter speaks Ollama's OpenAI-compatible API, which
+/// lives under `/v1/`: a bare host like the shipped default
+/// `http://localhost:11434` would otherwise become
+/// `http://localhost:11434/chat/completions`, which Ollama answers with 404.
+fn normalize_base_url(url: &str, adapter_kind: AdapterKind) -> String {
+    if adapter_kind == AdapterKind::Ollama {
+        if let Ok(mut parsed) = reqwest::Url::parse(url) {
+            if matches!(parsed.path(), "" | "/") {
+                parsed.set_path("/v1/");
+                return parsed.to_string();
+            }
+        }
+    }
+    ensure_trailing_slash(url.to_string())
+}
+
+/// Where one model's requests go. Plain data, so the routing rules can be
+/// unit tested without a network or a genai client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteDecision {
+    /// `[providers.<name>]` entry whose credentials (and base_url) serve the
+    /// model. `None` leaves auth to genai's per-adapter default.
+    provider_name: Option<String>,
+    /// genai adapter, i.e. the wire protocol to speak.
+    adapter_kind: AdapterKind,
+    /// Base URL to use instead of the default genai picked for the adapter it
+    /// guessed. Always ends in '/'.
+    endpoint_override: Option<String>,
+    /// Sent to OpenRouter's OpenAI-compatible API.
+    via_openrouter: bool,
+}
+
+/// Model name -> provider routing shared by the auth and service-target
+/// resolvers. genai calls both with the same model name and the same
+/// name-based adapter guess, so both reach the same decision, and the auth
+/// resolver (which runs first) already picks the credentials of the provider
+/// the request will actually be sent to.
+struct ModelRouter {
+    config: Arc<Config>,
+    owners: HashMap<String, ModelOwner>,
+    openrouter_enabled: bool,
+}
+
+impl ModelRouter {
+    fn new(config: Arc<Config>) -> Self {
+        let owners = build_model_provider_map(&config);
+        let openrouter_enabled = config
+            .providers
+            .get(OPENROUTER_PROVIDER)
+            .is_some_and(|p| p.enabled);
+        Self {
+            config,
+            owners,
+            openrouter_enabled,
+        }
+    }
+
+    /// Decide where `model_name` goes. `genai_guess` is the adapter genai
+    /// inferred from the name alone (`AdapterKind::from_model`).
+    fn route(&self, model_name: &str, genai_guess: AdapterKind) -> RouteDecision {
+        // 1. A configured model goes to the provider that lists it. This runs
+        //    before the OpenRouter slash heuristic below so a local vLLM's
+        //    "Qwen/Qwen2.5-7B-Instruct" or an Ollama "hf.co/..." tag is never
+        //    sent to a third party the user didn't pick.
+        if let Some(owner) = self.owners.get(model_name) {
+            if owner.provider == OPENROUTER_PROVIDER {
+                return self.openrouter_route();
+            }
+            let adapter_kind = match owner.adapter {
+                // genai maps GPT "pro"/"codex" names to the Responses API,
+                // and /chat/completions rejects those models. It's still the
+                // openai provider, so keep genai's more specific adapter.
+                Some(AdapterKind::OpenAI) if genai_guess == AdapterKind::OpenAIResp => {
+                    AdapterKind::OpenAIResp
+                }
+                Some(kind) => kind,
+                // No fixed adapter for this provider name: trust genai.
+                None => genai_guess,
+            };
+            return self.provider_route(&owner.provider, adapter_kind, genai_guess);
+        }
+
+        // 2. An unconfigured "vendor/model" name goes to OpenRouter, if the
+        //    user enabled it. genai's own "adapter::model" namespaces are an
+        //    explicit adapter choice, so those are left alone.
+        if self.openrouter_enabled && model_name.contains('/') && !model_name.contains("::") {
+            return self.openrouter_route();
+        }
+
+        // 3. Otherwise trust genai's guess, with that adapter's provider settings.
+        match provider_name_for_adapter(genai_guess.as_str()) {
+            Some(provider) => self.provider_route(provider, genai_guess, genai_guess),
+            None => RouteDecision {
+                provider_name: None,
+                adapter_kind: genai_guess,
+                endpoint_override: None,
+                via_openrouter: false,
+            },
+        }
+    }
+
+    fn provider_route(
+        &self,
+        provider: &str,
+        adapter_kind: AdapterKind,
+        genai_guess: AdapterKind,
+    ) -> RouteDecision {
+        let base_url = self
+            .config
+            .providers
+            .get(provider)
+            .and_then(|p| p.base_url.as_deref());
+        let endpoint_override = match base_url {
+            Some(url) => Some(normalize_base_url(url, adapter_kind)),
+            // genai picked the default endpoint of the adapter it guessed; if
+            // we changed the adapter, the endpoint has to follow.
+            None if adapter_kind != genai_guess => default_base_url(adapter_kind).map(String::from),
+            None => None,
+        };
+        RouteDecision {
+            provider_name: Some(provider.to_string()),
+            adapter_kind,
+            endpoint_override,
+            via_openrouter: false,
+        }
+    }
+
+    fn openrouter_route(&self) -> RouteDecision {
+        let base_url = self
+            .config
+            .providers
+            .get(OPENROUTER_PROVIDER)
+            .and_then(|p| p.base_url.as_deref())
+            .unwrap_or(OPENROUTER_DEFAULT_BASE_URL);
+        RouteDecision {
+            provider_name: Some(OPENROUTER_PROVIDER.to_string()),
+            adapter_kind: AdapterKind::OpenAI,
+            endpoint_override: Some(ensure_trailing_slash(base_url.to_string())),
+            via_openrouter: true,
+        }
+    }
+
+    /// Credentials for a routed request. `None` (no owning provider) lets
+    /// genai use its default for the adapter, which in that case is also the
+    /// adapter we route to.
+    fn auth(&self, route: &RouteDecision) -> Option<AuthData> {
+        let provider = route.provider_name.as_deref()?;
+        Some(resolve_provider_auth(&self.config, provider).unwrap_or_else(|| default_auth(route)))
+    }
+}
+
+/// Fallback credentials when the owning provider has none configured: the
+/// default of the adapter we route to, never of the adapter genai guessed
+/// from the name. Returning `None` here would make genai use the guess's
+/// default, so an Ollama model named like another vendor's ("glm4",
+/// "command-r") would demand ZAI_API_KEY / COHERE_API_KEY, or send that
+/// vendor's key to the local server.
+fn default_auth(route: &RouteDecision) -> AuthData {
+    if route.via_openrouter {
+        return AuthData::from_env(OPENROUTER_KEY_ENV);
+    }
+    match route.adapter_kind.default_key_env_name() {
+        Some(env) => AuthData::from_env(env),
+        // Ollama needs no key; this placeholder is genai's own default.
+        None => AuthData::from_single("ollama"),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Provider {
     pub display_name: String,
@@ -256,36 +477,22 @@ pub struct ProviderManager {
 impl ProviderManager {
     pub fn new(config: Config, model_tier: ModelTier) -> Result<Self> {
         let config = Arc::new(config);
-        let model_map = Arc::new(build_model_provider_map(&config));
+        let router = Arc::new(ModelRouter::new(Arc::clone(&config)));
 
-        // Build custom auth resolver that uses our config.
-        // First tries the model→provider lookup table (handles Bedrock-style IDs),
-        // then falls back to adapter kind matching.
-        let auth_config = Arc::clone(&config);
-        let auth_model_map = Arc::clone(&model_map);
+        // genai runs the auth resolver first, with the adapter it guessed from
+        // the model name, then the service-target resolver. Both route through
+        // the same ModelRouter (model→provider table first, so Bedrock-style
+        // IDs and slash-named local models land on the provider that lists
+        // them), so auth is resolved once per request, for the right provider.
+        let auth_router = Arc::clone(&router);
         let auth_resolver = AuthResolver::from_resolver_fn(
             move |model_iden: ModelIden| -> Result<Option<AuthData>, genai::resolver::Error> {
-                let provider_name = auth_model_map
-                    .get::<str>(&model_iden.model_name)
-                    .map(|(name, _)| name.as_str())
-                    .or_else(|| provider_name_for_adapter(model_iden.adapter_kind.as_str()));
-
-                let Some(provider_name) = provider_name else {
-                    return Ok(None);
-                };
-
-                Ok(resolve_provider_auth(&auth_config, provider_name))
+                let route = auth_router.route(&model_iden.model_name, model_iden.adapter_kind);
+                Ok(auth_router.auth(&route))
             },
         );
 
-        let or_config = Arc::clone(&config);
-        let or_enabled = config
-            .providers
-            .get("openrouter")
-            .map(|p| p.enabled)
-            .unwrap_or(false);
-        let target_model_map = Arc::clone(&model_map);
-
+        let target_router = Arc::clone(&router);
         let target_resolver = ServiceTargetResolver::from_resolver_fn(
             move |service_target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
                 let ServiceTarget {
@@ -294,87 +501,23 @@ impl ProviderManager {
                     auth,
                 } = service_target;
 
-                // Route slash-namespaced models through OpenRouter.
-                if or_enabled && model.model_name.contains('/') {
-                    let or_url = or_config
-                        .providers
-                        .get("openrouter")
-                        .and_then(|p| p.base_url.clone())
-                        .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
-                    let or_url = ensure_trailing_slash(or_url);
-                    let or_endpoint = Endpoint::from_owned(or_url);
-                    let or_auth = if let Some(key) = or_config.get_api_key("openrouter") {
-                        AuthData::from_single(key)
-                    } else {
-                        AuthData::from_env("OPENROUTER_API_KEY")
-                    };
-                    let or_model = ModelIden::new(AdapterKind::OpenAI, model.model_name);
-                    return Ok(ServiceTarget {
-                        endpoint: or_endpoint,
-                        auth: or_auth,
-                        model: or_model,
-                    });
-                }
+                let route = target_router.route(&model.model_name, model.adapter_kind);
 
-                // Resolve the provider for this model: first try our config's model
-                // table (handles Bedrock-style IDs that genai misroutes), then fall
-                // back to adapter-kind matching.
-                let (provider_name, correct_kind) = target_model_map
-                    .get::<str>(&model.model_name)
-                    .map(|(name, kind)| (name.as_str(), Some(*kind)))
-                    .unwrap_or_else(|| {
-                        let name =
-                            provider_name_for_adapter(model.adapter_kind.as_str()).unwrap_or("");
-                        (name, None)
-                    });
-
-                // Fix the adapter kind if genai guessed wrong
-                let kind_was_wrong = correct_kind.is_some_and(|k| k != model.adapter_kind);
-                let model = if kind_was_wrong {
-                    ModelIden::new(correct_kind.unwrap(), model.model_name)
-                } else {
+                // Fix the adapter kind if genai guessed wrong.
+                let model = if route.adapter_kind == model.adapter_kind {
                     model
-                };
-
-                // Override endpoint: use [providers.<name>].base_url if set,
-                // otherwise if the adapter kind was corrected we must also fix
-                // the endpoint (genai resolved the default for the wrong adapter).
-                let override_endpoint = or_config
-                    .providers
-                    .get(provider_name)
-                    .and_then(|p| p.base_url.clone())
-                    .or_else(|| {
-                        if !kind_was_wrong {
-                            return None;
-                        }
-                        Some(
-                            match model.adapter_kind {
-                                AdapterKind::Anthropic => "https://api.anthropic.com/v1/",
-                                AdapterKind::OpenAI => "https://api.openai.com/v1/",
-                                AdapterKind::Gemini => {
-                                    "https://generativelanguage.googleapis.com/v1beta/"
-                                }
-                                AdapterKind::Xai => "https://api.x.ai/v1/",
-                                _ => return None,
-                            }
-                            .to_string(),
-                        )
-                    })
-                    .map(|u| Endpoint::from_owned(ensure_trailing_slash(u)));
-
-                // Re-resolve auth when adapter kind was corrected, since the auth
-                // resolver ran with the wrong kind earlier. Goes through the same
-                // resolve_provider_auth() as the initial pass so subscription-mode
-                // auth doesn't get clobbered back to a plain API key here.
-                let auth = if correct_kind.is_some_and(|k| k != AdapterKind::Ollama) {
-                    resolve_provider_auth(&or_config, provider_name).unwrap_or(auth)
                 } else {
-                    auth
+                    ModelIden::new(route.adapter_kind, model.model_name)
                 };
+                let endpoint = route
+                    .endpoint_override
+                    .map(Endpoint::from_owned)
+                    .unwrap_or(endpoint);
 
+                // `auth` already came from the auth resolver's identical route.
                 Ok(ServiceTarget {
                     model,
-                    endpoint: override_endpoint.unwrap_or(endpoint),
+                    endpoint,
                     auth,
                 })
             },
@@ -939,5 +1082,381 @@ mod tests {
             .collect();
         // [default].providers first, then the rest alphabetically.
         assert_eq!(names, ["CLAUDE", "A", "Z"]);
+    }
+
+    // -- Model routing ------------------------------------------------------
+
+    /// A provider entry with an inline key (so auth never depends on the
+    /// environment) listing `fast` and optionally `smart`.
+    fn routed_provider(fast: &str, smart: Option<&str>, base_url: Option<&str>) -> ProviderConfig {
+        ProviderConfig {
+            enabled: true,
+            api_key_env: None,
+            api_key: Some("test-key".to_string()),
+            default_model: fast.to_string(),
+            fast_model: Some(fast.to_string()),
+            smart_model: smart.map(String::from),
+            aliases: Vec::new(),
+            color: "white".to_string(),
+            base_url: base_url.map(String::from),
+            auth_mode: AuthMode::ApiKey,
+        }
+    }
+
+    fn config_with(providers: Vec<(&str, ProviderConfig)>) -> Config {
+        let mut config = Config::default();
+        config.providers.clear();
+        for (name, provider) in providers {
+            config.providers.insert(name.to_string(), provider);
+        }
+        config
+    }
+
+    fn router_for(providers: Vec<(&str, ProviderConfig)>) -> ModelRouter {
+        ModelRouter::new(Arc::new(config_with(providers)))
+    }
+
+    /// Route `model` the way the resolvers do, with genai's real name-based guess.
+    fn route(router: &ModelRouter, model: &str) -> RouteDecision {
+        let guess = AdapterKind::from_model(model).unwrap();
+        router.route(model, guess)
+    }
+
+    fn openrouter() -> ProviderConfig {
+        routed_provider(
+            "google/gemini-3.1-flash-lite-preview",
+            Some("anthropic/claude-opus-4-8"),
+            Some("https://openrouter.ai/api/v1"),
+        )
+    }
+
+    fn assert_key(auth: Option<AuthData>, expected: &str) {
+        match auth {
+            Some(AuthData::Key(key)) => assert_eq!(key, expected),
+            other => panic!("expected AuthData::Key, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn slash_model_configured_under_openai_stays_on_openai() {
+        // Real-world bug: a local vLLM configured as the openai provider was
+        // sent to openrouter.ai (a third party) because the model contains '/'.
+        let router = router_for(vec![
+            (
+                "openai",
+                routed_provider(
+                    "Qwen/Qwen2.5-7B-Instruct",
+                    None,
+                    Some("http://localhost:8000/v1/"),
+                ),
+            ),
+            ("openrouter", openrouter()),
+        ]);
+        let r = route(&router, "Qwen/Qwen2.5-7B-Instruct");
+        assert_eq!(r.provider_name.as_deref(), Some("openai"));
+        assert_eq!(r.adapter_kind, AdapterKind::OpenAI);
+        assert_eq!(
+            r.endpoint_override.as_deref(),
+            Some("http://localhost:8000/v1/")
+        );
+        assert!(!r.via_openrouter);
+    }
+
+    #[test]
+    fn slash_model_configured_under_ollama_stays_on_ollama() {
+        let router = router_for(vec![
+            (
+                "ollama",
+                routed_provider(
+                    "huihui_ai/qwen3:8b",
+                    Some("hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"),
+                    Some("http://localhost:11434"),
+                ),
+            ),
+            ("openrouter", openrouter()),
+        ]);
+        for model in [
+            "huihui_ai/qwen3:8b",
+            "hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M",
+        ] {
+            let r = route(&router, model);
+            assert_eq!(r.provider_name.as_deref(), Some("ollama"), "{model}");
+            assert_eq!(r.adapter_kind, AdapterKind::Ollama, "{model}");
+            assert_eq!(
+                r.endpoint_override.as_deref(),
+                Some("http://localhost:11434/v1/"),
+                "{model}"
+            );
+            assert!(!r.via_openrouter, "{model}");
+        }
+    }
+
+    #[test]
+    fn unknown_slash_model_goes_to_openrouter_only_when_enabled() {
+        let model = "meta-llama/llama-3.3-70b-instruct";
+
+        let router = router_for(vec![("openrouter", openrouter())]);
+        let r = route(&router, model);
+        assert!(r.via_openrouter);
+        assert_eq!(r.provider_name.as_deref(), Some("openrouter"));
+        assert_eq!(r.adapter_kind, AdapterKind::OpenAI);
+        assert_eq!(
+            r.endpoint_override.as_deref(),
+            Some("https://openrouter.ai/api/v1/")
+        );
+        assert_key(router.auth(&r), "test-key");
+
+        let mut disabled = openrouter();
+        disabled.enabled = false;
+        let router = router_for(vec![("openrouter", disabled)]);
+        let r = route(&router, model);
+        assert!(!r.via_openrouter);
+        assert_ne!(r.provider_name.as_deref(), Some("openrouter"));
+    }
+
+    #[test]
+    fn models_configured_under_openrouter_route_there_even_when_genai_guesses_otherwise() {
+        // genai maps "qwen/qwen3-32b" to its Groq adapter (it's in Groq's
+        // model list); configured under openrouter, it must go to OpenRouter.
+        let mut or = openrouter();
+        or.smart_model = Some("qwen/qwen3-32b".to_string());
+        or.enabled = false; // enabled only gates the unknown-model fallback
+        let router = router_for(vec![("openrouter", or)]);
+        assert_eq!(
+            AdapterKind::from_model("qwen/qwen3-32b").unwrap(),
+            AdapterKind::Groq
+        );
+        let r = route(&router, "qwen/qwen3-32b");
+        assert!(r.via_openrouter);
+        assert_eq!(r.adapter_kind, AdapterKind::OpenAI);
+    }
+
+    #[test]
+    fn genai_namespaced_models_are_not_sent_to_openrouter() {
+        // "adapter::model" is genai's explicit adapter pin; the '/' in the
+        // model part must not divert it to OpenRouter.
+        let router = router_for(vec![("openrouter", openrouter())]);
+        let r = route(&router, "together::meta-llama/Llama-3-8b-chat-hf");
+        assert!(!r.via_openrouter);
+        assert_eq!(r.adapter_kind, AdapterKind::Together);
+    }
+
+    #[test]
+    fn bedrock_style_ids_route_to_their_provider() {
+        let bedrock = "https://bedrock-runtime.us-east-1.amazonaws.com/v1/";
+        let arn =
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus-4-7";
+        let router = router_for(vec![
+            (
+                "anthropic",
+                routed_provider("us.anthropic.claude-opus-4-7", Some(arn), Some(bedrock)),
+            ),
+            ("openrouter", openrouter()),
+        ]);
+        for model in ["us.anthropic.claude-opus-4-7", arn] {
+            let r = route(&router, model);
+            assert_eq!(r.provider_name.as_deref(), Some("anthropic"), "{model}");
+            assert_eq!(r.adapter_kind, AdapterKind::Anthropic, "{model}");
+            assert_eq!(r.endpoint_override.as_deref(), Some(bedrock), "{model}");
+            assert!(!r.via_openrouter, "{model}");
+        }
+    }
+
+    #[test]
+    fn ollama_base_url_gets_openai_compat_path() {
+        let ollama = AdapterKind::Ollama;
+        assert_eq!(
+            normalize_base_url("http://localhost:11434", ollama),
+            "http://localhost:11434/v1/"
+        );
+        assert_eq!(
+            normalize_base_url("http://localhost:11434/", ollama),
+            "http://localhost:11434/v1/"
+        );
+        assert_eq!(
+            normalize_base_url("http://localhost:11434/v1", ollama),
+            "http://localhost:11434/v1/"
+        );
+        assert_eq!(
+            normalize_base_url("http://gpu-box:11434/v1/", ollama),
+            "http://gpu-box:11434/v1/"
+        );
+        // An explicit path is the user's choice; only the slash is added.
+        assert_eq!(
+            normalize_base_url("https://proxy.example/ollama", ollama),
+            "https://proxy.example/ollama/"
+        );
+        // Other adapters never get a path appended.
+        assert_eq!(
+            normalize_base_url("http://localhost:8000", AdapterKind::OpenAI),
+            "http://localhost:8000/"
+        );
+    }
+
+    #[test]
+    fn ollama_models_genai_misdetects_get_ollama_endpoint_and_auth() {
+        // genai guesses Zai for "glm4:*" and Cohere for "command-r*". Without
+        // a base_url, the endpoint used to stay on api.z.ai / api.cohere.com,
+        // and auth fell back to ZAI_API_KEY / COHERE_API_KEY.
+        let mut ollama = routed_provider("glm4:9b", Some("command-r"), None);
+        ollama.api_key = None;
+        let router = router_for(vec![("ollama", ollama)]);
+        for model in ["glm4:9b", "command-r"] {
+            assert_ne!(
+                AdapterKind::from_model(model).unwrap(),
+                AdapterKind::Ollama,
+                "{model}"
+            );
+            let r = route(&router, model);
+            assert_eq!(r.provider_name.as_deref(), Some("ollama"), "{model}");
+            assert_eq!(r.adapter_kind, AdapterKind::Ollama, "{model}");
+            assert_eq!(
+                r.endpoint_override.as_deref(),
+                Some("http://localhost:11434/v1/"),
+                "{model}"
+            );
+            assert_key(router.auth(&r), "ollama");
+        }
+    }
+
+    #[test]
+    fn gpt_pro_and_codex_models_keep_the_responses_api() {
+        let router = router_for(vec![(
+            "openai",
+            routed_provider("gpt-5-nano", Some("gpt-5-pro"), None),
+        )]);
+        let r = route(&router, "gpt-5-pro");
+        assert_eq!(r.adapter_kind, AdapterKind::OpenAIResp);
+        assert_eq!(r.provider_name.as_deref(), Some("openai"));
+        // genai's default endpoint for OpenAIResp is already OpenAI's.
+        assert_eq!(r.endpoint_override, None);
+
+        let r = route(&router, "gpt-5-nano");
+        assert_eq!(r.adapter_kind, AdapterKind::OpenAI);
+
+        // Unconfigured Responses-API models still use the openai provider's settings.
+        let r = route(&router, "gpt-5.1-codex");
+        assert_eq!(r.adapter_kind, AdapterKind::OpenAIResp);
+        assert_eq!(r.provider_name.as_deref(), Some("openai"));
+        assert_eq!(provider_name_for_adapter("OpenAIResp"), Some("openai"));
+    }
+
+    #[test]
+    fn duplicate_model_names_resolve_deterministically() {
+        let shared = "acme/shared-model";
+
+        // Direct provider beats OpenRouter when both are enabled.
+        let router = router_for(vec![
+            (
+                "openai",
+                routed_provider(shared, None, Some("http://vllm:8000/v1")),
+            ),
+            ("openrouter", routed_provider(shared, None, None)),
+        ]);
+        assert_eq!(
+            route(&router, shared).provider_name.as_deref(),
+            Some("openai")
+        );
+
+        // Enabled beats disabled.
+        let mut disabled = routed_provider(shared, None, Some("http://vllm:8000/v1"));
+        disabled.enabled = false;
+        let router = router_for(vec![
+            ("openai", disabled),
+            ("openrouter", routed_provider(shared, None, None)),
+        ]);
+        assert!(route(&router, shared).via_openrouter);
+    }
+
+    #[test]
+    fn configured_provider_auth_wins_over_adapter_default() {
+        let router = router_for(vec![(
+            "anthropic",
+            routed_provider("us.anthropic.claude-opus-4-7", None, None),
+        )]);
+        let r = route(&router, "us.anthropic.claude-opus-4-7");
+        // No base_url: the corrected adapter's default endpoint replaces the
+        // one genai picked for its (Ollama) guess.
+        assert_eq!(
+            r.endpoint_override.as_deref(),
+            Some("https://api.anthropic.com/v1/")
+        );
+        assert_key(router.auth(&r), "test-key");
+    }
+
+    #[tokio::test]
+    async fn default_base_urls_match_genai() {
+        // default_base_url() mirrors genai's crate-private endpoint table; a
+        // resolver-less client exposes those defaults.
+        let client = Client::default();
+        for model in [
+            "claude-haiku-4-5",
+            "gpt-5-nano",
+            "gpt-5-pro",
+            "gemini-3.5-flash",
+            "grok-4",
+            "qwen3:8b",
+        ] {
+            let target = client.resolve_service_target(model).await.unwrap();
+            assert_eq!(
+                default_base_url(target.model.adapter_kind),
+                Some(target.endpoint.base_url()),
+                "{model}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn genai_client_resolves_through_the_router() {
+        // End to end through genai's resolver pipeline (no network).
+        let config = config_with(vec![
+            (
+                "openai",
+                routed_provider(
+                    "Qwen/Qwen2.5-7B-Instruct",
+                    Some("gpt-5-pro"),
+                    Some("http://localhost:8000/v1"),
+                ),
+            ),
+            (
+                "ollama",
+                routed_provider("qwen3:8b", None, Some("http://localhost:11434")),
+            ),
+            ("openrouter", openrouter()),
+        ]);
+        let manager = ProviderManager::new(config, ModelTier::Fast).unwrap();
+
+        let target = manager
+            .client
+            .resolve_service_target("Qwen/Qwen2.5-7B-Instruct")
+            .await
+            .unwrap();
+        assert_eq!(target.model.adapter_kind, AdapterKind::OpenAI);
+        assert_eq!(target.endpoint.base_url(), "http://localhost:8000/v1/");
+        assert_key(Some(target.auth), "test-key");
+
+        let target = manager
+            .client
+            .resolve_service_target("gpt-5-pro")
+            .await
+            .unwrap();
+        assert_eq!(target.model.adapter_kind, AdapterKind::OpenAIResp);
+        assert_eq!(target.endpoint.base_url(), "http://localhost:8000/v1/");
+
+        let target = manager
+            .client
+            .resolve_service_target("qwen3:8b")
+            .await
+            .unwrap();
+        assert_eq!(target.model.adapter_kind, AdapterKind::Ollama);
+        assert_eq!(target.endpoint.base_url(), "http://localhost:11434/v1/");
+
+        let target = manager
+            .client
+            .resolve_service_target("anthropic/claude-opus-4-8")
+            .await
+            .unwrap();
+        assert_eq!(target.model.adapter_kind, AdapterKind::OpenAI);
+        assert_eq!(target.endpoint.base_url(), "https://openrouter.ai/api/v1/");
     }
 }

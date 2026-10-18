@@ -122,7 +122,7 @@ fn gen_ai_system_for(display_name: &str) -> &'static str {
 /// thrown away, and the usual oversized case (one huge `@file`/stdin message)
 /// still fits under the overall cap as valid JSON. Callers still pass the
 /// result through `content_attr`, which applies the overall cap (long chat
-/// histories) and the `LANGFUSE_CAPTURE_CONTENT` opt-out.
+/// histories) and the `AI_CLI_LANGFUSE_CAPTURE_CONTENT` opt-out.
 fn messages_to_json(messages: &[ChatMessage]) -> Option<String> {
     let parts: Vec<serde_json::Value> = messages
         .iter()

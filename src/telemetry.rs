@@ -1,11 +1,31 @@
 //! OpenTelemetry → Langfuse integration.
 //!
-//! Initialization is opt-in based on env vars: when LANGFUSE_HOST,
-//! LANGFUSE_PUBLIC_KEY, and LANGFUSE_SECRET_KEY are all set (and
-//! LANGFUSE_ENABLED is not "false"), spans created via
-//! `opentelemetry::global::tracer(TRACER_NAME)` are batched and exported
-//! over OTLP/HTTP to `<host>/api/public/otel/v1/traces` with HTTP basic
-//! auth derived from the project keys.
+//! Export is opt-in and configured by env vars (see [`resolve`]):
+//!
+//! - `AI_CLI_LANGFUSE_HOST`, `AI_CLI_LANGFUSE_PUBLIC_KEY` and
+//!   `AI_CLI_LANGFUSE_SECRET_KEY` name ai-cli's own Langfuse project. These
+//!   are the recommended settings. If any one of them is set, ai-cli uses
+//!   only these three and needs all of them: an incomplete set leaves
+//!   telemetry off and prints one warning naming the missing variable(s).
+//!   It never falls back to the generic keys in that case, because an
+//!   ai-cli host paired with generic keys (or the other way round) would
+//!   mix two projects.
+//! - Otherwise the generic `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY` and
+//!   `LANGFUSE_SECRET_KEY` are used when all three are set, for backward
+//!   compatibility. Other Langfuse-instrumented apps read these same names,
+//!   so in a shared shell they usually belong to another app's project, and
+//!   ai-cli's prompts (inlined `@file`s included) would land there.
+//! - `AI_CLI_LANGFUSE_ENABLED`, when set, overrides `LANGFUSE_ENABLED`; a
+//!   `false` (or `0`) turns telemetry off whichever keys are set. That is
+//!   the way to keep ai-cli out of another app's project without touching
+//!   the generic variables that app relies on.
+//!   `AI_CLI_LANGFUSE_CAPTURE_CONTENT` overrides `LANGFUSE_CAPTURE_CONTENT`
+//!   the same way.
+//!
+//! When enabled, spans created via `opentelemetry::global::tracer(TRACER_NAME)`
+//! are batched and exported over OTLP/HTTP to
+//! `<host>/api/public/otel/v1/traces` with HTTP basic auth derived from the
+//! project keys.
 //!
 //! Spans follow the GenAI semantic conventions
 //! (https://opentelemetry.io/docs/specs/semconv/gen-ai/) so Langfuse renders
@@ -13,7 +33,8 @@
 //!
 //! Prompt and answer text is attached to spans only through [`content_attr`],
 //! which caps each value at [`MAX_CONTENT_BYTES`] and returns `None` when the
-//! user opted out with `LANGFUSE_CAPTURE_CONTENT=false`.
+//! user opted out with `AI_CLI_LANGFUSE_CAPTURE_CONTENT=false` (or the
+//! generic `LANGFUSE_CAPTURE_CONTENT=false`).
 
 use base64::Engine;
 use opentelemetry::trace::TraceContextExt;
@@ -22,11 +43,38 @@ use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig, WithHttpConfi
 use opentelemetry_sdk::{runtime, trace::TracerProvider, Resource};
 use std::collections::HashMap;
 use std::env;
+use std::fmt;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Name used for the global tracer and as `service.name` in Langfuse.
 pub const TRACER_NAME: &str = "ai-cli";
+
+/// ai-cli's own Langfuse credentials (host, public key, secret key). They
+/// take precedence over [`GENERIC_KEYS`] and are never mixed with them.
+const AI_CLI_KEYS: [&str; 3] = [
+    "AI_CLI_LANGFUSE_HOST",
+    "AI_CLI_LANGFUSE_PUBLIC_KEY",
+    "AI_CLI_LANGFUSE_SECRET_KEY",
+];
+
+/// The generic Langfuse credentials, in the same order as [`AI_CLI_KEYS`].
+/// Langfuse SDKs in other apps read these same names, so they are only a
+/// backward-compatible fallback.
+const GENERIC_KEYS: [&str; 3] = [
+    "LANGFUSE_HOST",
+    "LANGFUSE_PUBLIC_KEY",
+    "LANGFUSE_SECRET_KEY",
+];
+
+/// Kill switch: the ai-cli name wins over the generic one when set.
+const ENABLED_SWITCH: (&str, &str) = ("AI_CLI_LANGFUSE_ENABLED", "LANGFUSE_ENABLED");
+
+/// Metadata-only switch: the ai-cli name wins over the generic one when set.
+const CAPTURE_CONTENT_SWITCH: (&str, &str) = (
+    "AI_CLI_LANGFUSE_CAPTURE_CONTENT",
+    "LANGFUSE_CAPTURE_CONTENT",
+);
 
 /// Upper bound (in bytes) on any single content attribute (prompt, message
 /// history, answer). Inputs can be huge — inlined `@file`s and up to 20 MB of
@@ -35,7 +83,7 @@ pub const TRACER_NAME: &str = "ai-cli";
 /// preview in Langfuse while staying far below typical request limits.
 pub const MAX_CONTENT_BYTES: usize = 32 * 1024;
 
-/// Cached result of reading `LANGFUSE_CAPTURE_CONTENT` (read once per process).
+/// Cached result of reading the content-capture switch (read once per process).
 static CAPTURE_CONTENT: OnceLock<bool> = OnceLock::new();
 
 /// Holds the provider so its background batch processor stays alive for the
@@ -52,26 +100,32 @@ pub struct InitInfo;
 
 /// Initialize OpenTelemetry export to Langfuse.
 ///
-/// Returns `Some(InitInfo)` if exporter was wired up; `None` if any required
-/// env var is missing or `LANGFUSE_ENABLED=false`. Errors during exporter
-/// construction return `None` rather than panicking — telemetry is a
-/// nice-to-have, not load-bearing, and we don't want a misconfigured
-/// endpoint to prevent the CLI from running. They are reported on stderr,
-/// though: the user configured Langfuse, so silently exporting nothing
-/// would be confusing.
+/// Returns `Some(InitInfo)` if exporter was wired up; `None` if no complete
+/// set of credentials is configured or telemetry is switched off (see
+/// [`resolve`] for the precedence rules). An incomplete `AI_CLI_LANGFUSE_*`
+/// set is reported on stderr, naming the missing variables but never any
+/// values. `main` calls this once per process, so that warning is printed
+/// once. Errors during exporter construction return `None` rather than
+/// panicking — telemetry is a nice-to-have, not load-bearing, and we don't
+/// want a misconfigured endpoint to prevent the CLI from running. They are
+/// reported on stderr, though: the user configured Langfuse, so silently
+/// exporting nothing would be confusing.
 pub fn init() -> Option<InitInfo> {
-    let host = non_empty_env("LANGFUSE_HOST")?;
-    let public = non_empty_env("LANGFUSE_PUBLIC_KEY")?;
-    let secret = non_empty_env("LANGFUSE_SECRET_KEY")?;
+    let creds = match resolve(process_env) {
+        Resolution::Export(creds) => creds,
+        Resolution::Off => return None,
+        Resolution::Incomplete(missing) => {
+            eprintln!("{}", incomplete_warning(&missing));
+            return None;
+        }
+    };
 
-    // Explicit kill switch wins over key presence.
-    if is_switched_off(env::var("LANGFUSE_ENABLED").ok().as_deref()) {
-        return None;
-    }
-
-    let endpoint = format!("{}/api/public/otel/v1/traces", host.trim_end_matches('/'));
-    let credentials =
-        base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", public, secret));
+    let endpoint = format!(
+        "{}/api/public/otel/v1/traces",
+        creds.host.trim_end_matches('/')
+    );
+    let credentials = base64::engine::general_purpose::STANDARD
+        .encode(format!("{}:{}", creds.public_key, creds.secret_key));
 
     let mut headers = HashMap::new();
     headers.insert(
@@ -108,8 +162,107 @@ pub fn init() -> Option<InitInfo> {
     global::set_tracer_provider(provider.clone());
     let _ = PROVIDER.set(provider);
 
-    let _ = host; // host is consumed via `endpoint` above
     Some(InitInfo)
+}
+
+/// Langfuse project credentials read from one consistent set of env vars.
+#[derive(PartialEq, Eq)]
+struct Credentials {
+    host: String,
+    public_key: String,
+    secret_key: String,
+}
+
+impl fmt::Debug for Credentials {
+    // The keys are secrets: never format them, not even in a failing test's
+    // assertion message.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credentials")
+            .field("host", &self.host)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What [`resolve`] decided from the environment.
+#[derive(Debug, PartialEq, Eq)]
+enum Resolution {
+    /// Export traces with these credentials.
+    Export(Credentials),
+    /// Telemetry off, nothing worth reporting: no credentials configured, an
+    /// incomplete generic set (quiet, as it always was), or switched off.
+    Off,
+    /// Telemetry off because only some of the `AI_CLI_LANGFUSE_*`
+    /// credentials are set. Holds the names (never the values) of the
+    /// missing ones, in [`AI_CLI_KEYS`] order.
+    Incomplete(Vec<&'static str>),
+}
+
+/// Decide whether and where to export, reading env vars through `env` so the
+/// precedence rules can be unit tested without mutating the process
+/// environment (tests run in parallel). Rules, in order:
+///
+/// 1. `AI_CLI_LANGFUSE_ENABLED` if set, else `LANGFUSE_ENABLED`: `false` or
+///    `0` turns telemetry off. This wins over any credentials and also
+///    silences the incomplete-set warning, since the user asked for none.
+/// 2. If any of [`AI_CLI_KEYS`] is set, use only those: all three set means
+///    export, otherwise [`Resolution::Incomplete`]. Never fall back to the
+///    generic keys here: mixing an ai-cli host with another project's keys
+///    (or the reverse) would send traces to the wrong project.
+/// 3. Otherwise use [`GENERIC_KEYS`] if all three are set.
+///
+/// An empty value counts as unset throughout.
+fn resolve(env: impl Fn(&str) -> Option<String>) -> Resolution {
+    if is_switched_off(switch_value(&env, ENABLED_SWITCH).as_deref()) {
+        return Resolution::Off;
+    }
+
+    let get = |name: &str| non_empty(env(name));
+    let ai_cli = AI_CLI_KEYS.iter().any(|&name| get(name).is_some());
+    let names = if ai_cli { AI_CLI_KEYS } else { GENERIC_KEYS };
+    match names.map(get) {
+        [Some(host), Some(public_key), Some(secret_key)] => Resolution::Export(Credentials {
+            host,
+            public_key,
+            secret_key,
+        }),
+        values if ai_cli => Resolution::Incomplete(
+            names
+                .into_iter()
+                .zip(values)
+                .filter(|(_, value)| value.is_none())
+                .map(|(name, _)| name)
+                .collect(),
+        ),
+        _ => Resolution::Off,
+    }
+}
+
+/// The one-line stderr warning for an incomplete `AI_CLI_LANGFUSE_*` set.
+/// Takes only variable names, so no value can end up in it.
+fn incomplete_warning(missing: &[&str]) -> String {
+    let verb = if missing.len() == 1 { "is" } else { "are" };
+    format!(
+        "[telemetry] disabled: {} {} not set. ai-cli needs all of {}, and \
+         doesn't fall back to LANGFUSE_* while any of them is set.",
+        missing.join(" and "),
+        verb,
+        AI_CLI_KEYS.join(", "),
+    )
+}
+
+/// Value of an on/off switch given as `(ai_cli_name, generic_name)`: the
+/// ai-cli variable when set (non-empty), else the generic one.
+fn switch_value(
+    env: &impl Fn(&str) -> Option<String>,
+    (ai_cli, generic): (&str, &str),
+) -> Option<String> {
+    non_empty(env(ai_cli)).or_else(|| env(generic))
+}
+
+/// The real process environment, in the shape [`resolve`] takes. A value
+/// that isn't valid Unicode counts as unset.
+fn process_env(name: &str) -> Option<String> {
+    env::var(name).ok()
 }
 
 /// Flush and shut down the tracer provider. Safe to call even if `init()`
@@ -159,11 +312,16 @@ fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 }
 
 /// Whether prompt/answer text may be attached to spans. On by default; set
-/// `LANGFUSE_CAPTURE_CONTENT=false` (or `0`) to export only metadata (model,
-/// token counts, timings, errors).
+/// `AI_CLI_LANGFUSE_CAPTURE_CONTENT=false` (or `0`) to export only metadata
+/// (model, token counts, timings, errors). The generic
+/// `LANGFUSE_CAPTURE_CONTENT` applies when the ai-cli one is unset.
 pub fn capture_content() -> bool {
-    *CAPTURE_CONTENT
-        .get_or_init(|| !is_switched_off(env::var("LANGFUSE_CAPTURE_CONTENT").ok().as_deref()))
+    *CAPTURE_CONTENT.get_or_init(|| capture_content_from(process_env))
+}
+
+/// Pure core of [`capture_content`], reading env vars through `env`.
+fn capture_content_from(env: impl Fn(&str) -> Option<String>) -> bool {
+    !is_switched_off(switch_value(&env, CAPTURE_CONTENT_SWITCH).as_deref())
 }
 
 /// Prepare prompt/answer text for use as a span attribute value. Returns
@@ -212,10 +370,6 @@ impl Drop for EndSpanOnDrop {
     fn drop(&mut self) {
         self.0.span().end();
     }
-}
-
-fn non_empty_env(name: &str) -> Option<String> {
-    non_empty(env::var(name).ok())
 }
 
 /// Treat an empty value the same as an unset one.
@@ -273,6 +427,257 @@ mod tests {
         }
         for on in [None, Some(""), Some("true"), Some("1"), Some("no")] {
             assert!(!is_switched_off(on), "{on:?} should leave it on");
+        }
+    }
+
+    mod env_precedence {
+        use super::*;
+
+        /// A fake environment for [`resolve`] / [`capture_content_from`]:
+        /// no `set_var`, so these tests can run in parallel safely.
+        fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+            let map: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            move |name: &str| map.get(name).cloned()
+        }
+
+        static GENERIC: [(&str, &str); 3] = [
+            ("LANGFUSE_HOST", "http://other-app.example"),
+            ("LANGFUSE_PUBLIC_KEY", "pk-lf-other-app"),
+            ("LANGFUSE_SECRET_KEY", "sk-lf-other-app"),
+        ];
+
+        static AI_CLI: [(&str, &str); 3] = [
+            ("AI_CLI_LANGFUSE_HOST", "http://ai-cli.example"),
+            ("AI_CLI_LANGFUSE_PUBLIC_KEY", "pk-lf-ai-cli"),
+            ("AI_CLI_LANGFUSE_SECRET_KEY", "sk-lf-ai-cli"),
+        ];
+
+        /// Env var name/value pairs.
+        type Vars = [(&'static str, &'static str)];
+
+        fn with(base: &Vars, extra: &Vars) -> Vec<(&'static str, &'static str)> {
+            base.iter().chain(extra).copied().collect()
+        }
+
+        fn creds(set: &[(&str, &str); 3]) -> Resolution {
+            Resolution::Export(Credentials {
+                host: set[0].1.to_string(),
+                public_key: set[1].1.to_string(),
+                secret_key: set[2].1.to_string(),
+            })
+        }
+
+        #[test]
+        fn nothing_set_is_quietly_off() {
+            assert_eq!(resolve(env(&[])), Resolution::Off);
+        }
+
+        #[test]
+        fn generic_trio_still_works_without_ai_cli_vars() {
+            assert_eq!(resolve(env(&GENERIC)), creds(&GENERIC));
+        }
+
+        #[test]
+        fn incomplete_generic_trio_is_quietly_off() {
+            // Backward compatible: a partial generic set never warned.
+            assert_eq!(resolve(env(&GENERIC[..2])), Resolution::Off);
+            assert_eq!(resolve(env(&GENERIC[1..])), Resolution::Off);
+        }
+
+        #[test]
+        fn ai_cli_trio_is_used_on_its_own() {
+            assert_eq!(resolve(env(&AI_CLI)), creds(&AI_CLI));
+        }
+
+        #[test]
+        fn ai_cli_trio_wins_over_generic_trio() {
+            let all = with(&GENERIC, &AI_CLI);
+            assert_eq!(resolve(env(&all)), creds(&AI_CLI));
+        }
+
+        #[test]
+        fn incomplete_ai_cli_trio_is_off_and_never_falls_back() {
+            // Each case has a complete generic trio that must NOT be used,
+            // neither whole nor filling in the missing ai-cli values.
+            let cases: [(&Vars, &[&str]); 4] = [
+                // ai-cli host with generic keys would mix projects.
+                (
+                    &AI_CLI[..1],
+                    &["AI_CLI_LANGFUSE_PUBLIC_KEY", "AI_CLI_LANGFUSE_SECRET_KEY"],
+                ),
+                // ai-cli keys with the generic host: the other way round.
+                (&AI_CLI[1..], &["AI_CLI_LANGFUSE_HOST"]),
+                (&AI_CLI[..2], &["AI_CLI_LANGFUSE_SECRET_KEY"]),
+                (
+                    &AI_CLI[2..],
+                    &["AI_CLI_LANGFUSE_HOST", "AI_CLI_LANGFUSE_PUBLIC_KEY"],
+                ),
+            ];
+            for (ai_cli, missing) in cases {
+                let got = resolve(env(&with(&GENERIC, ai_cli)));
+                assert_eq!(got, Resolution::Incomplete(missing.to_vec()), "{ai_cli:?}");
+                // Same without the generic trio around.
+                assert_eq!(
+                    resolve(env(ai_cli)),
+                    Resolution::Incomplete(missing.to_vec())
+                );
+            }
+        }
+
+        #[test]
+        fn empty_ai_cli_var_counts_as_unset() {
+            let vars = with(
+                &GENERIC,
+                &[
+                    ("AI_CLI_LANGFUSE_HOST", ""),
+                    ("AI_CLI_LANGFUSE_SECRET_KEY", ""),
+                ],
+            );
+            assert_eq!(resolve(env(&vars)), creds(&GENERIC));
+
+            // An empty value inside an otherwise-set ai-cli trio is missing.
+            let vars = with(&AI_CLI[..2], &[("AI_CLI_LANGFUSE_SECRET_KEY", "")]);
+            assert_eq!(
+                resolve(env(&vars)),
+                Resolution::Incomplete(vec!["AI_CLI_LANGFUSE_SECRET_KEY"])
+            );
+        }
+
+        #[test]
+        fn incomplete_warning_names_missing_vars_but_no_values() {
+            // Distinctive values in every credential var, ai-cli and generic.
+            let vars = [
+                ("AI_CLI_LANGFUSE_HOST", "http://sentinel-host-1.example"),
+                ("AI_CLI_LANGFUSE_PUBLIC_KEY", "pk-lf-sentinel-2"),
+                ("LANGFUSE_HOST", "http://sentinel-host-3.example"),
+                ("LANGFUSE_PUBLIC_KEY", "pk-lf-sentinel-4"),
+                ("LANGFUSE_SECRET_KEY", "sk-lf-sentinel-5"),
+            ];
+            let Resolution::Incomplete(missing) = resolve(env(&vars)) else {
+                panic!("expected an incomplete ai-cli trio");
+            };
+            let text = incomplete_warning(&missing);
+            assert!(
+                text.contains("AI_CLI_LANGFUSE_SECRET_KEY is not set"),
+                "{text}"
+            );
+            assert!(!text.contains('\n'), "one line: {text}");
+            for (_, value) in vars {
+                assert!(!text.contains(value), "warning leaks a value: {text}");
+            }
+            assert!(!text.contains("sentinel"), "warning leaks a value: {text}");
+
+            let two =
+                incomplete_warning(&["AI_CLI_LANGFUSE_PUBLIC_KEY", "AI_CLI_LANGFUSE_SECRET_KEY"]);
+            assert!(
+                two.contains(
+                    "AI_CLI_LANGFUSE_PUBLIC_KEY and AI_CLI_LANGFUSE_SECRET_KEY are not set"
+                ),
+                "{two}"
+            );
+        }
+
+        #[test]
+        fn credentials_debug_hides_keys() {
+            let Resolution::Export(c) = creds(&AI_CLI) else {
+                unreachable!()
+            };
+            let text = format!("{c:?}");
+            assert!(text.contains("http://ai-cli.example"), "{text}");
+            assert!(!text.contains("pk-lf-ai-cli"), "{text}");
+            assert!(!text.contains("sk-lf-ai-cli"), "{text}");
+        }
+
+        #[test]
+        fn ai_cli_enabled_false_switches_off_generic_trio() {
+            // The shared-shell opt-out: another app's LANGFUSE_* stay as
+            // they are, ai-cli exports nothing.
+            for off in ["false", "0"] {
+                let vars = with(&GENERIC, &[("AI_CLI_LANGFUSE_ENABLED", off)]);
+                assert_eq!(resolve(env(&vars)), Resolution::Off, "{off}");
+            }
+        }
+
+        #[test]
+        fn ai_cli_enabled_false_switches_off_ai_cli_trio() {
+            let vars = with(&AI_CLI, &[("AI_CLI_LANGFUSE_ENABLED", "false")]);
+            assert_eq!(resolve(env(&vars)), Resolution::Off);
+        }
+
+        #[test]
+        fn switched_off_incomplete_trio_does_not_warn() {
+            let vars = with(&AI_CLI[..1], &[("AI_CLI_LANGFUSE_ENABLED", "false")]);
+            assert_eq!(resolve(env(&vars)), Resolution::Off);
+        }
+
+        #[test]
+        fn generic_enabled_still_applies_when_ai_cli_enabled_unset() {
+            let off = with(&GENERIC, &[("LANGFUSE_ENABLED", "false")]);
+            assert_eq!(resolve(env(&off)), Resolution::Off);
+            // An empty ai-cli switch counts as unset.
+            let off = with(&off, &[("AI_CLI_LANGFUSE_ENABLED", "")]);
+            assert_eq!(resolve(env(&off)), Resolution::Off);
+            let off = with(&AI_CLI, &[("LANGFUSE_ENABLED", "0")]);
+            assert_eq!(resolve(env(&off)), Resolution::Off);
+        }
+
+        #[test]
+        fn ai_cli_enabled_overrides_generic_enabled() {
+            // Another app switched its own telemetry off; ai-cli's stays on.
+            let vars = with(
+                &AI_CLI,
+                &[
+                    ("LANGFUSE_ENABLED", "false"),
+                    ("AI_CLI_LANGFUSE_ENABLED", "true"),
+                ],
+            );
+            assert_eq!(resolve(env(&vars)), creds(&AI_CLI));
+            // And the other way round.
+            let vars = with(
+                &GENERIC,
+                &[
+                    ("LANGFUSE_ENABLED", "true"),
+                    ("AI_CLI_LANGFUSE_ENABLED", "false"),
+                ],
+            );
+            assert_eq!(resolve(env(&vars)), Resolution::Off);
+        }
+
+        #[test]
+        fn capture_content_is_on_by_default() {
+            assert!(capture_content_from(env(&[])));
+        }
+
+        #[test]
+        fn generic_capture_content_still_works() {
+            assert!(!capture_content_from(env(&[(
+                "LANGFUSE_CAPTURE_CONTENT",
+                "false"
+            )])));
+            // An empty ai-cli switch counts as unset.
+            assert!(!capture_content_from(env(&[
+                ("LANGFUSE_CAPTURE_CONTENT", "0"),
+                ("AI_CLI_LANGFUSE_CAPTURE_CONTENT", ""),
+            ])));
+        }
+
+        #[test]
+        fn ai_cli_capture_content_overrides_generic() {
+            assert!(!capture_content_from(env(&[(
+                "AI_CLI_LANGFUSE_CAPTURE_CONTENT",
+                "false"
+            )])));
+            assert!(!capture_content_from(env(&[
+                ("AI_CLI_LANGFUSE_CAPTURE_CONTENT", "false"),
+                ("LANGFUSE_CAPTURE_CONTENT", "true"),
+            ])));
+            assert!(capture_content_from(env(&[
+                ("AI_CLI_LANGFUSE_CAPTURE_CONTENT", "true"),
+                ("LANGFUSE_CAPTURE_CONTENT", "false"),
+            ])));
         }
     }
 

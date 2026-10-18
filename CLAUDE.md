@@ -66,9 +66,17 @@ API keys resolved via environment variables (ANTHROPIC_API_KEY, OPENAI_API_KEY, 
 ### Observability
 
 `src/telemetry.rs` initializes OpenTelemetry export to a self-hosted Langfuse
-when `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`, and `LANGFUSE_SECRET_KEY` are set
-(no-op otherwise; if they are set but the exporter fails to build, a one-line
-`[telemetry] disabled: <err>` goes to stderr). Each CLI invocation creates a
+when `AI_CLI_LANGFUSE_HOST`, `AI_CLI_LANGFUSE_PUBLIC_KEY`, and
+`AI_CLI_LANGFUSE_SECRET_KEY` are set (no-op otherwise; if they are set but the
+exporter fails to build, a one-line `[telemetry] disabled: <err>` goes to
+stderr). If any of that trio is set, only the trio is used: a partial trio
+leaves telemetry off with a one-line warning naming the missing vars (never
+values), and never falls back to the generic keys, which would mix projects.
+With none of it set, the generic `LANGFUSE_HOST`/`_PUBLIC_KEY`/`_SECRET_KEY`
+still work for backward compatibility, but other apps' Langfuse SDKs read
+those too, so prefer the `AI_CLI_` names in docs and examples. The precedence
+rules live in `telemetry::resolve`, which takes the env lookup as a closure so
+tests never mutate the process environment. Each CLI invocation creates a
 root `ai.query` span; each genai-routed provider call becomes a child
 `chat <PROVIDER>` GENERATION span carrying `gen_ai.*` semconv attributes plus
 `langfuse.observation.input/output`. Bedrock-routed calls
@@ -76,13 +84,16 @@ root `ai.query` span; each genai-routed provider call becomes a child
 span, so only the root `ai.query` span shows up for them. The trace name is the
 first 60 chars of the question. Service is identified as `service.name=ai-cli`
 so traces are filterable in shared Langfuse projects. Set
-`LANGFUSE_ENABLED=false` as a kill switch.
+`AI_CLI_LANGFUSE_ENABLED=false` as a kill switch; it overrides the generic
+`LANGFUSE_ENABLED` when set, so it also turns ai-cli off when the generic
+trio belongs to another app.
 
 Prompt/answer text (`langfuse.trace.input`, `langfuse.observation.input`,
 `langfuse.observation.output`) must go through `telemetry::content_attr`, which
 caps each value at 32 KiB (`MAX_CONTENT_BYTES`, cut on a char boundary with a
 `…[truncated N bytes]` marker) so an inlined `@file` or large piped stdin can't
-make the OTLP batch fail. Set `LANGFUSE_CAPTURE_CONTENT=false` (or `0`) to send
+make the OTLP batch fail. Set `AI_CLI_LANGFUSE_CAPTURE_CONTENT=false` (or `0`;
+overrides the generic `LANGFUSE_CAPTURE_CONTENT`) to send
 metadata only (model, token counts, timings, errors); the trace name then
 becomes a generic `query` so it doesn't leak the prompt either.
 

@@ -71,7 +71,7 @@ tokio-stream = "0.1"
 httpdate = "1"
 
 # Observability — OpenTelemetry traces shipped to a self-hosted Langfuse
-# via OTLP/HTTP. No-op when LANGFUSE_PUBLIC_KEY/SECRET_KEY are unset.
+# via OTLP/HTTP. No-op unless Langfuse keys are set (see src/telemetry.rs).
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client", "reqwest-rustls"] }

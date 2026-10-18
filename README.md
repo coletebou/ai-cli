@@ -159,15 +159,19 @@ max_delay_ms = 5000    # ceiling per attempt
 
 Traces can be exported over OpenTelemetry to a [Langfuse](https://langfuse.com) instance. It is off unless all three keys are set:
 
-| Env var                    | Meaning                                                        |
-|----------------------------|----------------------------------------------------------------|
-| `LANGFUSE_HOST`            | Base URL, e.g. `https://langfuse.example.com`                  |
-| `LANGFUSE_PUBLIC_KEY`      | Project public key                                             |
-| `LANGFUSE_SECRET_KEY`      | Project secret key                                             |
-| `LANGFUSE_ENABLED`         | `false` (or `0`) turns telemetry off even when keys are set    |
-| `LANGFUSE_CAPTURE_CONTENT` | `false` (or `0`) sends metadata only: no prompt or answer text |
+| Env var                           | Meaning                                                        |
+|-----------------------------------|----------------------------------------------------------------|
+| `AI_CLI_LANGFUSE_HOST`            | Base URL, e.g. `https://langfuse.example.com`                  |
+| `AI_CLI_LANGFUSE_PUBLIC_KEY`      | Project public key                                             |
+| `AI_CLI_LANGFUSE_SECRET_KEY`      | Project secret key                                             |
+| `AI_CLI_LANGFUSE_ENABLED`         | `false` (or `0`) turns telemetry off even when keys are set    |
+| `AI_CLI_LANGFUSE_CAPTURE_CONTENT` | `false` (or `0`) sends metadata only: no prompt or answer text |
 
-By default, traces include the question, message history and answers, and that includes any `@file` contents and piped stdin. Each text attribute is capped at 32 KiB and marked `…[truncated N bytes]`. With `LANGFUSE_CAPTURE_CONTENT=false`, only the model, token counts, timings and errors are sent. Calls to Bedrock-hosted models aren't traced yet.
+If any of the three `AI_CLI_LANGFUSE_*` keys is set, ai-cli uses only those and needs all three. When one is missing, telemetry stays off and ai-cli prints a warning naming it. It never borrows the missing value from the generic variables below, since that would mix two projects.
+
+If none of them is set, ai-cli falls back to the generic `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY`, as earlier versions did. Langfuse SDKs in other apps read those same names, so if they're set in your shell for another app, ai-cli's prompts land in that app's project. To keep ai-cli out of it without touching the other app's settings, set `AI_CLI_LANGFUSE_ENABLED=false`, or give ai-cli its own `AI_CLI_LANGFUSE_*` keys. `AI_CLI_LANGFUSE_ENABLED` and `AI_CLI_LANGFUSE_CAPTURE_CONTENT` override the generic `LANGFUSE_ENABLED` and `LANGFUSE_CAPTURE_CONTENT` when set.
+
+By default, traces include the question, message history and answers, and that includes any `@file` contents and piped stdin. Each text attribute is capped at 32 KiB and marked `…[truncated N bytes]`. With `AI_CLI_LANGFUSE_CAPTURE_CONTENT=false`, only the model, token counts, timings and errors are sent. Calls to Bedrock-hosted models aren't traced yet.
 
 ## Subcommands
 

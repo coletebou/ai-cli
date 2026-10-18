@@ -15,7 +15,7 @@ $ ai -w "latest release of tokio?"          # with web search
 - **Side-by-side TUI.** `-t` splits the terminal into per-provider panels with proper markdown rendering. Interactive by default: type follow-ups, scroll with the mouse wheel, cancel with Ctrl+C.
 - **Streaming by default.** Tokens appear as they arrive; no waiting for the full response.
 - **Web search tool use.** `-w` exposes a `web_search` tool to any model — backed by Gemini (Google Search grounding) or Tavily, with automatic fallback.
-- **Interactive chat.** `-i` keeps conversation history so you can ask follow-ups. `/clear`, `/history`, `/help` built in.
+- **Interactive chat.** `-i` keeps conversation history so you can ask follow-ups. It supports multi-line input, `@file` references and input history that persists across sessions. `/clear`, `/history`, `/export`, `/help` built in.
 - **Config-driven.** Edit `~/.config/ai-cli/config.toml` or run `ai config` for a TUI editor.
 - **Reasoning control.** `-r low|medium|high|<budget>` for models that support it.
 - **Raw mode.** `--raw` for pipeable output (good for scripts).
@@ -181,9 +181,12 @@ ai completions fish > ~/.config/fish/completions/ai.fish
 ## Interactive chat
 
 ```bash
-ai -i                    # start empty
-ai -i "initial question" # start with a seed question
+ai -i                               # start empty
+ai -i "initial question"            # start with a seed question
+cat error.log | ai -i "what broke?" # seed with piped input, then keep chatting
 ```
+
+With piped stdin, the piped content becomes part of the first question and chat keeps reading your replies from the terminal. Without a terminal (e.g. in CI), `-i` exits with an error; drop `-i` for a one-shot answer.
 
 Slash commands inside chat:
 
@@ -192,10 +195,19 @@ Slash commands inside chat:
 | `/exit`, `/q`          | Quit                                                      |
 | `/clear`, `/reset`     | Clear conversation history                                |
 | `/history`             | Print the full message history                            |
-| `/export [path.md]`    | Save conversation as markdown (auto-named if path omitted)|
+| `/export [path.md]`    | Save conversation as markdown. If you omit the path, it's auto-named `chat-<timestamp>.md` (with `-1`, `-2`… if taken). It never overwrites an existing file. |
+| `/export! <path.md>`   | Same, but replace the file if it exists                   |
 | `/help`                | Show available commands                                   |
 
-`Ctrl+D` exits. `Ctrl+C` cancels the current input line at the prompt, or aborts an in-flight streaming response mid-turn. History persists across turns; use `/clear` to reset.
+A line that starts with a path, such as `/etc/nginx/nginx.conf fails with …`, is sent as a message, not treated as a command. The export path may be quoted (`/export "my chat.md"`) and may start with `~/`.
+
+Input:
+
+- **Multi-line messages.** End a line with a single `\` and press Enter to continue on the next line. The continuation backslashes are removed when the message is sent. Pasting multi-line text keeps it as one message (bracketed paste); press Enter to send it.
+- **`@path` references** expand to the file's contents, the same as on the command line.
+- **Input history.** Up/Down recall earlier messages, including ones from previous sessions. They're saved in `<data dir>/ai-cli/chat_history.txt`: `~/.local/share` on Linux, `~/Library/Application Support` on macOS, `%APPDATA%` on Windows. The file keeps the last 1000 entries. On Linux and macOS it's readable only by you (mode 0600).
+
+`Ctrl+D` exits. At the prompt, `Ctrl+C` clears the current input line. During a reply, `Ctrl+C` stops the streaming response; press it again if the provider doesn't stop, and chat quits (exit code 130). The conversation persists across turns; use `/clear` to reset.
 
 Chat is single-provider — if multiple are configured, the first is used and the rest are noted as skipped.
 

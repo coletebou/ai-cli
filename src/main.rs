@@ -582,7 +582,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         } else {
             Some(question.clone())
         };
-        crate::chat::run_interactive(manager, provider, ctx, footer, initial).await?;
+        crate::chat::run_interactive(manager, provider, ctx, footer, initial, reasoning_str)
+            .await?;
         return Ok(ExitCode::SUCCESS);
     }
 

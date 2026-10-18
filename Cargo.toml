@@ -59,6 +59,9 @@ pulldown-cmark = "0.11"
 
 # Interactive chat mode — readline-style input editing with history
 rustyline = "14"
+# The file lock rustyline's history uses (already one of its dependencies),
+# so trimming the chat history file coordinates with other chat sessions.
+fd-lock = "4"
 
 # Async Streaming
 tokio-stream = "0.1"

@@ -14,6 +14,7 @@ mod query;
 mod retry;
 mod search;
 mod telemetry;
+mod term;
 mod ui;
 
 use anyhow::Result;

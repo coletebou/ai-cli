@@ -1,15 +1,10 @@
 use crate::providers::{Provider, ProviderManager};
 use crate::query::{stream_with_messages, QueryContext, StreamEvent};
 use anyhow::Result;
-use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseEventKind,
-    },
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
-use genai::chat::{ChatMessage, ChatRole};
+use genai::chat::{ChatMessage, ChatRole, ContentPart};
 use opentelemetry::trace::FutureExt;
 use opentelemetry::Context;
 use ratatui::{
@@ -23,7 +18,11 @@ use ratatui::{
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Three lines per wheel tick — single-line feels sluggish, half-page feels too
 /// jumpy. Matches most terminal pagers.
@@ -34,6 +33,10 @@ const MOUSE_SCROLL_STEP: u16 = 3;
 /// seconds. If it does saturate, we show a status message rather than blocking
 /// the UI thread.
 const PANEL_INPUT_CAPACITY: usize = 8;
+
+/// Tabs are drawn as this many spaces. ratatui counts `\t` as one column but
+/// terminals jump to the next tab stop, which garbles panel layout.
+const TAB_WIDTH: usize = 4;
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum Mode {
@@ -83,6 +86,10 @@ pub struct PanelState {
     /// on `Done`/`Error`.
     pub current_text: String,
     pub is_streaming: bool,
+    /// A turn abandoned by `/clear` is still winding down in the panel task.
+    /// Its remaining events are discarded until its closing `Done`/`Error`
+    /// arrives, so they can't leak into the next turn.
+    pub draining: bool,
     pub scroll_offset: u16,
     pub content_height: u16,
     pub visible_height: u16,
@@ -104,6 +111,7 @@ impl PanelState {
             turns: Vec::new(),
             current_text: String::new(),
             is_streaming: false,
+            draining: false,
             scroll_offset: 0,
             content_height: 0,
             visible_height: 0,
@@ -114,6 +122,12 @@ impl PanelState {
 
     pub fn max_scroll(&self) -> u16 {
         self.content_height.saturating_sub(self.visible_height)
+    }
+
+    /// Busy means a request is still running in the panel task, whether or
+    /// not the UI still cares about its output.
+    fn is_busy(&self) -> bool {
+        self.is_streaming || self.draining
     }
 
     pub fn get_color(&self) -> Color {
@@ -133,10 +147,17 @@ impl PanelState {
 pub struct App {
     panels: Vec<PanelState>,
     senders: Vec<mpsc::Sender<PanelCommand>>,
+    /// Panel worker tasks, index-aligned with `panels`. Watched so a task
+    /// that dies (e.g. panics) doesn't leave its panel "streaming" forever,
+    /// and aborted on exit. Empty in unit tests.
+    tasks: Vec<JoinHandle<()>>,
     selected_panel: usize,
     show_tokens: bool,
     mode: Mode,
     input_buffer: String,
+    /// Byte offset of the cursor in `input_buffer`; always on a grapheme
+    /// boundary.
+    input_cursor: usize,
     should_quit: bool,
     /// Ephemeral one-line hint (e.g., "busy", "cleared") shown in the footer
     /// until the next key event or turn completion.
@@ -155,20 +176,31 @@ impl App {
         App {
             panels,
             senders,
+            tasks: Vec::new(),
             selected_panel: 0,
             show_tokens,
             // Default to Insert so typing works immediately, like Claude Code.
             // Power users can press Esc once to drop into Normal for vim nav.
             mode: Mode::Insert,
             input_buffer: String::new(),
+            input_cursor: 0,
             should_quit: false,
             status_message: None,
             current_turn_cancel: None,
         }
     }
 
+    /// A turn is visibly in progress: Esc/Ctrl+C should cancel it rather
+    /// than quit or clear the input line.
     fn any_streaming(&self) -> bool {
         self.panels.iter().any(|p| p.is_streaming)
+    }
+
+    /// Some panel's worker is still running a request — including one
+    /// abandoned by `/clear` that is winding down. New turns must wait, but
+    /// there's nothing left for Esc/Ctrl+C to cancel.
+    fn any_busy(&self) -> bool {
+        self.panels.iter().any(PanelState::is_busy)
     }
 
     fn find_panel_mut(&mut self, display_name: &str) -> Option<&mut PanelState> {
@@ -181,12 +213,16 @@ impl App {
         match event {
             StreamEvent::Start { provider, model } => {
                 if let Some(p) = self.find_panel_mut(&provider) {
-                    p.model = model;
+                    if !p.draining {
+                        p.model = model;
+                    }
                 }
             }
             StreamEvent::Chunk { provider, text } => {
                 if let Some(p) = self.find_panel_mut(&provider) {
-                    p.current_text.push_str(&text);
+                    if p.is_streaming {
+                        p.current_text.push_str(&text);
+                    }
                 }
             }
             StreamEvent::Done {
@@ -197,17 +233,22 @@ impl App {
                 duration_ms,
             } => {
                 if let Some(p) = self.find_panel_mut(&provider) {
-                    p.model = model;
-                    let text = std::mem::take(&mut p.current_text);
-                    p.turns.push(Turn {
-                        kind: TurnKind::Assistant {
-                            input_tokens,
-                            output_tokens,
-                            duration_ms,
-                        },
-                        text,
-                    });
-                    p.is_streaming = false;
+                    if p.draining {
+                        // The abandoned turn has finished; nothing to record.
+                        p.draining = false;
+                    } else if p.is_streaming {
+                        p.model = model;
+                        let text = std::mem::take(&mut p.current_text);
+                        p.turns.push(Turn {
+                            kind: TurnKind::Assistant {
+                                input_tokens,
+                                output_tokens,
+                                duration_ms,
+                            },
+                            text,
+                        });
+                        p.is_streaming = false;
+                    }
                 }
                 self.maybe_clear_turn_cancel();
             }
@@ -218,28 +259,29 @@ impl App {
                 ..
             } => {
                 if let Some(p) = self.find_panel_mut(&provider) {
-                    // Drop any partial streamed text — it's incomplete and
-                    // mixing it into an "error" turn is misleading.
-                    p.current_text.clear();
-                    let dur = if duration_ms >= 1000 {
-                        format!("{:.1}s", duration_ms as f64 / 1000.0)
-                    } else {
-                        format!("{}ms", duration_ms)
-                    };
-                    p.turns.push(Turn {
-                        kind: TurnKind::Error,
-                        text: format!("{} ({})", error, dur),
-                    });
-                    p.is_streaming = false;
+                    if p.draining {
+                        p.draining = false;
+                    } else if p.is_streaming {
+                        // Drop any partial streamed text — it's incomplete and
+                        // mixing it into an "error" turn is misleading.
+                        p.current_text.clear();
+                        p.turns.push(Turn {
+                            kind: TurnKind::Error,
+                            text: format!("{} ({})", error, format_duration(duration_ms)),
+                        });
+                        p.is_streaming = false;
+                    }
                 }
                 self.maybe_clear_turn_cancel();
             }
             StreamEvent::SearchStart { provider, query } => {
                 if let Some(p) = self.find_panel_mut(&provider) {
-                    // Appears inline in the streaming text; italic markdown so
-                    // the markdown renderer styles it distinctly.
-                    p.current_text
-                        .push_str(&format!("\n*→ searching: {}*\n\n", query));
+                    if p.is_streaming {
+                        // Appears inline in the streaming text; italic markdown
+                        // so the markdown renderer styles it distinctly.
+                        p.current_text
+                            .push_str(&format!("\n\n*→ searching: {}*\n\n", query.trim()));
+                    }
                 }
             }
             StreamEvent::SearchEnd {
@@ -250,10 +292,13 @@ impl App {
                 ..
             } => {
                 if let Some(p) = self.find_panel_mut(&provider) {
+                    if !p.is_streaming {
+                        return;
+                    }
                     match error {
                         Some(err) => p
                             .current_text
-                            .push_str(&format!("*← search failed: {}*\n\n", err)),
+                            .push_str(&format!("*← search failed: {}*\n\n", err.trim())),
                         None => p.current_text.push_str(&format!(
                             "*← via {}: {} result(s)*\n\n",
                             search_provider, result_count
@@ -267,21 +312,25 @@ impl App {
     /// Clear the shared cancel token once every panel has finished streaming,
     /// so the next Ctrl+C doesn't no-op against a stale token.
     fn maybe_clear_turn_cancel(&mut self) {
-        if !self.any_streaming() {
+        if !self.any_busy() {
             self.current_turn_cancel = None;
         }
     }
 
-    fn submit_turn(&mut self, question: String) {
-        if self.any_streaming() {
+    /// Send `question` to every panel. Returns false (and leaves the input
+    /// alone for the caller) if a turn is still in flight or no panel could
+    /// take it.
+    fn submit_turn(&mut self, question: String) -> bool {
+        if self.any_busy() {
             self.status_message = Some("busy — wait for current turn to finish".into());
-            return;
+            return false;
         }
         if self.senders.is_empty() {
-            return;
+            return false;
         }
         let cancel = CancellationToken::new();
         self.current_turn_cancel = Some(cancel.clone());
+        let mut accepted = 0usize;
         for (i, tx) in self.senders.iter().enumerate() {
             let panel = &mut self.panels[i];
             panel.turns.push(Turn {
@@ -293,23 +342,32 @@ impl App {
             panel.auto_scroll = true;
             // try_send is non-blocking; if the queue is somehow full (capacity
             // hit) we surface it to the user rather than stalling the UI loop.
-            if tx
-                .try_send(PanelCommand::Ask {
-                    question: question.clone(),
-                    cancel: cancel.clone(),
-                })
-                .is_err()
-            {
+            if let Err(e) = tx.try_send(PanelCommand::Ask {
+                question: question.clone(),
+                cancel: cancel.clone(),
+            }) {
                 panel.is_streaming = false;
                 // Roll back the user turn we just added so the history doesn't
                 // show a question that will never be answered.
                 panel.turns.pop();
+                let reason = match e {
+                    TrySendError::Full(_) => "input queue full",
+                    TrySendError::Closed(_) => "its worker stopped",
+                };
                 self.status_message = Some(format!(
-                    "{} is unavailable (input queue full)",
-                    panel.provider.display_name
+                    "{} is unavailable ({})",
+                    panel.provider.display_name, reason
                 ));
+            } else {
+                accepted += 1;
             }
         }
+        if accepted == 0 {
+            // Nothing will answer: keep the question in the input box.
+            self.current_turn_cancel = None;
+            return false;
+        }
+        true
     }
 
     fn cancel_current_turn(&mut self) {
@@ -319,11 +377,18 @@ impl App {
     }
 
     fn clear_all_panels(&mut self) {
+        // Stop any in-flight turn first: otherwise it keeps streaming (and
+        // billing) with no way to cancel it, and its late events would land
+        // in the freshly cleared panels.
+        self.cancel_current_turn();
         for (i, tx) in self.senders.iter().enumerate() {
             // Fire-and-forget: if the receiver is gone the task is ending
             // anyway, and the visible state is reset regardless.
             let _ = tx.try_send(PanelCommand::Clear);
             let p = &mut self.panels[i];
+            if p.is_streaming {
+                p.draining = true;
+            }
             p.turns.clear();
             p.current_text.clear();
             p.is_streaming = false;
@@ -332,6 +397,37 @@ impl App {
         }
         self.current_turn_cancel = None;
         self.status_message = Some("cleared".into());
+    }
+
+    /// Notice panel tasks that ended on their own (a panic in the request
+    /// path) so their panels don't sit at "streaming..." forever. Returns
+    /// true if anything changed.
+    fn reap_dead_tasks(&mut self) -> bool {
+        let mut changed = false;
+        for (i, task) in self.tasks.iter().enumerate() {
+            let Some(panel) = self.panels.get_mut(i) else {
+                continue;
+            };
+            if task.is_finished() && panel.is_busy() {
+                let was_streaming = panel.is_streaming;
+                panel.is_streaming = false;
+                panel.draining = false;
+                panel.current_text.clear();
+                if was_streaming {
+                    panel.turns.push(Turn {
+                        kind: TurnKind::Error,
+                        text: "this panel's worker stopped unexpectedly \
+                               (details are printed after you quit)"
+                            .into(),
+                    });
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            self.maybe_clear_turn_cancel();
+        }
+        changed
     }
 
     fn next_panel(&mut self) {
@@ -358,6 +454,17 @@ impl App {
         }
     }
 
+    fn page_scroll(&mut self, direction: i32) {
+        let idx = self.selected_panel;
+        let page = self
+            .panels
+            .get(idx)
+            .map(|p| p.visible_height.saturating_sub(1) as i32)
+            .unwrap_or(10)
+            .max(1);
+        self.scroll_by(idx, direction * page);
+    }
+
     /// Locate which panel (if any) contains the given screen coordinate, based
     /// on the area each panel recorded on its last draw.
     fn panel_at(&self, col: u16, row: u16) -> Option<usize> {
@@ -374,6 +481,135 @@ impl App {
         }
         None
     }
+
+    // ── Input line editing ────────────────────────────────────────────────
+
+    fn insert_text(&mut self, text: &str) {
+        self.input_buffer.insert_str(self.input_cursor, text);
+        self.input_cursor += text.len();
+    }
+
+    fn clear_input(&mut self) {
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+    }
+
+    fn cursor_left(&mut self) {
+        self.input_cursor = prev_grapheme_boundary(&self.input_buffer, self.input_cursor);
+    }
+
+    fn cursor_right(&mut self) {
+        self.input_cursor = next_grapheme_boundary(&self.input_buffer, self.input_cursor);
+    }
+
+    /// Delete the grapheme before the cursor — a whole flag/ZWJ emoji or
+    /// accented letter, not just its last code point.
+    fn backspace(&mut self) {
+        let start = prev_grapheme_boundary(&self.input_buffer, self.input_cursor);
+        self.input_buffer.drain(start..self.input_cursor);
+        self.input_cursor = start;
+    }
+
+    fn delete_forward(&mut self) {
+        let end = next_grapheme_boundary(&self.input_buffer, self.input_cursor);
+        self.input_buffer.drain(self.input_cursor..end);
+    }
+
+    /// Ctrl+W: delete the word (and any whitespace) before the cursor.
+    fn delete_word_back(&mut self) {
+        let before = &self.input_buffer[..self.input_cursor];
+        let trimmed = before.trim_end();
+        let start = trimmed
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        self.input_buffer.drain(start..self.input_cursor);
+        self.input_cursor = start;
+    }
+}
+
+fn prev_grapheme_boundary(s: &str, idx: usize) -> usize {
+    s[..idx]
+        .grapheme_indices(true)
+        .next_back()
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+fn next_grapheme_boundary(s: &str, idx: usize) -> usize {
+    s[idx..]
+        .graphemes(true)
+        .next()
+        .map(|g| idx + g.len())
+        .unwrap_or(idx)
+}
+
+fn format_duration(duration_ms: u64) -> String {
+    if duration_ms >= 1000 {
+        format!("{:.1}s", duration_ms as f64 / 1000.0)
+    } else {
+        format!("{}ms", duration_ms)
+    }
+}
+
+fn expand_tabs(s: &str) -> String {
+    s.replace('\t', &" ".repeat(TAB_WIDTH))
+}
+
+/// Single-line rendering of the input buffer: newlines from a multi-line
+/// paste show as `↵` (they're still sent as real newlines) and tabs as
+/// spaces.
+fn input_display(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\n' => "↵".to_string(),
+            '\t' => " ".repeat(TAB_WIDTH),
+            '\r' => String::new(),
+            c => c.to_string(),
+        })
+        .collect()
+}
+
+/// Visible text and cursor column for a one-row input box `width` columns
+/// wide: keeps the cursor visible with the text scrolling left under it once
+/// the line is longer than the box.
+///
+/// The window is sliced here rather than handed to `Paragraph::scroll`,
+/// whose offset is a `u16`: a paste wider than 65,535 columns would wrap the
+/// offset and show an unrelated part of the buffer while the cursor kept
+/// editing the end of it.
+fn input_viewport(buffer: &str, cursor: usize, width: usize) -> (String, u16) {
+    if width == 0 {
+        return (String::new(), 0);
+    }
+    let cursor_col = input_display(&buffer[..cursor]).width();
+    let offset = cursor_col.saturating_sub(width - 1);
+    let mut visible = String::new();
+    // Display column where the current grapheme starts.
+    let mut col = 0;
+    for g in input_display(buffer).graphemes(true) {
+        let end = col + g.width();
+        if end <= offset {
+            col = end;
+            continue;
+        }
+        if end - offset > width {
+            break;
+        }
+        if col < offset {
+            // A wide glyph straddling the left edge: blank its visible half
+            // so everything after it stays aligned with the cursor.
+            visible.push_str(&" ".repeat(end - offset));
+        } else {
+            visible.push_str(g);
+        }
+        col = end;
+    }
+    // `cursor_col - offset` is at most `width - 1`, and `width` came from a
+    // u16 area, so this never truncates.
+    (visible, (cursor_col - offset) as u16)
 }
 
 /// Render one completed turn or the in-flight streaming text as a block of
@@ -390,7 +626,7 @@ fn lines_for_turn(turn: &Turn, panel_color: Color, show_tokens: bool) -> Vec<Lin
                     .add_modifier(Modifier::BOLD),
             ));
             for l in turn.text.lines() {
-                out.push(Line::from(format!("  {}", l)));
+                out.push(Line::from(format!("  {}", expand_tabs(l))));
             }
         }
         TurnKind::Assistant {
@@ -411,12 +647,7 @@ fn lines_for_turn(turn: &Turn, panel_color: Color, show_tokens: bool) -> Vec<Lin
                     stats.push(format!("{} in / {} out", i, o));
                 }
             }
-            let dur = if *duration_ms >= 1000 {
-                format!("{:.1}s", *duration_ms as f64 / 1000.0)
-            } else {
-                format!("{}ms", duration_ms)
-            };
-            stats.push(dur);
+            stats.push(format_duration(*duration_ms));
             out.push(Line::styled(
                 stats.join(" | "),
                 Style::default().fg(Color::DarkGray),
@@ -427,10 +658,14 @@ fn lines_for_turn(turn: &Turn, panel_color: Color, show_tokens: bool) -> Vec<Lin
                 "error".to_string(),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ));
-            out.push(Line::styled(
-                turn.text.clone(),
-                Style::default().fg(Color::Red),
-            ));
+            // One Line per text line: a Line renders its content on a
+            // single row, so embedded newlines would otherwise run together.
+            for l in turn.text.lines() {
+                out.push(Line::styled(
+                    expand_tabs(l),
+                    Style::default().fg(Color::Red),
+                ));
+            }
         }
     }
     out.push(Line::from(""));
@@ -454,7 +689,10 @@ fn draw_panel(
     } else {
         "idle"
     };
-    let title_text = format!(" {} [{}] ", panel.provider.display_name, status);
+    let title_text = format!(
+        " {} · {} [{}] ",
+        panel.provider.display_name, panel.model, status
+    );
 
     // Bold alone is unreliable here: box-drawing glyphs don't always render
     // visibly heavier under the ANSI bold attribute, which is why the old
@@ -505,20 +743,15 @@ fn draw_panel(
         }
     }
 
-    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_width = area.width.saturating_sub(2);
     let inner_height = area.height.saturating_sub(2);
 
-    let mut total_lines: u16 = 0;
-    for line in &lines {
-        let line_len = line.width();
-        if inner_width > 0 && line_len > 0 {
-            total_lines = total_lines.saturating_add(line_len.div_ceil(inner_width) as u16);
-        } else {
-            total_lines = total_lines.saturating_add(1);
-        }
-    }
-
-    panel.content_height = total_lines;
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // Ask the paragraph itself how many rows it wraps to. Estimating with
+    // `ceil(line_width / inner_width)` undercounts word-wrapped prose, which
+    // left the tail of long answers unreachable (auto-scroll stopped short).
+    let total_lines = paragraph.line_count(inner_width);
+    panel.content_height = u16::try_from(total_lines).unwrap_or(u16::MAX);
     panel.visible_height = inner_height;
 
     let max_scroll = panel.max_scroll();
@@ -530,10 +763,7 @@ fn draw_panel(
         panel.scroll_offset = max_scroll;
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((panel.scroll_offset, 0));
+    let paragraph = paragraph.block(block).scroll((panel.scroll_offset, 0));
 
     frame.render_widget(paragraph, area);
 }
@@ -567,8 +797,8 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         }
     }
 
-    // Input box. In Insert mode we show a real cursor position inside the
-    // block; in Normal mode the buffer still displays but no cursor is drawn.
+    // Input box: one row that scrolls horizontally to keep the cursor in
+    // view. In Normal mode the buffer still displays but no cursor is drawn.
     let input_area = main_layout[1];
     let (input_title, input_style) = match app.mode {
         Mode::Insert => (
@@ -588,25 +818,14 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         .borders(Borders::ALL)
         .title(input_title)
         .border_style(input_style);
-    let input_paragraph = Paragraph::new(app.input_buffer.as_str())
-        .block(input_block)
-        .wrap(Wrap { trim: false });
+    let inner_width = input_area.width.saturating_sub(2) as usize;
+    let (visible_input, cursor_col) =
+        input_viewport(&app.input_buffer, app.input_cursor, inner_width);
+    let input_paragraph = Paragraph::new(visible_input).block(input_block);
     frame.render_widget(input_paragraph, input_area);
 
     if app.mode == Mode::Insert {
-        // Inner height of the input box is 1 row; clamp the cursor to that row
-        // so wrapped buffers don't push it onto the bottom border or footer.
-        // Width measured in Unicode columns so multi-byte chars don't drift.
-        let inner_width = input_area.width.saturating_sub(2) as usize;
-        let buf_width = unicode_display_width(&app.input_buffer);
-        let visible_col = if inner_width == 0 {
-            0
-        } else {
-            buf_width % inner_width
-        };
-        let cx = input_area.x + 1 + visible_col as u16;
-        let cy = input_area.y + 1;
-        frame.set_cursor_position((cx, cy));
+        frame.set_cursor_position((input_area.x + 1 + cursor_col, input_area.y + 1));
     }
 
     // Footer: mode-appropriate keybind hint, or a transient status message.
@@ -615,7 +834,8 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     } else {
         match app.mode {
             Mode::Insert => {
-                "Esc: normal | Enter: send | Ctrl+C: cancel turn | /clear /exit".to_string()
+                "Esc: normal | Enter: send | Ctrl+C: cancel turn | PgUp/PgDn: scroll | /clear /exit"
+                    .to_string()
             }
             Mode::Normal => {
                 "i: insert | h/l or ←/→: select panel | j/k or ↑/↓: scroll | q: quit".to_string()
@@ -626,17 +846,38 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     frame.render_widget(footer, main_layout[2]);
 }
 
-/// Unicode display width — counts columns, not bytes, so multi-byte and
-/// wide characters don't desync the cursor. `Line::width` from ratatui does
-/// the same thing for styled lines; we use it here for the raw input buffer.
-fn unicode_display_width(s: &str) -> usize {
-    use ratatui::text::Text;
-    Text::from(s.to_string()).width()
+/// Give panels distinct display names. Stream events are routed to panels
+/// by name, so two providers sharing a first alias would otherwise both feed
+/// the first panel and leave the second "streaming" forever.
+///
+/// The first provider with a name keeps it; later ones get the lowest free
+/// ` (n)` suffix. Every configured name is reserved up front so a generated
+/// name can't collide with one a later provider was configured with (aliases
+/// `X`, `X`, `X (2)` become `X`, `X (3)`, `X (2)`).
+fn dedupe_display_names(providers: &mut [Provider]) {
+    use std::collections::HashSet;
+    let configured: HashSet<String> = providers.iter().map(|p| p.display_name.clone()).collect();
+    let mut taken: HashSet<String> = HashSet::new();
+    for p in providers.iter_mut() {
+        if taken.insert(p.display_name.clone()) {
+            continue;
+        }
+        let mut n = 2;
+        let unique = loop {
+            let name = format!("{} ({})", p.display_name, n);
+            if !configured.contains(&name) && !taken.contains(&name) {
+                break name;
+            }
+            n += 1;
+        };
+        taken.insert(unique.clone());
+        p.display_name = unique;
+    }
 }
 
 pub async fn run_tui(
     manager: Arc<ProviderManager>,
-    providers: Vec<Provider>,
+    mut providers: Vec<Provider>,
     ctx: QueryContext,
     initial_question: &str,
     show_tokens: bool,
@@ -648,12 +889,15 @@ pub async fn run_tui(
         );
     }
 
+    dedupe_display_names(&mut providers);
+
     // Spawn a task per panel; each owns its own history and listens on its
     // own mpsc<PanelCommand>. Stream events from all panels fan in to a
     // shared event channel the UI consumes.
     let (event_tx, event_rx) = mpsc::channel::<StreamEvent>(100);
     let mut senders: Vec<mpsc::Sender<PanelCommand>> = Vec::with_capacity(providers.len());
     let mut panels: Vec<PanelState> = Vec::with_capacity(providers.len());
+    let mut tasks: Vec<JoinHandle<()>> = Vec::with_capacity(providers.len());
 
     // tokio::spawn does not propagate the OTel Context, so spans created inside
     // panel_task would otherwise become orphan roots in Langfuse instead of
@@ -671,50 +915,69 @@ pub async fn run_tui(
         let task_ctx = ctx.clone();
         let task_event_tx = event_tx.clone();
         let task_cx = parent_cx.clone();
-        tokio::spawn(
+        // Handles are kept on the App: watched for unexpected exits and
+        // aborted on quit.
+        tasks.push(tokio::spawn(
             async move {
-                // DETACH: cmd_rx closes when App drops its senders at the end
-                // of run_tui, which terminates panel_task's while-let loop.
-                // Any in-flight stream_with_messages is abandoned; callers
-                // wanting graceful shutdown must invoke cancel_current_turn()
-                // and let the CancellationToken unwind the stream before
-                // dropping the App.
                 panel_task(task_manager, task_provider, task_ctx, cmd_rx, task_event_tx).await;
             }
             .with_context(task_cx),
-        );
+        ));
     }
     drop(event_tx); // only panel tasks should hold senders; drop our copy
 
     // Retry notices and auth warnings would print over the alternate screen;
     // hold them until the terminal is restored.
     crate::diag::defer();
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let result = {
+        // The guard restores the terminal on every exit path from this
+        // block, including `?` and panics.
+        let guard = crate::term::TerminalGuard::enter(true);
+        match guard {
+            Ok(_guard) => {
+                let mut app = App::new(panels, senders, show_tokens);
+                app.tasks = tasks;
 
-    let mut app = App::new(panels, senders, show_tokens);
+                // Seed the first turn with the CLI-provided question, if any.
+                let initial = initial_question.trim();
+                if !initial.is_empty() {
+                    app.submit_turn(initial.to_string());
+                }
 
-    // Seed the first turn with the CLI-provided question, if any.
-    let initial = initial_question.trim();
-    if !initial.is_empty() {
-        app.submit_turn(initial.to_string());
-    }
+                let result = match Terminal::new(CrosstermBackend::new(io::stdout())) {
+                    Ok(mut terminal) => run_main_loop(&mut terminal, &mut app, event_rx).await,
+                    Err(e) => Err(e.into()),
+                };
 
-    let result = run_main_loop(&mut terminal, &mut app, event_rx).await;
-
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
+                // Stop in-flight requests instead of abandoning them to run
+                // (and bill) in the background while the process exits.
+                app.cancel_current_turn();
+                for task in &app.tasks {
+                    task.abort();
+                }
+                result
+            }
+            Err(e) => Err(e.into()),
+        }
+    };
     crate::diag::flush();
 
     result
+}
+
+/// True when `messages` ends with a completed assistant reply (text, no
+/// pending tool calls) — i.e. `stream_with_messages` succeeded.
+fn ends_with_final_reply(messages: &[ChatMessage]) -> bool {
+    let Some(last) = messages.last() else {
+        return false;
+    };
+    matches!(last.role, ChatRole::Assistant)
+        && !last
+            .content
+            .parts()
+            .iter()
+            .any(|p| matches!(p, ContentPart::ToolCall(_)))
+        && !last.content.texts().join("").is_empty()
 }
 
 /// Long-lived per-panel worker. Owns a private `Vec<ChatMessage>` including
@@ -737,10 +1000,7 @@ async fn panel_task(
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             PanelCommand::Ask { question, cancel } => {
-                let pre_assistant_count = messages
-                    .iter()
-                    .filter(|m| matches!(m.role, ChatRole::Assistant))
-                    .count();
+                let pre_turn_len = messages.len();
                 messages.push(ChatMessage::user(question));
                 let enriched = stream_with_messages(
                     &manager,
@@ -751,17 +1011,14 @@ async fn panel_task(
                     &cancel,
                 )
                 .await;
-                let post_assistant_count = enriched
-                    .iter()
-                    .filter(|m| matches!(m.role, ChatRole::Assistant))
-                    .count();
-                if post_assistant_count > pre_assistant_count {
+                if ends_with_final_reply(&enriched) {
                     messages = enriched;
                 } else {
-                    // No new assistant message was persisted — error or
-                    // cancel. Roll back the user turn so a retry doesn't
-                    // double-stack duplicated user messages.
-                    messages.pop();
+                    // Error or cancel. Roll back to where the turn started:
+                    // besides the user message this drops any half-finished
+                    // tool exchange (assistant tool-call + tool results),
+                    // which would otherwise corrupt every later turn.
+                    messages.truncate(pre_turn_len);
                 }
             }
             PanelCommand::Clear => {
@@ -776,8 +1033,14 @@ async fn run_main_loop(
     app: &mut App,
     mut event_rx: mpsc::Receiver<StreamEvent>,
 ) -> Result<()> {
+    // Only redraw when something changed. Redrawing re-parses every panel's
+    // markdown, so doing it on a fixed 50ms tick burned CPU while idle.
+    let mut dirty = true;
     loop {
-        terminal.draw(|frame| draw_ui(frame, app))?;
+        if dirty {
+            terminal.draw(|frame| draw_ui(frame, app))?;
+            dirty = false;
+        }
 
         if event::poll(std::time::Duration::from_millis(50))? {
             match event::read()? {
@@ -791,24 +1054,39 @@ async fn run_main_loop(
                     }
                 }
                 Event::Mouse(mouse) => handle_mouse(app, mouse),
+                Event::Paste(text) if app.mode == Mode::Insert => {
+                    app.insert_text(&normalize_newlines(&text));
+                }
                 _ => {}
             }
+            dirty = true;
         }
 
         while let Ok(event) = event_rx.try_recv() {
             app.handle_event(event);
+            dirty = true;
+        }
+
+        if app.reap_dead_tasks() {
+            dirty = true;
         }
     }
 }
 
-fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
+/// Pasted text arrives with whatever line endings the source used; keep
+/// plain LF so the provider sees normal newlines.
+fn normalize_newlines(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn handle_key(app: &mut App, key: KeyEvent) {
     match app.mode {
         Mode::Normal => handle_normal_key(app, key),
         Mode::Insert => handle_insert_key(app, key),
     }
 }
 
-fn handle_normal_key(app: &mut App, key: crossterm::event::KeyEvent) {
+fn handle_normal_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('q') => {
             app.cancel_current_turn();
@@ -843,31 +1121,15 @@ fn handle_normal_key(app: &mut App, key: crossterm::event::KeyEvent) {
             let idx = app.selected_panel;
             app.scroll_by(idx, 1);
         }
-        KeyCode::PageUp => {
-            let idx = app.selected_panel;
-            let page = app
-                .panels
-                .get(idx)
-                .map(|p| p.visible_height.saturating_sub(1) as i32)
-                .unwrap_or(10)
-                .max(1);
-            app.scroll_by(idx, -page);
-        }
-        KeyCode::PageDown => {
-            let idx = app.selected_panel;
-            let page = app
-                .panels
-                .get(idx)
-                .map(|p| p.visible_height.saturating_sub(1) as i32)
-                .unwrap_or(10)
-                .max(1);
-            app.scroll_by(idx, page);
-        }
+        KeyCode::PageUp => app.page_scroll(-1),
+        KeyCode::PageDown => app.page_scroll(1),
         _ => {}
     }
 }
 
-fn handle_insert_key(app: &mut App, key: crossterm::event::KeyEvent) {
+fn handle_insert_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
         KeyCode::Esc => app.mode = Mode::Normal,
         KeyCode::Enter => {
@@ -888,36 +1150,57 @@ fn handle_insert_key(app: &mut App, key: crossterm::event::KeyEvent) {
                     }
                     "clear" | "reset" => {
                         app.clear_all_panels();
-                        app.input_buffer.clear();
+                        app.clear_input();
                     }
                     _ => {
                         app.status_message = Some(format!("unknown command: /{}", cmd_name));
-                        app.input_buffer.clear();
+                        app.clear_input();
                     }
                 }
                 return;
             }
-            app.submit_turn(line);
-            app.input_buffer.clear();
+            // Keep the text if the turn was rejected (busy) so it isn't lost.
+            if app.submit_turn(line) {
+                app.clear_input();
+            }
         }
-        KeyCode::Backspace => {
-            // Pop a full grapheme's worth of bytes by draining the trailing
-            // char; `String::pop` is char-aware and therefore UTF-8 safe.
-            app.input_buffer.pop();
-        }
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Backspace => app.backspace(),
+        KeyCode::Delete => app.delete_forward(),
+        KeyCode::Left => app.cursor_left(),
+        KeyCode::Right => app.cursor_right(),
+        KeyCode::Home => app.input_cursor = 0,
+        KeyCode::End => app.input_cursor = app.input_buffer.len(),
+        KeyCode::PageUp => app.page_scroll(-1),
+        KeyCode::PageDown => app.page_scroll(1),
+        KeyCode::Char('c') if ctrl => {
             if app.any_streaming() {
                 app.cancel_current_turn();
                 app.status_message = Some("cancelling...".into());
             } else {
                 // Ctrl+C with no in-flight turn clears the input line — like
                 // a shell prompt. Second press in Normal quits.
-                app.input_buffer.clear();
+                app.clear_input();
                 app.mode = Mode::Normal;
             }
         }
+        // Readline-style editing chords.
+        KeyCode::Char('a') if ctrl && !alt => app.input_cursor = 0,
+        KeyCode::Char('e') if ctrl && !alt => app.input_cursor = app.input_buffer.len(),
+        KeyCode::Char('u') if ctrl && !alt => {
+            app.input_buffer.drain(..app.input_cursor);
+            app.input_cursor = 0;
+        }
+        KeyCode::Char('k') if ctrl && !alt => {
+            app.input_buffer.truncate(app.input_cursor);
+        }
+        KeyCode::Char('w') if ctrl && !alt => app.delete_word_back(),
+        // Other Ctrl- or Alt- chords are commands, not text: don't type a
+        // literal letter for them. Ctrl+Alt together is AltGr on Windows
+        // and produces real characters (e.g. `@`, `€`), so let it through.
+        KeyCode::Char(_) if ctrl != alt => {}
         KeyCode::Char(c) => {
-            app.input_buffer.push(c);
+            let mut buf = [0u8; 4];
+            app.insert_text(c.encode_utf8(&mut buf));
         }
         _ => {}
     }
@@ -947,6 +1230,7 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
 mod tests {
     use super::*;
     use crate::providers::Provider;
+    use ratatui::backend::TestBackend;
 
     fn fake_provider(name: &str) -> Provider {
         Provider {
@@ -973,23 +1257,37 @@ mod tests {
         (App::new(panels, senders, true), receivers)
     }
 
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            handle_key(app, key(KeyCode::Char(c)));
+        }
+    }
+
+    fn done(provider: &str) -> StreamEvent {
+        StreamEvent::Done {
+            provider: provider.into(),
+            model: "m".into(),
+            input_tokens: None,
+            output_tokens: None,
+            duration_ms: 10,
+        }
+    }
+
     #[test]
     fn insert_mode_appends_chars_and_backspace_removes_them() {
         let (mut app, _rxs) = app_with(1);
         app.mode = Mode::Insert;
-        handle_key(
-            &mut app,
-            crossterm::event::KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
-        );
-        handle_key(
-            &mut app,
-            crossterm::event::KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
-        );
+        type_str(&mut app, "hi");
         assert_eq!(app.input_buffer, "hi");
-        handle_key(
-            &mut app,
-            crossterm::event::KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
-        );
+        handle_key(&mut app, key(KeyCode::Backspace));
         assert_eq!(app.input_buffer, "h");
     }
 
@@ -1005,15 +1303,9 @@ mod tests {
     fn normal_mode_i_enters_insert_and_esc_leaves() {
         let (mut app, _rxs) = app_with(1);
         app.mode = Mode::Normal;
-        handle_key(
-            &mut app,
-            crossterm::event::KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
-        );
+        handle_key(&mut app, key(KeyCode::Char('i')));
         assert_eq!(app.mode, Mode::Insert);
-        handle_key(
-            &mut app,
-            crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-        );
+        handle_key(&mut app, key(KeyCode::Esc));
         assert_eq!(app.mode, Mode::Normal);
     }
 
@@ -1021,17 +1313,14 @@ mod tests {
     fn normal_mode_q_quits() {
         let (mut app, _rxs) = app_with(1);
         app.mode = Mode::Normal;
-        handle_key(
-            &mut app,
-            crossterm::event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-        );
+        handle_key(&mut app, key(KeyCode::Char('q')));
         assert!(app.should_quit);
     }
 
     #[test]
     fn submit_turn_appends_user_turn_and_marks_streaming() {
         let (mut app, _rxs) = app_with(2);
-        app.submit_turn("hello".into());
+        assert!(app.submit_turn("hello".into()));
         for panel in &app.panels {
             assert_eq!(panel.turns.len(), 1);
             assert!(matches!(panel.turns[0].kind, TurnKind::User));
@@ -1044,11 +1333,20 @@ mod tests {
     #[test]
     fn submit_turn_blocked_while_streaming() {
         let (mut app, _rxs) = app_with(1);
-        app.submit_turn("first".into());
-        app.submit_turn("second".into());
+        assert!(app.submit_turn("first".into()));
+        assert!(!app.submit_turn("second".into()));
         assert_eq!(app.panels[0].turns.len(), 1);
         assert_eq!(app.panels[0].turns[0].text, "first");
         assert!(app.status_message.as_deref().unwrap_or("").contains("busy"));
+    }
+
+    #[test]
+    fn enter_while_busy_keeps_the_typed_text() {
+        let (mut app, _rxs) = app_with(1);
+        app.submit_turn("first".into());
+        type_str(&mut app, "follow-up");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.input_buffer, "follow-up");
     }
 
     #[test]
@@ -1112,16 +1410,8 @@ mod tests {
     fn slash_exit_sets_quit() {
         let (mut app, _rxs) = app_with(1);
         app.mode = Mode::Insert;
-        for c in "/exit".chars() {
-            handle_key(
-                &mut app,
-                crossterm::event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
-            );
-        }
-        handle_key(
-            &mut app,
-            crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        );
+        type_str(&mut app, "/exit");
+        handle_key(&mut app, key(KeyCode::Enter));
         assert!(app.should_quit);
     }
 
@@ -1131,30 +1421,69 @@ mod tests {
         app.submit_turn("hi".into());
         // Simulate completion so the panel is no longer streaming, letting
         // /clear run against a stable state.
-        app.handle_event(StreamEvent::Done {
-            provider: "P0".into(),
-            model: "m".into(),
-            input_tokens: None,
-            output_tokens: None,
-            duration_ms: 10,
-        });
-        app.handle_event(StreamEvent::Done {
-            provider: "P1".into(),
-            model: "m".into(),
-            input_tokens: None,
-            output_tokens: None,
-            duration_ms: 10,
-        });
+        app.handle_event(done("P0"));
+        app.handle_event(done("P1"));
         app.mode = Mode::Insert;
-        app.input_buffer = "/clear".into();
-        handle_key(
-            &mut app,
-            crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        );
+        type_str(&mut app, "/clear");
+        handle_key(&mut app, key(KeyCode::Enter));
         for panel in &app.panels {
             assert!(panel.turns.is_empty());
             assert!(panel.current_text.is_empty());
         }
+    }
+
+    #[test]
+    fn submit_to_dead_workers_keeps_the_input() {
+        let (mut app, rxs) = app_with(1);
+        drop(rxs); // the panel's worker is gone
+        type_str(&mut app, "question");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.input_buffer, "question");
+        assert!(app.status_message.unwrap().contains("worker stopped"));
+        assert!(app.current_turn_cancel.is_none());
+    }
+
+    #[test]
+    fn esc_quits_while_a_cleared_turn_is_still_draining() {
+        let (mut app, _rxs) = app_with(1);
+        app.submit_turn("hi".into());
+        app.clear_all_panels();
+        // Nothing visible is streaming, so Esc in Normal mode quits instead
+        // of trying to cancel a turn that's already cancelled.
+        app.mode = Mode::Normal;
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn clear_mid_stream_cancels_and_discards_late_events() {
+        let (mut app, _rxs) = app_with(1);
+        app.submit_turn("hi".into());
+        let cancel = app.current_turn_cancel.clone().unwrap();
+        app.clear_all_panels();
+        assert!(cancel.is_cancelled(), "/clear must stop the in-flight turn");
+        // Late events from the abandoned turn must not show up...
+        app.handle_event(StreamEvent::Chunk {
+            provider: "P0".into(),
+            text: "ghost".into(),
+        });
+        // ...and a new question can't start until the old one has wound down.
+        assert!(!app.submit_turn("next".into()));
+        app.handle_event(StreamEvent::Error {
+            provider: "P0".into(),
+            model: "m".into(),
+            error: "cancelled".into(),
+            duration_ms: 5,
+        });
+        assert!(app.panels[0].turns.is_empty(), "no ghost turns after clear");
+        assert!(app.submit_turn("next".into()));
+        app.handle_event(StreamEvent::Chunk {
+            provider: "P0".into(),
+            text: "real".into(),
+        });
+        app.handle_event(done("P0"));
+        assert_eq!(app.panels[0].turns.len(), 2);
+        assert_eq!(app.panels[0].turns[1].text, "real");
     }
 
     #[test]
@@ -1180,5 +1509,155 @@ mod tests {
         assert_eq!(app.panel_at(10, 5), Some(0));
         assert_eq!(app.panel_at(60, 5), Some(1));
         assert_eq!(app.panel_at(5, 30), None);
+    }
+
+    #[test]
+    fn content_height_counts_word_wrapped_rows() {
+        // Word wrapping needs more rows than ceil(width / columns): these
+        // six-letter words fit only one per 10-column row.
+        let (mut app, _rxs) = app_with(1);
+        app.panels[0].turns.push(Turn {
+            kind: TurnKind::User,
+            text: "aaaaaa bbbbbb cccccc dddddd".into(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(12, 30)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, 12, 30);
+                draw_panel(f, &mut app.panels[0], area, true, false);
+            })
+            .unwrap();
+        // "you" + 4 wrapped rows + trailing blank line.
+        assert_eq!(app.panels[0].content_height, 6);
+    }
+
+    #[test]
+    fn cursor_editing_moves_by_grapheme() {
+        let (mut app, _rxs) = app_with(1);
+        type_str(&mut app, "ab");
+        app.insert_text("🇯🇵"); // a two-code-point flag
+        type_str(&mut app, "c");
+        handle_key(&mut app, key(KeyCode::Left));
+        handle_key(&mut app, key(KeyCode::Backspace));
+        assert_eq!(app.input_buffer, "abc", "whole flag deleted");
+        handle_key(&mut app, key(KeyCode::Home));
+        type_str(&mut app, ">");
+        assert_eq!(app.input_buffer, ">abc");
+        handle_key(&mut app, key(KeyCode::End));
+        handle_key(&mut app, ctrl('w'));
+        assert_eq!(app.input_buffer, "");
+    }
+
+    #[test]
+    fn control_chords_do_not_insert_letters() {
+        let (mut app, _rxs) = app_with(1);
+        type_str(&mut app, "hello world");
+        handle_key(&mut app, ctrl('w'));
+        assert_eq!(app.input_buffer, "hello ");
+        handle_key(&mut app, ctrl('x'));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+        );
+        assert_eq!(app.input_buffer, "hello ");
+        // AltGr (Ctrl+Alt) produces real characters on Windows layouts.
+        handle_key(
+            &mut app,
+            KeyEvent::new(
+                KeyCode::Char('@'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+        );
+        assert_eq!(app.input_buffer, "hello @");
+        handle_key(&mut app, ctrl('u'));
+        assert_eq!(app.input_buffer, "");
+    }
+
+    #[test]
+    fn long_input_scrolls_to_keep_cursor_visible() {
+        let text: String = ('a'..='z').chain('A'..='D').collect();
+        let (visible, col) = input_viewport(&text, text.len(), 20);
+        // Scrolled 11 columns: the tail plus a free cell for the cursor.
+        assert_eq!(visible, &text[11..]);
+        assert_eq!(col, 19);
+        let (visible, col) = input_viewport(&text, 0, 20);
+        assert_eq!((visible.as_str(), col), (&text[..20], 0));
+    }
+
+    #[test]
+    fn input_wider_than_u16_shows_the_text_under_the_cursor() {
+        // A single-line paste wider than a u16 scroll offset can express.
+        let mut text = "x".repeat(70_000);
+        text.push_str("TAIL");
+        let (visible, col) = input_viewport(&text, text.len(), 20);
+        assert_eq!(visible, format!("{}TAIL", "x".repeat(15)));
+        assert_eq!(col, 19);
+    }
+
+    #[test]
+    fn wide_glyph_cut_by_the_left_edge_keeps_columns_aligned() {
+        // "漢" is two columns wide; scrolling by one column cuts it in half.
+        let text = "漢abcd";
+        let (visible, col) = input_viewport(text, text.len(), 6);
+        assert_eq!(visible, " abcd");
+        assert_eq!(col, 5);
+    }
+
+    #[test]
+    fn pasted_newlines_display_as_markers_but_are_kept() {
+        let (mut app, _rxs) = app_with(1);
+        app.insert_text("fn main() {\n}\n");
+        assert_eq!(input_display(&app.input_buffer), "fn main() {↵}↵");
+        assert!(app.input_buffer.contains('\n'));
+    }
+
+    #[test]
+    fn duplicate_display_names_are_made_unique() {
+        let mut providers = vec![fake_provider("X"), fake_provider("X"), fake_provider("Y")];
+        dedupe_display_names(&mut providers);
+        let names: Vec<&str> = providers.iter().map(|p| p.display_name.as_str()).collect();
+        assert_eq!(names, ["X", "X (2)", "Y"]);
+    }
+
+    #[test]
+    fn generated_names_skip_configured_ones() {
+        let mut providers = vec![
+            fake_provider("X"),
+            fake_provider("X"),
+            fake_provider("X (2)"),
+            fake_provider("X"),
+        ];
+        dedupe_display_names(&mut providers);
+        let names: Vec<&str> = providers.iter().map(|p| p.display_name.as_str()).collect();
+        assert_eq!(names, ["X", "X (3)", "X (2)", "X (4)"]);
+    }
+
+    #[test]
+    fn failed_turn_detection_ignores_tool_call_messages() {
+        use genai::chat::ToolCall;
+        let ok = vec![ChatMessage::user("q"), ChatMessage::assistant("a")];
+        assert!(ends_with_final_reply(&ok));
+        let mid_tool = vec![
+            ChatMessage::user("q"),
+            ChatMessage::from(vec![ToolCall {
+                call_id: "c".into(),
+                fn_name: "web_search".into(),
+                fn_arguments: serde_json::json!({"query": "x"}),
+                thought_signatures: None,
+            }]),
+        ];
+        assert!(!ends_with_final_reply(&mid_tool));
+        assert!(!ends_with_final_reply(&[ChatMessage::user("q")]));
+    }
+
+    #[test]
+    fn multi_line_errors_render_one_row_per_line() {
+        let turn = Turn {
+            kind: TurnKind::Error,
+            text: "first\nsecond".into(),
+        };
+        let lines = lines_for_turn(&turn, Color::Red, false);
+        // header, two text lines, trailing blank
+        assert_eq!(lines.len(), 4);
     }
 }

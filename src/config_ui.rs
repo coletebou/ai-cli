@@ -1,10 +1,6 @@
 use crate::config::{Config, ModelTier, QueryMode};
 use anyhow::Result;
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    ExecutableCommand,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs},
@@ -421,8 +417,8 @@ pub async fn run_config_ui() -> Result<()> {
     let config = Config::load()?;
     let mut app = App::new(config);
 
-    enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
+    // Restores the terminal on every exit path, including the `?`s below.
+    let _guard = crate::term::TerminalGuard::enter(false)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     loop {
@@ -489,9 +485,6 @@ pub async fn run_config_ui() -> Result<()> {
             }
         }
     }
-
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
 
     Ok(())
 }

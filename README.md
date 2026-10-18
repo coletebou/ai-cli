@@ -180,7 +180,12 @@ The TUI is a long-running chat: type a message, hit Enter, read responses in eac
 | Insert | `Enter` | Submit turn to all panels |
 | Insert | `Esc` | Back to normal |
 | Insert | `Ctrl+C` | Cancel in-flight turn, or clear line |
+| Insert | `←` / `→` / `Home` / `End` | Move the cursor (also `Ctrl+A` / `Ctrl+E`) |
+| Insert | `Ctrl+W` / `Ctrl+U` / `Ctrl+K` | Delete word back / to start / to end |
+| Insert | `PageUp` / `PageDown` | Scroll the selected panel |
 | Any | Mouse wheel | Scroll the panel under the cursor |
+
+Multi-line pastes are kept intact: newlines show as `↵` in the input box and are sent as real newlines.
 
 Slash commands in the input box: `/clear` (reset all histories), `/exit` (quit).
 

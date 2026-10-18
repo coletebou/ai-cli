@@ -13,9 +13,15 @@ path = "src/main.rs"
 # AI Provider Client
 genai = "0.5"
 
-# TUI
-ratatui = "0.29"
+# TUI. `unstable-rendered-line-info` exposes Paragraph::line_count, the only
+# accurate way to know how many rows word-wrapped text occupies (needed for
+# scrolling to the true bottom of a panel).
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
+# Input-line editing: cursor movement/deletion by grapheme and display width.
+# Both are already in the tree via ratatui.
+unicode-segmentation = "1"
+unicode-width = "0.2"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

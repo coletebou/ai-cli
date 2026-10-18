@@ -182,7 +182,26 @@ ai models --free                    # only free models
 ai models --refresh                 # force-refresh model cache
 ai models "llama"                   # filter by name
 ai completions zsh                  # generate shell completion script
+ai doctor                           # check config, keys and connectivity
 ```
+
+## Diagnostics (`ai doctor`)
+
+`ai doctor` checks your setup and marks each item ✓ (ok), ! (warning) or ✗ (problem):
+
+- **System:** version and build, OS, and which config file is in use, and whether it parses.
+- **Providers:** for each configured provider, whether it's enabled, its fast and smart models, where its credentials come from (env var, config `api_key`, or subscription), its endpoint, and whether it's routed through AWS Bedrock. Key values are never printed, only their length.
+- **Connectivity:** for each enabled provider with credentials, a DNS lookup of the endpoint host plus one free authenticated request (list models, or key info for OpenRouter). The result is classified as OK, auth failure, not found, rate limited, TLS error, DNS failure, timeout or connection refused. Bedrock is checked for reachability only, so doctor never makes a billed call.
+- **Web search** and **telemetry:** whether the search keys (`TAVILY_API_KEY`, `GEMINI_API_KEY` / `GOOGLE_API_KEY`) and the `LANGFUSE_*` variables are set.
+
+```bash
+ai doctor             # full check, including network probes (about 10s at most)
+ai doctor --offline   # config and credentials only
+```
+
+It exits with status 1 when a probe fails or the config file doesn't load, so it also works as a scripted pre-flight check.
+
+**Blocked networks.** Some corporate networks filter AI APIs at the DNS level. Cisco Umbrella, for example, resolves `api.anthropic.com`, `api.openai.com` and `api.x.ai` to its block-page servers in `146.112.0.0/16`, which present a Cisco-issued certificate, so requests fail with a TLS error. `ai doctor` flags this as "DNS appears redirected by a network filter (Cisco Umbrella)". If an AWS Bedrock provider is reachable at the same time, it suggests switching to that provider on this network.
 
 ## Shell completions
 
@@ -312,6 +331,7 @@ src/
 ├── markdown.rs   pulldown-cmark → ratatui styled lines
 ├── display.rs    Sequential + streaming terminal output
 ├── pricing.rs    Per-model prices and the footer's cost estimate
+├── doctor.rs     `ai doctor`: config, credential and connectivity diagnostics
 ├── chat.rs       Interactive chat (rustyline) with slash commands
 ├── models.rs     OpenRouter model listing
 └── ui.rs         Ratatui TUI — interactive side-by-side chat panels

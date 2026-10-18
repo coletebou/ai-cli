@@ -7,6 +7,7 @@ mod config_ui;
 mod context;
 mod diag;
 mod display;
+mod doctor;
 mod markdown;
 mod models;
 mod pricing;
@@ -184,6 +185,12 @@ enum Command {
     Completions {
         /// Shell to generate completions for
         shell: Shell,
+    },
+    /// Diagnose config, credentials and per-provider connectivity
+    Doctor {
+        /// Skip the network probes (config and credential checks only)
+        #[arg(long)]
+        offline: bool,
     },
 }
 
@@ -365,6 +372,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 let bin_name = cmd.get_name().to_string();
                 generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
             }
+            Command::Doctor { offline } => doctor::run(offline).await?,
         }
         return Ok(ExitCode::SUCCESS);
     }

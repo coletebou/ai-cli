@@ -10,7 +10,7 @@ use genai::chat::{
     ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatStream, ChatStreamEvent, Tool,
 };
 use genai::resolver::{AuthData, AuthResolver, Endpoint, ServiceTargetResolver};
-use genai::{Client, ClientConfig, ModelIden, ServiceTarget};
+use genai::{Client, ClientConfig, ModelIden, ServiceTarget, WebConfig};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -143,6 +143,21 @@ impl Provider {
             model,
             color,
         }
+    }
+}
+
+/// HTTP timeouts for every genai request (genai sets none by default, so a
+/// provider that accepts the connection and then stalls hangs forever —
+/// in non-streaming multi-provider mode that blocks every other answer too).
+/// There's deliberately no overall request timeout: a long streamed answer
+/// can legitimately run for minutes. The read timeout is per read (idle),
+/// and generous because a non-streaming call to a slow reasoning model
+/// sends nothing until it's done.
+fn provider_web_config() -> WebConfig {
+    WebConfig {
+        connect_timeout: Some(Duration::from_secs(15)),
+        read_timeout: Some(Duration::from_secs(600)),
+        ..WebConfig::default()
     }
 }
 
@@ -292,7 +307,7 @@ impl ProviderManager {
             },
         );
 
-        let client_config = ClientConfig::default();
+        let client_config = ClientConfig::default().with_web_config(provider_web_config());
         let client = Client::builder()
             .with_config(client_config)
             .with_auth_resolver(auth_resolver)

@@ -160,6 +160,23 @@ fn build_options(ctx: &QueryContext) -> Option<ChatOptions> {
     Some(options)
 }
 
+/// Report a turn that was cancelled (Ctrl+C / Esc / `/clear`).
+async fn send_cancelled(
+    tx: &mpsc::Sender<StreamEvent>,
+    provider: &str,
+    model: &str,
+    start: Instant,
+) {
+    let _ = tx
+        .send(StreamEvent::Error {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            error: "cancelled".to_string(),
+            duration_ms: start.elapsed().as_millis() as u64,
+        })
+        .await;
+}
+
 /// Execute a tool call and return the text response for feeding back to the model.
 async fn execute_tool_call(
     tool_call: &ToolCall,
@@ -574,10 +591,21 @@ async fn stream_bedrock(
         for tc in &finalized_tool_calls {
             parts.push(ContentPart::ToolCall(tc.clone()));
         }
+        let before_tool_turn = messages.len();
         messages.push(ChatMessage::assistant(MessageContent::from_parts(parts)));
 
         for tool_call in &finalized_tool_calls {
-            let result_text = execute_tool_call(tool_call, ctx, &provider_name, Some(&tx)).await;
+            // Cancellable, as in the genai path, including dropping the
+            // half-finished tool turn.
+            let result_text = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    send_cancelled(&tx, &provider_name, &model, start).await;
+                    messages.truncate(before_tool_turn);
+                    return messages;
+                }
+                text = execute_tool_call(tool_call, ctx, &provider_name, Some(&tx)) => text,
+            };
             let tool_response = ToolResponse::new(tool_call.call_id.clone(), result_text);
             messages.push(ChatMessage::from(tool_response));
         }
@@ -1063,11 +1091,26 @@ pub async fn stream_with_messages(
                 captured_thoughts,
             )
         };
+        let before_tool_turn = messages.len();
         messages.push(assistant_msg);
 
-        // Execute each tool call
+        // Execute each tool call. A web search can take a while, so race it
+        // against cancellation: Ctrl+C shouldn't wait for the search — or
+        // for the next (billed) model call its results would feed.
         for tool_call in &captured_tool_calls {
-            let result_text = execute_tool_call(tool_call, ctx, &provider_name, Some(&tx)).await;
+            let result_text = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    span.set_attribute(KeyValue::new("cancelled", true));
+                    span.end();
+                    send_cancelled(&tx, &provider_name, &model, start).await;
+                    // Drop the half-finished tool turn: a tool call without
+                    // its tool result is a history every provider rejects.
+                    messages.truncate(before_tool_turn);
+                    return messages;
+                }
+                text = execute_tool_call(tool_call, ctx, &provider_name, Some(&tx)) => text,
+            };
             let tool_response = ToolResponse::new(tool_call.call_id.clone(), result_text);
             messages.push(ChatMessage::from(tool_response));
         }
@@ -1147,20 +1190,50 @@ pub async fn stream_all(
     for provider in providers {
         let manager = Arc::clone(&manager);
         let ctx = ctx.clone();
-        let tx = tx.clone();
+        let task_tx = tx.clone();
+        let watch_tx = tx.clone();
         let parent_cx = parent_cx.clone();
+        let name = provider.display_name.clone();
+        let model = provider.model.clone();
+        let start = Instant::now();
 
-        // DETACH: each task terminates naturally when stream_single returns;
-        // the cloned tx drops with it, and the receiver sees a closed channel
-        // once every task finishes. Cancellation propagates via the CLI's
-        // CancellationToken (held inside ctx), not via JoinHandle.abort().
-        tokio::spawn(
-            async move { stream_single(&manager, &provider, &ctx, tx).await }
+        let task = tokio::spawn(
+            async move { stream_single(&manager, &provider, &ctx, task_tx).await }
                 .with_context(parent_cx),
         );
+        // DETACH: the watcher ends as soon as its provider task does. Its
+        // only job is to turn a panic in that task into a visible Error
+        // event; otherwise the provider would just vanish from the output
+        // (its sender drops without ever sending Done or Error). Each task
+        // still terminates naturally when stream_single returns, and the
+        // receiver sees a closed channel once all tasks and watchers finish.
+        tokio::spawn(async move {
+            if let Err(err) = task.await {
+                if err.is_panic() {
+                    let _ = watch_tx
+                        .send(StreamEvent::Error {
+                            provider: name,
+                            model,
+                            error: format!("internal error: {}", panic_message(err)),
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        })
+                        .await;
+                }
+            }
+        });
     }
 
     rx
+}
+
+/// Best-effort text of a task panic, for the error shown to the user.
+fn panic_message(err: tokio::task::JoinError) -> String {
+    let payload = err.into_panic();
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "provider task panicked".to_string())
 }
 
 #[cfg(test)]
@@ -1217,6 +1290,20 @@ mod tests {
         assert_eq!(gen_ai_system_for("GROK"), "xai");
         assert_eq!(gen_ai_system_for("GEMINI"), "google_vertex_ai");
         assert_eq!(gen_ai_system_for("OLLAMA"), "ollama");
+    }
+
+    #[tokio::test]
+    async fn panicked_provider_tasks_become_readable_errors() {
+        // stream_all's watcher turns a provider-task panic into an Error
+        // event using this text, instead of the provider silently vanishing.
+        let err = tokio::spawn(async { panic!("adapter exploded") })
+            .await
+            .unwrap_err();
+        assert_eq!(panic_message(err), "adapter exploded");
+        let err = tokio::spawn(async { panic!("{} {}", "formatted", 42) })
+            .await
+            .unwrap_err();
+        assert_eq!(panic_message(err), "formatted 42");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::config::FooterConfig;
+use crate::pricing;
 use crate::providers::{Provider, ProviderResponse};
 use crate::query::StreamEvent;
 use colored::Colorize;
@@ -75,8 +76,22 @@ pub fn format_reasoning(reasoning: Option<&str>) -> String {
     reasoning.unwrap_or("none").to_string()
 }
 
-/// The `model: … | tokens: … | time: … | reasoning: …` footer, or `None`
-/// when every part is switched off.
+/// Estimated cost of one answer, when cost display is on and both token
+/// counts and a price for `model` are known.
+fn estimated_cost(
+    model: &str,
+    input_tokens: Option<i32>,
+    output_tokens: Option<i32>,
+    footer: &FooterConfig,
+) -> Option<f64> {
+    if !footer.show_cost {
+        return None;
+    }
+    pricing::estimate_cost(model, input_tokens?, output_tokens?, &footer.pricing)
+}
+
+/// The `model: … | tokens: … | cost: … | time: … | reasoning: …` footer, or
+/// `None` when every part is switched off.
 fn footer_text(
     model: &str,
     input_tokens: Option<i32>,
@@ -97,6 +112,10 @@ fn footer_text(
         }
     }
 
+    if let Some(cost) = estimated_cost(model, input_tokens, output_tokens, footer) {
+        parts.push(format!("cost: {}", pricing::format_cost(cost)));
+    }
+
     if footer.show_time {
         parts.push(format!("time: {}", format_duration(duration_ms)));
     }
@@ -108,15 +127,69 @@ fn footer_text(
     (!parts.is_empty()).then(|| parts.join(" | "))
 }
 
-/// Footer settings for an error block: no tokens (there are none) and no
-/// reasoning label.
+/// Footer settings for an error block: no tokens or cost (there are none)
+/// and no reasoning label.
 fn error_footer(footer: &FooterConfig) -> FooterConfig {
     FooterConfig {
         show_model: footer.show_model,
         show_time: footer.show_time,
         show_tokens: false,
         show_reasoning: false,
+        show_cost: false,
+        pricing: Default::default(),
     }
+}
+
+/// Running total of the estimated cost of a multi-provider run.
+#[derive(Debug, Default)]
+struct CostTotal {
+    usd: f64,
+    /// Answers that had a cost estimate.
+    priced: usize,
+    /// All answers counted, priced or not (failed providers aren't counted).
+    answers: usize,
+}
+
+impl CostTotal {
+    fn add(&mut self, cost: Option<f64>) {
+        self.answers += 1;
+        if let Some(cost) = cost {
+            self.usd += cost;
+            self.priced += 1;
+        }
+    }
+
+    /// `total: $…`, noting when some answers couldn't be priced (unknown
+    /// model or no token counts) so a partial sum isn't mistaken for the
+    /// whole. `None` when nothing was priced.
+    fn line(&self) -> Option<String> {
+        if self.priced == 0 {
+            return None;
+        }
+        let mut line = format!("total: {}", pricing::format_cost(self.usd));
+        if self.priced < self.answers {
+            line.push_str(&format!(" ({} of {} priced)", self.priced, self.answers));
+        }
+        Some(line)
+    }
+}
+
+/// The `total:` line for a completed multi-provider run, or `None` for a
+/// single provider or when no answer could be priced.
+fn responses_total(responses: &[ProviderResponse], footer: &FooterConfig) -> Option<String> {
+    if responses.len() < 2 {
+        return None;
+    }
+    let mut total = CostTotal::default();
+    for response in responses.iter().filter(|r| !r.is_error()) {
+        total.add(estimated_cost(
+            &response.model,
+            response.input_tokens,
+            response.output_tokens,
+            footer,
+        ));
+    }
+    total.line()
 }
 
 pub fn print_metadata(
@@ -178,6 +251,9 @@ pub fn print_responses(
 ) {
     for response in responses {
         print_response(response, footer, reasoning);
+    }
+    if let Some(total) = responses_total(responses, footer) {
+        println!("{}", total.dimmed());
     }
 }
 
@@ -328,6 +404,9 @@ pub struct StreamingDisplay {
     provider_buffers: std::collections::HashMap<String, ProviderBuffer>,
     // Provider colors lookup
     provider_colors: std::collections::HashMap<String, colored::Color>,
+    /// Estimated cost across providers, for the `total:` line printed after
+    /// the last one. Only kept for multi-provider (buffered) output.
+    total: CostTotal,
 }
 
 impl StreamingDisplay {
@@ -350,7 +429,14 @@ impl StreamingDisplay {
             reasoning,
             provider_buffers: std::collections::HashMap::new(),
             provider_colors,
+            total: CostTotal::default(),
         }
+    }
+
+    /// The `total:` line to print once every provider has finished, if this
+    /// was a multi-provider run and at least one answer could be priced.
+    fn total_line(&self) -> Option<String> {
+        self.total.line()
     }
 
     fn color_for(&self, provider: &str) -> colored::Color {
@@ -600,6 +686,12 @@ impl StreamingDisplay {
                 if !content.is_empty() {
                     render_markdown(&content);
                 }
+                self.total.add(estimated_cost(
+                    &model,
+                    input_tokens,
+                    output_tokens,
+                    &self.footer,
+                ));
                 if let Some(text) = footer_text(
                     &model,
                     input_tokens,
@@ -700,6 +792,10 @@ pub async fn display_streaming(
             _ => {}
         }
         display.handle_event(event);
+    }
+    if let Some(total) = display.total_line() {
+        println!();
+        println!("{}", total.dimmed());
     }
     any_error || completed < providers.len()
 }
@@ -840,6 +936,7 @@ mod tests {
             show_time: true,
             show_tokens: true,
             show_reasoning: false,
+            ..FooterConfig::default()
         };
         let text = footer_text("m", Some(3), Some(5), 1500, &footer, None).unwrap();
         assert_eq!(text, "model: m | tokens: 3 in / 5 out | time: 1.5s");
@@ -848,8 +945,195 @@ mod tests {
             show_time: false,
             show_tokens: false,
             show_reasoning: false,
+            show_cost: false,
+            ..FooterConfig::default()
         };
-        assert!(footer_text("m", None, None, 1, &none, None).is_none());
+        assert!(footer_text("claude-haiku-4-5", Some(3), Some(5), 1, &none, None).is_none());
+    }
+
+    fn cost_footer() -> FooterConfig {
+        FooterConfig {
+            show_model: true,
+            show_time: true,
+            show_tokens: true,
+            show_reasoning: false,
+            ..FooterConfig::default()
+        }
+    }
+
+    #[test]
+    fn footer_shows_cost_when_tokens_and_price_are_known() {
+        let footer = cost_footer();
+        // Haiku 4.5: 1000 × $1/M + 500 × $5/M = $0.0035.
+        let text = footer_text(
+            "claude-haiku-4-5",
+            Some(1000),
+            Some(500),
+            1500,
+            &footer,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            text,
+            "model: claude-haiku-4-5 | tokens: 1000 in / 500 out | cost: $0.0035 | time: 1.5s"
+        );
+
+        // Cost doesn't depend on showing the token counts.
+        let quiet = FooterConfig {
+            show_tokens: false,
+            ..cost_footer()
+        };
+        let text = footer_text(
+            "claude-haiku-4-5",
+            Some(1000),
+            Some(500),
+            1500,
+            &quiet,
+            None,
+        )
+        .unwrap();
+        assert_eq!(text, "model: claude-haiku-4-5 | cost: $0.0035 | time: 1.5s");
+    }
+
+    #[test]
+    fn footer_omits_cost_when_unknown_or_disabled() {
+        let footer = cost_footer();
+        // Unknown model: no cost, no crash.
+        let text = footer_text("qwen3:8b", Some(1000), Some(500), 1500, &footer, None).unwrap();
+        assert_eq!(
+            text,
+            "model: qwen3:8b | tokens: 1000 in / 500 out | time: 1.5s"
+        );
+        // Known model but no usage reported (e.g. a stream without usage).
+        let text = footer_text("claude-haiku-4-5", None, None, 1500, &footer, None).unwrap();
+        assert_eq!(text, "model: claude-haiku-4-5 | time: 1.5s");
+        // Switched off (`show_cost = false` / `--no-cost`).
+        let off = FooterConfig {
+            show_cost: false,
+            ..cost_footer()
+        };
+        let text =
+            footer_text("claude-haiku-4-5", Some(1000), Some(500), 1500, &off, None).unwrap();
+        assert!(!text.contains("cost"), "{text}");
+        // Error footers never show a cost.
+        assert!(!error_footer(&footer).show_cost);
+    }
+
+    #[test]
+    fn footer_cost_uses_config_overrides() {
+        let mut footer = cost_footer();
+        footer.pricing.insert(
+            "qwen3:8b".to_string(),
+            pricing::ModelPrice {
+                input_per_mtok: 1.0,
+                output_per_mtok: 2.0,
+            },
+        );
+        let text = footer_text("qwen3:8b", Some(1000), Some(1000), 1500, &footer, None).unwrap();
+        assert!(text.contains("cost: $0.003 |"), "{text}");
+    }
+
+    fn provider(name: &str, model: &str) -> Provider {
+        Provider {
+            display_name: name.to_string(),
+            model: model.to_string(),
+            color: colored::Color::White,
+        }
+    }
+
+    #[test]
+    fn multi_provider_total_sums_priced_answers() {
+        let footer = cost_footer();
+        let ok = |name: &str, model: &str, input, output| {
+            ProviderResponse::success(
+                provider(name, model),
+                model.to_string(),
+                "answer".to_string(),
+                input,
+                output,
+                10,
+            )
+        };
+        // $0.0035 (Haiku) + 1000 × $0.05/M + 1000 × $0.40/M = $0.00045 (nano).
+        let both = [
+            ok("CLAUDE", "claude-haiku-4-5", Some(1000), Some(500)),
+            ok("GPT", "gpt-5-nano", Some(1000), Some(1000)),
+        ];
+        assert_eq!(
+            responses_total(&both, &footer).as_deref(),
+            Some("total: $0.00395")
+        );
+
+        // An unpriced answer is called out; a failed provider isn't counted.
+        let mixed = [
+            ok("CLAUDE", "claude-haiku-4-5", Some(1000), Some(500)),
+            ok("LOCAL", "qwen3:8b", Some(1000), Some(500)),
+            ProviderResponse::error(
+                provider("GROK", "grok-4.3"),
+                "grok-4.3".to_string(),
+                "boom".to_string(),
+                10,
+            ),
+        ];
+        assert_eq!(
+            responses_total(&mixed, &footer).as_deref(),
+            Some("total: $0.0035 (1 of 2 priced)")
+        );
+
+        // Nothing priced, a single provider, or cost switched off: no line.
+        let unpriced = [
+            ok("LOCAL", "qwen3:8b", Some(1), Some(1)),
+            ok("OTHER", "mystery", Some(1), Some(1)),
+        ];
+        assert_eq!(responses_total(&unpriced, &footer), None);
+        assert_eq!(responses_total(&both[..1], &footer), None);
+        let off = FooterConfig {
+            show_cost: false,
+            ..cost_footer()
+        };
+        assert_eq!(responses_total(&both, &off), None);
+    }
+
+    #[test]
+    fn streaming_total_covers_every_finished_provider() {
+        let providers = [
+            provider("CLAUDE", "claude-haiku-4-5"),
+            provider("GPT", "gpt-5-nano"),
+        ];
+        let mut display = StreamingDisplay::new(&providers, cost_footer(), false, None);
+        for p in &providers {
+            display.handle_event(StreamEvent::Start {
+                provider: p.display_name.clone(),
+                model: p.model.clone(),
+            });
+        }
+        display.handle_event(StreamEvent::Done {
+            provider: "GPT".to_string(),
+            model: "gpt-5-nano".to_string(),
+            input_tokens: Some(1000),
+            output_tokens: Some(1000),
+            duration_ms: 10,
+        });
+        display.handle_event(StreamEvent::Done {
+            provider: "CLAUDE".to_string(),
+            model: "claude-haiku-4-5".to_string(),
+            input_tokens: Some(1000),
+            output_tokens: Some(500),
+            duration_ms: 10,
+        });
+        assert_eq!(display.total_line().as_deref(), Some("total: $0.00395"));
+
+        // A single provider streams progressively and never prints a total.
+        let mut single = StreamingDisplay::new(&providers[..1], cost_footer(), false, None);
+        single.handle_event(StreamEvent::Done {
+            provider: "CLAUDE".to_string(),
+            model: "claude-haiku-4-5".to_string(),
+            input_tokens: Some(1000),
+            output_tokens: Some(500),
+            duration_ms: 10,
+        });
+        assert_eq!(single.total_line(), None);
     }
 
     #[test]

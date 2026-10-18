@@ -67,6 +67,7 @@ enum DisplayField {
     ShowTime,
     ShowTokens,
     ShowReasoning,
+    ShowCost,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -254,6 +255,7 @@ impl App {
             || now.footer.show_time != orig.footer.show_time
             || now.footer.show_tokens != orig.footer.show_tokens
             || now.footer.show_reasoning != orig.footer.show_reasoning
+            || now.footer.show_cost != orig.footer.show_cost
             || now.search.provider != orig.search.provider
             || now.search.gemini.model != orig.search.gemini.model
             || now.search.max_results != orig.search.max_results
@@ -365,7 +367,8 @@ impl App {
                     DisplayField::ShowModel => DisplayField::ShowTime,
                     DisplayField::ShowTime => DisplayField::ShowTokens,
                     DisplayField::ShowTokens => DisplayField::ShowReasoning,
-                    DisplayField::ShowReasoning => DisplayField::ShowModel,
+                    DisplayField::ShowReasoning => DisplayField::ShowCost,
+                    DisplayField::ShowCost => DisplayField::ShowModel,
                 };
             }
             Section::Search => {
@@ -398,10 +401,11 @@ impl App {
             }
             Section::Display => {
                 self.display_field = match self.display_field {
-                    DisplayField::ShowModel => DisplayField::ShowReasoning,
+                    DisplayField::ShowModel => DisplayField::ShowCost,
                     DisplayField::ShowTime => DisplayField::ShowModel,
                     DisplayField::ShowTokens => DisplayField::ShowTime,
                     DisplayField::ShowReasoning => DisplayField::ShowTokens,
+                    DisplayField::ShowCost => DisplayField::ShowReasoning,
                 };
             }
             Section::Search => {
@@ -497,6 +501,9 @@ impl App {
                 }
                 DisplayField::ShowReasoning => {
                     self.config.footer.show_reasoning = !self.config.footer.show_reasoning;
+                }
+                DisplayField::ShowCost => {
+                    self.config.footer.show_cost = !self.config.footer.show_cost;
                 }
             },
             Section::Search => match self.search_field {
@@ -823,6 +830,11 @@ fn draw_display_section(frame: &mut Frame, area: Rect, app: &App) {
             "Show Reasoning",
             app.config.footer.show_reasoning,
             app.display_field == DisplayField::ShowReasoning,
+        ),
+        format_bool_item(
+            "Show Cost",
+            app.config.footer.show_cost,
+            app.display_field == DisplayField::ShowCost,
         ),
     ];
 

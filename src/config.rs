@@ -34,6 +34,11 @@ pub struct Config {
     /// `fill_builtin_provider_fields` for how partial sections are handled).
     #[serde(default = "Config::builtin_providers")]
     pub providers: HashMap<String, ProviderConfig>,
+    /// Per-model price overrides and additions for the footer's cost
+    /// estimate, keyed by model id: `[pricing."anthropic/claude-opus-4-8"]`.
+    /// See `pricing::lookup` for how keys match.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pricing: HashMap<String, crate::pricing::ModelPrice>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -309,6 +314,15 @@ pub struct FooterConfig {
     pub show_tokens: bool,
     #[serde(default = "default_true")]
     pub show_reasoning: bool,
+    /// Estimated cost of each answer (plus a total for multi-provider runs),
+    /// from its token counts and the model's price. See `pricing.rs`.
+    #[serde(default = "default_true")]
+    pub show_cost: bool,
+    /// Runtime copy of the top-level `[pricing]` overrides, filled in at
+    /// startup so the footer can price answers. Not a `[footer]` key: never
+    /// read from or written to the config file.
+    #[serde(skip)]
+    pub pricing: HashMap<String, crate::pricing::ModelPrice>,
 }
 
 impl Default for FooterConfig {
@@ -318,6 +332,8 @@ impl Default for FooterConfig {
             show_time: true,
             show_tokens: false,
             show_reasoning: true,
+            show_cost: true,
+            pricing: HashMap::new(),
         }
     }
 }
@@ -493,6 +509,7 @@ impl Default for Config {
             search: SearchConfig::default(),
             retry: RetryConfig::default(),
             providers: Self::builtin_providers(),
+            pricing: HashMap::new(),
         }
     }
 }
@@ -924,6 +941,18 @@ show_model = true
 show_time = true
 show_tokens = false
 show_reasoning = true
+# Estimated cost from token counts and built-in list prices (hide for one
+# run with --no-cost). Unknown models show no cost; price them below.
+show_cost = true
+
+# ── Pricing overrides ───────────────────────────────────────────────
+# USD per million tokens, keyed by model id. A bare id also covers its
+# dated, Bedrock and OpenRouter spellings; a routed id such as
+# "anthropic/claude-opus-4-8" applies to that route only.
+#
+# [pricing."qwen3:8b"]
+# input_per_mtok = 0.0
+# output_per_mtok = 0.0
 
 # ── Web search (--search / -w) ──────────────────────────────────────
 # Primary search backend; the other is used as automatic fallback.

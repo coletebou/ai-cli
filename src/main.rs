@@ -9,6 +9,7 @@ mod diag;
 mod display;
 mod markdown;
 mod models;
+mod pricing;
 mod providers;
 mod query;
 mod retry;
@@ -145,6 +146,10 @@ struct Cli {
     /// Interactive chat mode (follow-up questions with conversation history)
     #[arg(short = 'i', long)]
     interactive: bool,
+
+    /// Hide the estimated cost in the footer (overrides `show_cost` in the config)
+    #[arg(long)]
+    no_cost: bool,
 }
 
 #[derive(Subcommand)]
@@ -451,6 +456,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     } else if cli.tokens {
         footer.show_tokens = true;
     }
+    // --no-cost hides the estimate; `[pricing]` adds or overrides prices.
+    footer.show_cost &= !cli.no_cost;
+    footer.pricing = config.pricing.clone();
 
     // Build search engine (primary + optional fallback) if --search flag set
     let search_client = if cli.search {

@@ -110,6 +110,28 @@ api_key_env = "TAVILY_API_KEY"
 
 Override at the CLI: `ai -w --search-provider tavily "query"`.
 
+### Cost estimate
+
+When a response reports its token counts, the footer shows an estimated cost, e.g. `cost: $0.0042`, and a multi-provider run ends with a `total: $…` line. The estimate uses built-in list prices (USD per million tokens) for the default Anthropic, OpenAI, Google, and xAI models, matched on the model id regardless of date suffix (`claude-haiku-4-5-20251001`), Bedrock spelling (`us.anthropic.claude-opus-4-7`), or OpenRouter route (`anthropic/claude-opus-4-8`). Models without a known price show no cost.
+
+It's a ballpark figure. It ignores prompt-cache discounts, batch pricing, long-context tiers, and regional-endpoint premiums, and built-in prices can go stale, so check your provider's dashboard for real billing. Add or correct prices in the config:
+
+```toml
+[footer]
+show_cost = true          # default; `--no-cost` hides it for one run
+
+# USD per million tokens, keyed by model id.
+[pricing."anthropic/claude-opus-4-8"]   # this OpenRouter route only
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+
+[pricing."qwen3:8b"]                    # a local Ollama model: free
+input_per_mtok = 0.0
+output_per_mtok = 0.0
+```
+
+An exact model id takes precedence. After that, a bare id such as `"claude-opus-4-8"` also covers the model's dated, Bedrock, and OpenRouter spellings. The built-in table is the fallback.
+
 ### Retry behavior
 
 Transient provider errors (HTTP 408, 425, 429, 500, 502, 503, 504, Anthropic's 529 "overloaded", and connection failures/timeouts) are retried automatically with exponential backoff, for streaming and non-streaming requests and for Bedrock. A streaming request is only retried if it fails before any output has been shown. A `Retry-After` header from the server takes precedence over the default backoff.
@@ -214,6 +236,7 @@ Mouse capture is enabled so the wheel scrolls panels natively. To text-select in
 | `--raw`                     | No formatting, pipeable                           |
 | `--no-stream`               | Wait for complete responses                       |
 | `--no-tokens` / `--tokens`  | Hide / show token usage (overrides config)        |
+| `--no-cost`                 | Hide the estimated cost (overrides config)        |
 | `--init`                    | Generate default config                           |
 
 Providers that are disabled (`enabled = false`) or have no API key are skipped. When you name one explicitly with `-p`, `ai` prints a note saying why it was skipped; if nothing is left to query, it lists every reason.
@@ -233,6 +256,7 @@ src/
 ├── search.rs     SearchEngine: Tavily + Gemini grounding, fallback logic
 ├── markdown.rs   pulldown-cmark → ratatui styled lines
 ├── display.rs    Sequential + streaming terminal output
+├── pricing.rs    Per-model prices and the footer's cost estimate
 ├── chat.rs       Interactive chat (rustyline) with slash commands
 ├── models.rs     OpenRouter model listing
 └── ui.rs         Ratatui TUI — interactive side-by-side chat panels

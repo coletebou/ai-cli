@@ -701,6 +701,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             initial,
             reasoning_str,
             cli.continue_session,
+            !cli.no_expand,
         )
         .await?;
         return Ok(ExitCode::SUCCESS);

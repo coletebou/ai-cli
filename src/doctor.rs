@@ -56,12 +56,6 @@ const PROXY_VARS: [&str; 6] = [
     "all_proxy",
 ];
 
-const LANGFUSE_VARS: [&str; 3] = [
-    "LANGFUSE_HOST",
-    "LANGFUSE_PUBLIC_KEY",
-    "LANGFUSE_SECRET_KEY",
-];
-
 // =============================================================================
 // Entry point
 // =============================================================================
@@ -664,7 +658,9 @@ impl AuthSource {
 /// Work out where a provider's credentials come from, mirroring the
 /// precedence the query path uses (`Config::get_api_key`: config `api_key`,
 /// then `api_key_env`, with `GOOGLE_API_KEY` as the fallback for
-/// `GEMINI_API_KEY`). Bedrock `bedrock-runtime` providers read the token from
+/// `GEMINI_API_KEY`). Blank values count as unset there, so a blank
+/// `api_key` falls through to the env var and a blank `GEMINI_API_KEY` to
+/// `GOOGLE_API_KEY`. Bedrock `bedrock-runtime` providers read the token from
 /// `api_key_env` only (`BedrockClient::from_env`), so `api_key` is ignored
 /// for them. Returns the key alongside so the probe can use it.
 fn resolve_auth(
@@ -684,17 +680,22 @@ fn resolve_auth(
     }
 
     let kind = provider_kind(name, cfg);
+    let mut config_key_blank = false;
     if kind != ProviderKind::BedrockConverse {
         if let Some(key) = &cfg.api_key {
             if key.trim().is_empty() {
-                return (AuthSource::ConfigKeyBlank, None);
+                config_key_blank = true;
+            } else {
+                let len = key.chars().count();
+                return (AuthSource::ConfigKey { len }, Some(Secret(key.clone())));
             }
-            let len = key.chars().count();
-            return (AuthSource::ConfigKey { len }, Some(Secret(key.clone())));
         }
     }
 
     let Some(var) = cfg.api_key_env.as_deref() else {
+        if config_key_blank {
+            return (AuthSource::ConfigKeyBlank, None);
+        }
         let unreferenced = conventional_key_env(name, kind)
             .filter(|var| non_blank(env.var(var)).is_some())
             .map(str::to_string);
@@ -705,24 +706,34 @@ fn resolve_auth(
     if var == "GEMINI_API_KEY" && kind != ProviderKind::BedrockConverse {
         candidates.push("GOOGLE_API_KEY".to_string());
     }
-    // First var that is set wins, even if blank: that's what the query path
-    // does, so a blank GEMINI_API_KEY shadows a valid GOOGLE_API_KEY there too.
+    // First non-blank var wins, as in the query path.
+    let mut first_blank = None;
     for var in &candidates {
-        if let Some(value) = env.var(var) {
-            if value.trim().is_empty() {
-                return (AuthSource::EnvBlank { var: var.clone() }, None);
+        match env.var(var) {
+            Some(value) if !value.trim().is_empty() => {
+                let len = value.chars().count();
+                return (
+                    AuthSource::EnvVar {
+                        var: var.clone(),
+                        len,
+                    },
+                    Some(Secret(value)),
+                );
             }
-            let len = value.chars().count();
-            return (
-                AuthSource::EnvVar {
-                    var: var.clone(),
-                    len,
-                },
-                Some(Secret(value)),
-            );
+            Some(_) => {
+                first_blank.get_or_insert_with(|| var.clone());
+            }
+            None => {}
         }
     }
-    (AuthSource::EnvUnset { vars: candidates }, None)
+    // Nothing usable: point at the most specific culprit.
+    if config_key_blank {
+        (AuthSource::ConfigKeyBlank, None)
+    } else if let Some(var) = first_blank {
+        (AuthSource::EnvBlank { var }, None)
+    } else {
+        (AuthSource::EnvUnset { vars: candidates }, None)
+    }
 }
 
 #[derive(Debug)]
@@ -1687,39 +1698,59 @@ fn search_section(search: &SearchConfig, env: &dyn Environment) -> Section {
     }
 }
 
+/// Reports what `telemetry::init` will do, via the same resolution rules
+/// (ai-cli's own `AI_CLI_LANGFUSE_*` set first, never mixed with the generic
+/// `LANGFUSE_*` one), so the two can't disagree.
 fn telemetry_section(env: &dyn Environment) -> Section {
-    let disabled = env
-        .var("LANGFUSE_ENABLED")
-        .is_some_and(|v| v.eq_ignore_ascii_case("false") || v == "0");
-    let (set, missing): (Vec<&str>, Vec<&str>) = LANGFUSE_VARS
-        .iter()
-        .copied()
-        .partition(|var| non_blank(env.var(var)).is_some());
-
-    let check = if disabled {
-        Check::new(
+    use crate::telemetry::Setup;
+    let setup = crate::telemetry::describe_setup(|name| env.var(name));
+    let shared_hint = "these are the generic LANGFUSE_* variables, which other apps on this \
+                       machine may share; set AI_CLI_LANGFUSE_HOST, AI_CLI_LANGFUSE_PUBLIC_KEY and \
+                       AI_CLI_LANGFUSE_SECRET_KEY to give ai-cli its own project";
+    let check = match &setup {
+        Setup::SwitchedOff(var) => Check::new(
             Status::Info,
-            "Langfuse telemetry disabled (LANGFUSE_ENABLED=false)",
-        )
-    } else if missing.is_empty() {
-        Check::new(
-            Status::Ok,
-            format!("Langfuse telemetry on ({} set)", set.join(", ")),
-        )
-    } else if set.is_empty() {
-        Check::new(
+            format!("Langfuse telemetry disabled ({var}=false)"),
+        ),
+        Setup::Export { host, vars } => {
+            let check = Check::new(
+                Status::Ok,
+                format!(
+                    "Langfuse telemetry on ({} set) -> {}",
+                    vars.join(", "),
+                    redact_url(host)
+                ),
+            );
+            if setup.uses_generic_vars() {
+                check.detail(shared_hint)
+            } else {
+                check
+            }
+        }
+        Setup::Incomplete { vars, missing } => {
+            let set: Vec<&str> = vars
+                .iter()
+                .copied()
+                .filter(|v| !missing.contains(v))
+                .collect();
+            let check = Check::new(
+                Status::Warn,
+                format!(
+                    "Langfuse telemetry off: {} not set ({} set)",
+                    missing.join(", "),
+                    set.join(", ")
+                ),
+            );
+            if setup.uses_generic_vars() {
+                check
+            } else {
+                check.detail("ai-cli doesn't fall back to LANGFUSE_* while any AI_CLI_LANGFUSE_* credential is set")
+            }
+        }
+        Setup::NotConfigured => Check::new(
             Status::Info,
-            "Langfuse telemetry off (LANGFUSE_* not set; optional)",
-        )
-    } else {
-        Check::new(
-            Status::Warn,
-            format!(
-                "Langfuse telemetry off: {} not set ({} set)",
-                missing.join(", "),
-                set.join(", ")
-            ),
-        )
+            "Langfuse telemetry off (AI_CLI_LANGFUSE_* / LANGFUSE_* not set; optional)",
+        ),
     };
     Section {
         title: "Telemetry",
@@ -2292,6 +2323,47 @@ mod tests {
     }
 
     #[test]
+    fn blank_values_fall_through_like_the_query_path() {
+        // `Config::get_api_key` treats blank values as unset, so a blank
+        // GEMINI_API_KEY falls back to GOOGLE_API_KEY...
+        let env = FakeEnv::new(&[("GEMINI_API_KEY", "  "), ("GOOGLE_API_KEY", "AIza-test")]);
+        let (auth, secret) = resolve_auth("google", &provider(Some("GEMINI_API_KEY"), None), &env);
+        assert_eq!(
+            auth,
+            AuthSource::EnvVar {
+                var: "GOOGLE_API_KEY".into(),
+                len: 9
+            }
+        );
+        assert!(secret.is_some());
+
+        // ...a blank config api_key falls back to the env var...
+        let env = FakeEnv::new(&[("OPENAI_API_KEY", "sk-test")]);
+        let (auth, _) = resolve_auth("openai", &provider(Some("OPENAI_API_KEY"), Some(" ")), &env);
+        assert_eq!(
+            auth,
+            AuthSource::EnvVar {
+                var: "OPENAI_API_KEY".into(),
+                len: 7
+            }
+        );
+
+        // ...and when nothing is usable, the blank config key is the culprit
+        // named, then the first blank env var.
+        let env = FakeEnv::new(&[("OPENAI_API_KEY", " ")]);
+        let (auth, _) = resolve_auth("openai", &provider(Some("OPENAI_API_KEY"), Some("")), &env);
+        assert_eq!(auth, AuthSource::ConfigKeyBlank);
+        let env = FakeEnv::new(&[("GEMINI_API_KEY", " "), ("GOOGLE_API_KEY", "")]);
+        let (auth, _) = resolve_auth("google", &provider(Some("GEMINI_API_KEY"), None), &env);
+        assert_eq!(
+            auth,
+            AuthSource::EnvBlank {
+                var: "GEMINI_API_KEY".into()
+            }
+        );
+    }
+
+    #[test]
     fn unset_env_key_is_reported() {
         let env = FakeEnv::new(&[]);
         let (auth, _) = resolve_auth("openai", &provider(Some("OPENAI_API_KEY"), None), &env);
@@ -2841,6 +2913,59 @@ mod tests {
             ("LANGFUSE_ENABLED", "false"),
         ]));
         assert!(off.checks[0].text.contains("disabled"));
+    }
+
+    #[test]
+    fn telemetry_follows_ai_cli_precedence() {
+        let generic = [
+            ("LANGFUSE_HOST", "https://other-app.example"),
+            ("LANGFUSE_PUBLIC_KEY", "p"),
+            ("LANGFUSE_SECRET_KEY", "s"),
+        ];
+
+        // The generic set works, but doctor points out it may be shared.
+        let shared = telemetry_section(&FakeEnv::new(&generic));
+        assert_eq!(shared.checks[0].status, Status::Ok);
+        assert!(shared.checks[0].details[0].contains("AI_CLI_LANGFUSE_HOST"));
+
+        // AI_CLI_LANGFUSE_ENABLED=false turns ai-cli off even with the
+        // generic set present (the other app keeps LANGFUSE_ENABLED).
+        let mut vars = generic.to_vec();
+        vars.push(("AI_CLI_LANGFUSE_ENABLED", "false"));
+        let off = telemetry_section(&FakeEnv::new(&vars));
+        assert_eq!(off.checks[0].status, Status::Info);
+        assert_eq!(
+            off.checks[0].text,
+            "Langfuse telemetry disabled (AI_CLI_LANGFUSE_ENABLED=false)"
+        );
+
+        // ai-cli's own set wins, and its host is the one reported.
+        let own = telemetry_section(&FakeEnv::new(&[
+            generic[0],
+            generic[1],
+            generic[2],
+            ("AI_CLI_LANGFUSE_HOST", "https://ai-cli.example"),
+            ("AI_CLI_LANGFUSE_PUBLIC_KEY", "p2"),
+            ("AI_CLI_LANGFUSE_SECRET_KEY", "s2"),
+        ]));
+        assert_eq!(own.checks[0].status, Status::Ok);
+        assert!(own.checks[0].text.contains("AI_CLI_LANGFUSE_HOST"));
+        assert!(own.checks[0].text.contains("ai-cli.example"));
+        assert!(!own.checks[0].text.contains("other-app.example"));
+        assert!(own.checks[0].details.is_empty());
+
+        // A partial ai-cli set is off, with no fallback to the generic one.
+        let partial = telemetry_section(&FakeEnv::new(&[
+            generic[0],
+            generic[1],
+            generic[2],
+            ("AI_CLI_LANGFUSE_HOST", "https://ai-cli.example"),
+        ]));
+        assert_eq!(partial.checks[0].status, Status::Warn);
+        assert!(partial.checks[0]
+            .text
+            .contains("AI_CLI_LANGFUSE_PUBLIC_KEY, AI_CLI_LANGFUSE_SECRET_KEY not set"));
+        assert!(partial.checks[0].details[0].contains("doesn't fall back"));
     }
 
     // --- end to end (no network) ----------------------------------------------------

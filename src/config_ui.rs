@@ -1024,7 +1024,7 @@ mod tests {
             (Section::General, 1),
             (Section::CliMode, 4),
             (Section::TuiMode, 4),
-            (Section::Display, 4),
+            (Section::Display, 5),
             (Section::Search, 4),
             (Section::Providers, providers),
         ];

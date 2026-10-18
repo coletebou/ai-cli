@@ -1066,6 +1066,8 @@ async fn run_turn(
 /// Entry point for interactive chat mode. `reasoning` is the display label
 /// for the `-r` level, shown in each turn's footer. `continue_session`
 /// (`--continue`) starts from the most recently updated saved session.
+/// `expand_file_refs` is false under `--no-expand`, for every turn.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_interactive(
     manager: Arc<ProviderManager>,
     provider: Provider,
@@ -1074,6 +1076,7 @@ pub async fn run_interactive(
     initial_question: Option<String>,
     reasoning: Option<String>,
     continue_session: bool,
+    expand_file_refs: bool,
 ) -> Result<()> {
     // Refuse before the first (paid) turn if there's no terminal to chat on.
     let term = if cfg!(unix) {
@@ -1250,11 +1253,17 @@ pub async fn run_interactive(
                 if rl.add_history_entry(trimmed).unwrap_or(false) {
                     history_file.save(rl.history_mut());
                 }
-                let expanded = match crate::context::expand_file_refs(trimmed) {
-                    Ok(expanded) => expanded,
-                    Err(e) => {
-                        println!("{} {:#} (message not sent)", "!".yellow(), e);
-                        continue;
+                // `--no-expand` applies to every chat turn, not just the
+                // first question.
+                let expanded = if !expand_file_refs {
+                    trimmed.to_string()
+                } else {
+                    match crate::context::expand_file_refs(trimmed) {
+                        Ok(expanded) => expanded,
+                        Err(e) => {
+                            println!("{} {:#} (message not sent)", "!".yellow(), e);
+                            continue;
+                        }
                     }
                 };
                 messages.push(ChatMessage::user(expanded));

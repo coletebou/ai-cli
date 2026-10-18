@@ -237,6 +237,78 @@ fn resolve(env: impl Fn(&str) -> Option<String>) -> Resolution {
     }
 }
 
+/// How telemetry is configured in an environment, as `ai doctor` reports it.
+/// Holds variable names and the host, never key values.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Setup {
+    /// Switched off by this variable (`AI_CLI_LANGFUSE_ENABLED` or
+    /// `LANGFUSE_ENABLED`).
+    SwitchedOff(&'static str),
+    /// Exporting to `host` with the credential set named by `vars`.
+    Export {
+        host: String,
+        vars: [&'static str; 3],
+    },
+    /// Off: some of `vars` are set but `missing` aren't.
+    Incomplete {
+        vars: [&'static str; 3],
+        missing: Vec<&'static str>,
+    },
+    /// No credentials configured at all.
+    NotConfigured,
+}
+
+impl Setup {
+    /// Whether the credentials come from the generic `LANGFUSE_*` names,
+    /// which other apps on the same machine may share.
+    pub(crate) fn uses_generic_vars(&self) -> bool {
+        matches!(self, Setup::Export { vars, .. } | Setup::Incomplete { vars, .. } if *vars == GENERIC_KEYS)
+    }
+}
+
+/// [`resolve`]'s decision, spelled out for `ai doctor` so the report can't
+/// drift from what `init` actually does.
+pub(crate) fn describe_setup(env: impl Fn(&str) -> Option<String>) -> Setup {
+    let (ai_cli_switch, generic_switch) = ENABLED_SWITCH;
+    if is_switched_off(switch_value(&env, ENABLED_SWITCH).as_deref()) {
+        let var = if non_empty(env(ai_cli_switch)).is_some() {
+            ai_cli_switch
+        } else {
+            generic_switch
+        };
+        return Setup::SwitchedOff(var);
+    }
+    let missing_of = |vars: [&'static str; 3]| {
+        vars.into_iter()
+            .filter(|&v| non_empty(env(v)).is_none())
+            .collect::<Vec<_>>()
+    };
+    match resolve(&env) {
+        Resolution::Export(credentials) => {
+            let ai_cli = AI_CLI_KEYS.iter().any(|&v| non_empty(env(v)).is_some());
+            Setup::Export {
+                host: credentials.host,
+                vars: if ai_cli { AI_CLI_KEYS } else { GENERIC_KEYS },
+            }
+        }
+        Resolution::Incomplete(missing) => Setup::Incomplete {
+            vars: AI_CLI_KEYS,
+            missing,
+        },
+        Resolution::Off => {
+            let missing = missing_of(GENERIC_KEYS);
+            if missing.len() == GENERIC_KEYS.len() {
+                Setup::NotConfigured
+            } else {
+                Setup::Incomplete {
+                    vars: GENERIC_KEYS,
+                    missing,
+                }
+            }
+        }
+    }
+}
+
 /// The one-line stderr warning for an incomplete `AI_CLI_LANGFUSE_*` set.
 /// Takes only variable names, so no value can end up in it.
 fn incomplete_warning(missing: &[&str]) -> String {

@@ -15,7 +15,7 @@ $ ai -w "latest release of tokio?"          # with web search
 - **Side-by-side TUI.** `-t` splits the terminal into per-provider panels with proper markdown rendering. Interactive by default: type follow-ups, scroll with the mouse wheel, cancel with Ctrl+C.
 - **Streaming by default.** Tokens appear as they arrive; no waiting for the full response.
 - **Web search tool use.** `-w` exposes a `web_search` tool to any model — backed by Gemini (Google Search grounding) or Tavily, with automatic fallback.
-- **Interactive chat.** `-i` keeps conversation history so you can ask follow-ups. It supports multi-line input, `@file` references and input history that persists across sessions. `/clear`, `/history`, `/export`, `/help` built in.
+- **Interactive chat.** `-i` keeps conversation history so you can ask follow-ups. It supports multi-line input, `@file` references and input history that persists across sessions. Chats can be saved, reloaded and resumed with `-i --continue`. `/clear`, `/history`, `/export`, `/save`, `/load`, `/sessions`, `/help` built in.
 - **Config-driven.** Edit `~/.config/ai-cli/config.toml` or run `ai config` for a TUI editor.
 - **Reasoning control.** `-r low|medium|high|<budget>` for models that support it.
 - **Raw mode.** `--raw` for pipeable output (good for scripts).
@@ -54,6 +54,7 @@ ai "explain @src/main.rs briefly"                             # inline a file wi
 ai -p claude,gpt "compare these approaches"                   # specific providers
 ai -t "design a rate limiter"                                 # TUI mode
 ai -i                                                         # interactive chat
+ai -i --continue                                              # resume the last chat
 ai -w "what changed in React 19.1?"                           # web search
 ai -r high "prove this theorem"                               # high-reasoning mode
 ai --raw "generate a commit message" | pbcopy                 # raw/pipeable
@@ -184,6 +185,8 @@ ai completions fish > ~/.config/fish/completions/ai.fish
 ai -i                               # start empty
 ai -i "initial question"            # start with a seed question
 cat error.log | ai -i "what broke?" # seed with piped input, then keep chatting
+ai -i --continue                    # resume the most recently saved session (short: ai -ic)
+ai -ic "one more thing"             # resume it and ask a follow-up straight away
 ```
 
 With piped stdin, the piped content becomes part of the first question and chat keeps reading your replies from the terminal. Without a terminal (e.g. in CI), `-i` exits with an error; drop `-i` for a one-shot answer.
@@ -197,9 +200,20 @@ Slash commands inside chat:
 | `/history`             | Print the full message history                            |
 | `/export [path.md]`    | Save conversation as markdown. If you omit the path, it's auto-named `chat-<timestamp>.md` (with `-1`, `-2`… if taken). It never overwrites an existing file. |
 | `/export! <path.md>`   | Same, but replace the file if it exists                   |
+| `/save [name]`         | Save the chat as a session. Without a name it keeps the session's current name, or gets a timestamp name like `chat-20260930-142501` (UTC). |
+| `/save! <name>`        | Same, but replace a different session that has this name  |
+| `/load <name>`         | Replace the chat with a saved session                     |
+| `/sessions`            | List saved sessions, newest first, with age, turn count, model and first message |
 | `/help`                | Show available commands                                   |
 
 A line that starts with a path, such as `/etc/nginx/nginx.conf fails with …`, is sent as a message, not treated as a command. The export path may be quoted (`/export "my chat.md"`) and may start with `~/`.
+
+Sessions:
+
+- **Autosave.** On exit (`/exit` or `Ctrl+D`), a chat with new turns is saved: under its session name if it was saved or loaded before, otherwise as `last`. The next unnamed chat replaces `last`, so use `/save <name>` to keep one. `ai -i --continue` (`-c`, needs `-i`) resumes whichever session was saved most recently.
+- **Loading.** `/load` and `--continue` keep the current provider and model. If the session was saved with different ones, chat says so; pick another with `-p`. The session keeps its own system prompt. If the chat you're leaving has unsaved turns, `/load` saves them first (under its name, or a timestamp name) and tells you where.
+- **Names** may use letters, digits, `.`, `_` and `-`. `/save <name>` won't replace a different session with the same name unless you use `/save!`. `/clear` starts a new, unnamed chat and leaves the saved session alone.
+- **Storage.** Each session is a JSON file in `<data dir>/ai-cli/chats/<name>.json` (same data dir as the input history below). It holds the full message history, including `@file` contents, piped input and web-search results, plus the provider, model and timestamps. Writes are atomic. On Linux and macOS the files are readable only by you (mode 0600).
 
 Input:
 
@@ -207,7 +221,7 @@ Input:
 - **`@path` references** expand to the file's contents, the same as on the command line.
 - **Input history.** Up/Down recall earlier messages, including ones from previous sessions. They're saved in `<data dir>/ai-cli/chat_history.txt`: `~/.local/share` on Linux, `~/Library/Application Support` on macOS, `%APPDATA%` on Windows. The file keeps the last 1000 entries. On Linux and macOS it's readable only by you (mode 0600).
 
-`Ctrl+D` exits. At the prompt, `Ctrl+C` clears the current input line. During a reply, `Ctrl+C` stops the streaming response; press it again if the provider doesn't stop, and chat quits (exit code 130). The conversation persists across turns; use `/clear` to reset.
+`Ctrl+D` exits. At the prompt, `Ctrl+C` clears the current input line. During a reply, `Ctrl+C` stops the streaming response; press it again if the provider doesn't stop, and chat quits (exit code 130, without the autosave). The conversation persists across turns; use `/clear` to reset.
 
 Chat is single-provider — if multiple are configured, the first is used and the rest are noted as skipped.
 

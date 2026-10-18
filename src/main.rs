@@ -14,6 +14,7 @@ mod providers;
 mod query;
 mod retry;
 mod search;
+mod sessions;
 mod telemetry;
 mod term;
 mod ui;
@@ -158,6 +159,10 @@ struct Cli {
     /// Send @path tokens as literal text instead of inlining files
     #[arg(long)]
     no_expand: bool,
+
+    /// With -i: resume the most recently saved chat session
+    #[arg(short = 'c', long = "continue", requires = "interactive")]
+    continue_session: bool,
 }
 
 #[derive(Subcommand)]
@@ -582,8 +587,16 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         } else {
             Some(question.clone())
         };
-        crate::chat::run_interactive(manager, provider, ctx, footer, initial, reasoning_str)
-            .await?;
+        crate::chat::run_interactive(
+            manager,
+            provider,
+            ctx,
+            footer,
+            initial,
+            reasoning_str,
+            cli.continue_session,
+        )
+        .await?;
         return Ok(ExitCode::SUCCESS);
     }
 

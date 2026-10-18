@@ -2,6 +2,7 @@ use crate::config::FooterConfig;
 use crate::display::StreamingDisplay;
 use crate::providers::{Provider, ProviderManager};
 use crate::query::{stream_with_messages, QueryContext, StreamEvent};
+use crate::sessions::{self, SessionStore, Tracker};
 use anyhow::{Context, Result};
 use colored::Colorize;
 use genai::chat::{ChatMessage, ChatRole, ContentPart};
@@ -32,6 +33,19 @@ enum Command {
         path: Option<PathBuf>,
         force: bool,
     },
+    /// Save the conversation as a session (see `sessions`). `name: None`
+    /// keeps the current session's name, or picks a timestamp. `force`
+    /// (`/save! <name>`) replaces a different session with that name.
+    Save {
+        name: Option<String>,
+        force: bool,
+    },
+    /// Replace the conversation with a saved session. `None` prints usage.
+    Load {
+        name: Option<String>,
+    },
+    /// List saved sessions.
+    Sessions,
     Unknown(String),
 }
 
@@ -52,19 +66,32 @@ fn parse_command(line: &str) -> Option<Command> {
     let cmd = word.to_lowercase();
     let rest = parts.next().unwrap_or("").trim();
     let home = dirs::home_dir();
+    // Session names are validated when used, so a bad one gets a specific
+    // error instead of "unknown command".
+    let arg = (!rest.is_empty()).then(|| rest.to_string());
     Some(match cmd.as_str() {
         "exit" | "quit" | "q" => Command::Exit,
         "clear" | "reset" => Command::Clear,
         "history" | "log" => Command::History,
         "help" | "?" => Command::Help,
-        "export" | "save" => Command::Export {
+        "export" => Command::Export {
             path: parse_export_path(rest, home.as_deref()),
             force: false,
         },
-        "export!" | "save!" => Command::Export {
+        "export!" => Command::Export {
             path: parse_export_path(rest, home.as_deref()),
             force: true,
         },
+        "save" => Command::Save {
+            name: arg,
+            force: false,
+        },
+        "save!" => Command::Save {
+            name: arg,
+            force: true,
+        },
+        "load" => Command::Load { name: arg },
+        "sessions" => Command::Sessions,
         other => Command::Unknown(other.to_string()),
     })
 }
@@ -130,7 +157,33 @@ fn print_help() {
         "  {}  — same, but replace the file if it already exists",
         "/export! <path.md>".cyan()
     );
+    println!(
+        "  {}  — save this chat as a session (default name: its current one, or a timestamp)",
+        "/save [name]".cyan()
+    );
+    println!(
+        "  {}  — same, but replace a different session that has this name",
+        "/save! <name>".cyan()
+    );
+    println!(
+        "  {}  — switch to a saved session (unsaved turns here are saved first)",
+        "/load <name>".cyan()
+    );
+    println!(
+        "  {}  — list saved sessions, newest first",
+        "/sessions".cyan()
+    );
     println!("  {}  — show this help", "/help".cyan());
+    println!();
+    println!(
+        "{}",
+        format!(
+            "On exit, new turns are saved to the current session (or to `{}`). \
+             `ai -i --continue` resumes the newest session.",
+            sessions::AUTOSAVE_NAME
+        )
+        .dimmed()
+    );
     println!();
     println!("{}", "Input:".bold());
     println!(
@@ -371,6 +424,214 @@ fn print_history(messages: &[ChatMessage]) {
         assistant_count,
     );
     println!();
+}
+
+// ---------------------------------------------------------------------------
+// Saved sessions: /save, /load, /sessions, --continue (storage in sessions.rs)
+// ---------------------------------------------------------------------------
+
+/// Messages a fresh conversation starts with: just the system prompt, if any.
+fn initial_messages(ctx: &QueryContext) -> Vec<ChatMessage> {
+    ctx.system_prompt
+        .iter()
+        .map(|system| ChatMessage::system(system.clone()))
+        .collect()
+}
+
+/// The context every chat turn runs with: `ctx` minus the startup system
+/// prompt. The conversation already carries its system prompt as a message
+/// (the startup one from `initial_messages`, or whatever a loaded session
+/// was saved with). The Bedrock path sends `ctx.system_prompt` on top of the
+/// system messages, so passing it too would add the startup persona to a
+/// loaded session's, or bring it back into one saved without a prompt.
+fn turn_context(ctx: &QueryContext) -> QueryContext {
+    let mut turn = ctx.clone();
+    turn.system_prompt = None;
+    turn
+}
+
+fn plural_turns(n: usize) -> String {
+    format!("{} {}", n, if n == 1 { "turn" } else { "turns" })
+}
+
+/// Swap in saved session `name` (for `/load` and `--continue`) and say how it
+/// differs from the current setup. The current provider always stays: the
+/// user picked it for this run with `-p` or the config.
+fn load_session(
+    tracker: &mut Tracker,
+    name: &str,
+    messages: &mut Vec<ChatMessage>,
+    provider: &Provider,
+    ctx: &QueryContext,
+    verb: &str,
+) {
+    let now = now_unix();
+    let loaded = match tracker.load(name, provider, messages, now) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            println!("  {} {:#}", "load failed:".red(), e);
+            return;
+        }
+    };
+    if let Some(stash) = &loaded.stashed {
+        println!(
+            "  {} {}",
+            "saved the previous conversation as".dimmed(),
+            stash.green()
+        );
+    }
+    let session = loaded.session;
+    println!(
+        "  {} {} {}",
+        verb.dimmed(),
+        name.green(),
+        format!(
+            "({}, updated {}; /history shows it)",
+            plural_turns(sessions::user_turns(&session.messages)),
+            sessions::format_age(session.updated, now)
+        )
+        .dimmed()
+    );
+    if session.provider != provider.display_name || session.model != provider.model {
+        println!(
+            "  {} it was saved with {} ({}); continuing with {} ({})",
+            "!".yellow(),
+            session.provider,
+            session.model,
+            provider.display_name,
+            provider.model
+        );
+    }
+    // The conversation is restored as saved, system prompt included.
+    match (
+        sessions::system_prompt(&session.messages),
+        &ctx.system_prompt,
+    ) {
+        (saved, current) if saved.as_ref() == current.as_ref() => {}
+        (Some(_), _) => println!(
+            "  {} it keeps the system prompt it was saved with",
+            "!".yellow()
+        ),
+        (None, _) => println!(
+            "  {} it was saved without a system prompt, so the current one isn't used",
+            "!".yellow()
+        ),
+    }
+    if ctx.search_client.is_none() && sessions::has_tool_calls(&session.messages) {
+        println!(
+            "  {} it contains web-search tool calls; if the provider rejects them, restart with -w",
+            "!".yellow()
+        );
+    }
+    *messages = session.messages;
+}
+
+/// `--continue`: load the most recently updated session, if there is one.
+fn resume_latest(
+    tracker: &mut Tracker,
+    messages: &mut Vec<ChatMessage>,
+    provider: &Provider,
+    ctx: &QueryContext,
+) {
+    let listing = match tracker.store().map(SessionStore::list) {
+        Some(Ok(listing)) => listing,
+        Some(Err(e)) => {
+            println!("  {} can't continue: {:#}", "!".yellow(), e);
+            return;
+        }
+        None => {
+            println!(
+                "  {} can't continue: this system has no data directory",
+                "!".yellow()
+            );
+            return;
+        }
+    };
+    for (name, err) in &listing.unreadable {
+        println!("  {} skipped session {}: {}", "!".yellow(), name, err);
+    }
+    match listing.sessions.first() {
+        Some(latest) => {
+            let name = latest.name.clone();
+            load_session(tracker, &name, messages, provider, ctx, "resumed");
+        }
+        None => println!(
+            "  {}",
+            "no saved sessions to continue; starting a new chat".dimmed()
+        ),
+    }
+    println!();
+}
+
+/// `/sessions`: saved sessions, newest first. `*` marks the current one.
+fn print_sessions(tracker: &Tracker, now: u64) {
+    println!();
+    let Some(store) = tracker.store() else {
+        println!(
+            "  {} sessions are unavailable: this system has no data directory",
+            "!".yellow()
+        );
+        println!();
+        return;
+    };
+    let listing = match store.list() {
+        Ok(listing) => listing,
+        Err(e) => {
+            println!("  {} {:#}", "could not list sessions:".red(), e);
+            println!();
+            return;
+        }
+    };
+    if listing.sessions.is_empty() {
+        println!(
+            "  {}",
+            "no saved sessions yet; /save [name] saves this one".dimmed()
+        );
+    }
+    let name_width = listing.sessions.iter().map(|s| s.name.len()).max();
+    let model_width = listing
+        .sessions
+        .iter()
+        .map(|s| s.model.chars().count())
+        .max();
+    for s in &listing.sessions {
+        let marker = if tracker.name() == Some(s.name.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        println!(
+            "  {} {}  {:>10}  {:>9}  {}  {}",
+            marker,
+            format!("{:<w$}", s.name, w = name_width.unwrap_or(0))
+                .cyan()
+                .bold(),
+            sessions::format_age(s.updated, now),
+            plural_turns(s.turns),
+            format!("{:<w$}", s.model, w = model_width.unwrap_or(0)).dimmed(),
+            s.preview.as_deref().unwrap_or(""),
+        );
+    }
+    for (name, err) in &listing.unreadable {
+        println!("  {} skipped {}: {}", "!".yellow(), name, err);
+    }
+    println!();
+    println!("  {} {}", "stored in".dimmed(), store.dir().display());
+    println!();
+}
+
+/// Exit autosave, so `--continue` can resume this conversation.
+fn autosave_on_exit(tracker: &mut Tracker, messages: &[ChatMessage], provider: &Provider) {
+    match tracker.autosave(provider, messages, now_unix()) {
+        Ok(Some(name)) => println!(
+            "  {} {} {}",
+            "saved session".dimmed(),
+            name.green(),
+            "(`ai -i --continue` resumes it)".dimmed()
+        ),
+        Ok(None) => {}
+        Err(e) => eprintln!("[warn] could not save the session: {:#}", e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -803,7 +1064,8 @@ async fn run_turn(
 }
 
 /// Entry point for interactive chat mode. `reasoning` is the display label
-/// for the `-r` level, shown in each turn's footer.
+/// for the `-r` level, shown in each turn's footer. `continue_session`
+/// (`--continue`) starts from the most recently updated saved session.
 pub async fn run_interactive(
     manager: Arc<ProviderManager>,
     provider: Provider,
@@ -811,6 +1073,7 @@ pub async fn run_interactive(
     footer: FooterConfig,
     initial_question: Option<String>,
     reasoning: Option<String>,
+    continue_session: bool,
 ) -> Result<()> {
     // Refuse before the first (paid) turn if there's no terminal to chat on.
     let term = if cfg!(unix) {
@@ -835,14 +1098,18 @@ pub async fn run_interactive(
     let mut history_file = HistoryFile::new(default_history_path());
     history_file.load(rl.history_mut());
 
-    // Seed history: start with system prompt if any
-    let mut messages: Vec<ChatMessage> = Vec::new();
-    if let Some(system) = &ctx.system_prompt {
-        messages.push(ChatMessage::system(system.clone()));
+    // Seed history: start with system prompt if any, or with the saved
+    // session for --continue.
+    let mut messages = initial_messages(&ctx);
+    let turn_ctx = turn_context(&ctx);
+    let mut tracker = Tracker::new(SessionStore::default_location());
+    if continue_session {
+        resume_latest(&mut tracker, &mut messages, &provider, &ctx);
     }
 
-    // If the user provided an initial question on the CLI, run it as turn 1.
-    // main.rs has already expanded its @file references.
+    // If the user provided an initial question on the CLI, run it as turn 1
+    // (the next turn, with --continue). main.rs has already expanded its
+    // @file references.
     if let Some(question) = initial_question {
         let question = question.trim().to_string();
         if !question.is_empty() {
@@ -851,13 +1118,16 @@ pub async fn run_interactive(
                 Arc::clone(&manager),
                 provider.clone(),
                 messages.clone(),
-                ctx.clone(),
+                turn_ctx.clone(),
                 footer.clone(),
                 reasoning.clone(),
             )
             .await
             {
-                Some(enriched) => messages = enriched,
+                Some(enriched) => {
+                    messages = enriched;
+                    tracker.turn_completed(now_unix());
+                }
                 None => {
                     // Hard error on turn 1 — drop the user message so the history stays clean
                     messages.pop();
@@ -866,8 +1136,9 @@ pub async fn run_interactive(
         }
     }
 
-    // Interactive loop
-    loop {
+    // Interactive loop. Every way out breaks with the result, so the exit
+    // autosave below runs for Ctrl+D, /exit and a broken terminal alike.
+    let outcome = loop {
         let read = rl.readline("> ");
         // Continuation breaks belong to this readline call only; take them
         // now so they can't leak into the next one.
@@ -882,20 +1153,13 @@ pub async fn run_interactive(
 
                 if let Some(cmd) = parse_command(trimmed) {
                     match cmd {
-                        Command::Exit => {
-                            println!("{}", "bye".dimmed());
-                            break;
-                        }
+                        Command::Exit => break Ok(()),
                         Command::Clear => {
-                            let had_system = messages
-                                .iter()
-                                .any(|m| matches!(m.role, genai::chat::ChatRole::System));
-                            messages.clear();
-                            if had_system {
-                                if let Some(system) = &ctx.system_prompt {
-                                    messages.push(ChatMessage::system(system.clone()));
-                                }
-                            }
+                            // A new conversation with the current settings.
+                            // Detaching means it's saved as a new session
+                            // rather than over the one it replaced.
+                            messages = initial_messages(&ctx);
+                            tracker.detach();
                             println!("{}", "conversation cleared".dimmed());
                             continue;
                         }
@@ -922,6 +1186,46 @@ pub async fn run_interactive(
                                     println!("  {} {:#}", "export failed:".red(), e)
                                 }
                             }
+                            continue;
+                        }
+                        Command::Save { name, force } => {
+                            match tracker.save(
+                                name.as_deref(),
+                                force,
+                                &provider,
+                                &messages,
+                                now_unix(),
+                            ) {
+                                Ok((name, path)) => println!(
+                                    "  {} {} {}",
+                                    "saved session".dimmed(),
+                                    name.green(),
+                                    format!("({})", path.display()).dimmed()
+                                ),
+                                Err(e) => println!("  {} {:#}", "save failed:".red(), e),
+                            }
+                            continue;
+                        }
+                        Command::Load { name: Some(name) } => {
+                            load_session(
+                                &mut tracker,
+                                &name,
+                                &mut messages,
+                                &provider,
+                                &ctx,
+                                "loaded",
+                            );
+                            continue;
+                        }
+                        Command::Load { name: None } => {
+                            println!(
+                                "{} usage: /load <name> (/sessions lists saved sessions)",
+                                "!".yellow()
+                            );
+                            continue;
+                        }
+                        Command::Sessions => {
+                            print_sessions(&tracker, now_unix());
                             continue;
                         }
                         Command::Help => {
@@ -959,13 +1263,16 @@ pub async fn run_interactive(
                     Arc::clone(&manager),
                     provider.clone(),
                     messages.clone(),
-                    ctx.clone(),
+                    turn_ctx.clone(),
                     footer.clone(),
                     reasoning.clone(),
                 )
                 .await
                 {
-                    Some(enriched) => messages = enriched,
+                    Some(enriched) => {
+                        messages = enriched;
+                        tracker.turn_completed(now_unix());
+                    }
                     None => {
                         // Drop the user message we just added so the history
                         // doesn't accumulate dangling user turns after errors
@@ -978,18 +1285,19 @@ pub async fn run_interactive(
                 println!("{}", "(press Ctrl+D or type /exit to quit)".dimmed());
                 continue;
             }
-            Err(ReadlineError::Eof) => {
-                println!("{}", "bye".dimmed());
-                break;
-            }
+            Err(ReadlineError::Eof) => break Ok(()),
             Err(e) => {
                 // A broken terminal is a failure, not a normal exit.
-                return Err(anyhow::anyhow!("chat input error: {}", e));
+                break Err(anyhow::anyhow!("chat input error: {}", e));
             }
         }
-    }
+    };
 
-    Ok(())
+    autosave_on_exit(&mut tracker, &messages, &provider);
+    if outcome.is_ok() {
+        println!("{}", "bye".dimmed());
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -1103,15 +1411,85 @@ mod tests {
 
     #[test]
     fn parse_command_bang_export_sets_force() {
-        for line in ["/export! out.md", "/save! out.md"] {
-            match parse_command(line) {
-                Some(Command::Export {
-                    path: Some(p),
-                    force: true,
-                }) => assert_eq!(p, PathBuf::from("out.md")),
-                other => panic!("expected forced Export for {line:?}, got {:?}", other),
-            }
+        match parse_command("/export! out.md") {
+            Some(Command::Export {
+                path: Some(p),
+                force: true,
+            }) => assert_eq!(p, PathBuf::from("out.md")),
+            other => panic!("expected forced Export, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_command_session_commands() {
+        // `/save` used to be an alias for `/export`; it now saves a session.
+        assert!(matches!(
+            parse_command("/save"),
+            Some(Command::Save {
+                name: None,
+                force: false
+            })
+        ));
+        match parse_command("/save  proj-x ") {
+            Some(Command::Save {
+                name: Some(n),
+                force: false,
+            }) => assert_eq!(n, "proj-x"),
+            other => panic!("expected Save(proj-x), got {:?}", other),
+        }
+        match parse_command("/SAVE! proj") {
+            Some(Command::Save {
+                name: Some(n),
+                force: true,
+            }) => assert_eq!(n, "proj"),
+            other => panic!("expected forced Save, got {:?}", other),
+        }
+        // Names keep their case and are validated later, so a bad one gets a
+        // specific error rather than being mangled here.
+        match parse_command("/load My chat") {
+            Some(Command::Load { name: Some(n) }) => assert_eq!(n, "My chat"),
+            other => panic!("expected Load, got {:?}", other),
+        }
+        assert!(matches!(
+            parse_command("/load"),
+            Some(Command::Load { name: None })
+        ));
+        assert!(matches!(
+            parse_command("/sessions"),
+            Some(Command::Sessions)
+        ));
+        // A session name with a dot is still an argument, not a path.
+        assert!(matches!(
+            parse_command("/load notes.v2"),
+            Some(Command::Load { name: Some(_) })
+        ));
+    }
+
+    #[test]
+    fn initial_messages_hold_only_the_system_prompt() {
+        let ctx = QueryContext::new("");
+        assert!(initial_messages(&ctx).is_empty());
+        let ctx = ctx.with_system_prompt(Some("be brief"));
+        let messages = initial_messages(&ctx);
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0].role, ChatRole::System));
+        assert_eq!(messages[0].content.first_text(), Some("be brief"));
+    }
+
+    #[test]
+    fn turns_take_the_system_prompt_from_the_conversation_only() {
+        // The startup prompt is in the conversation's first message; turns
+        // don't pass it again, so a loaded session's own prompt (or its lack
+        // of one) is what the provider gets.
+        let ctx = QueryContext::new("q").with_system_prompt(Some("be brief"));
+        let turn = turn_context(&ctx);
+        assert_eq!(turn.system_prompt, None);
+        assert_eq!(turn.question, "q");
+        assert_eq!(turn.max_iterations, ctx.max_iterations);
+        assert_eq!(
+            sessions::system_prompt(&initial_messages(&ctx)).as_deref(),
+            Some("be brief")
+        );
     }
 
     #[test]

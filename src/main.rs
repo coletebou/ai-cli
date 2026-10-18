@@ -150,6 +150,14 @@ struct Cli {
     /// Hide the estimated cost in the footer (overrides `show_cost` in the config)
     #[arg(long)]
     no_cost: bool,
+
+    /// Never read stdin as context (for scripts, loops, and subprocesses)
+    #[arg(long)]
+    no_stdin: bool,
+
+    /// Send @path tokens as literal text instead of inlining files
+    #[arg(long)]
+    no_expand: bool,
 }
 
 #[derive(Subcommand)]
@@ -365,9 +373,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     // Gather context from piped stdin and inline @file references so the
     // user can do `cat notes.md | ai "summarize this"` or
     // `ai "explain @src/foo.rs"` without hand-rolling the prompt.
-    let stdin = context::read_stdin_if_piped();
-    let raw_question = cli.question.join(" ");
-    let expanded = context::expand_file_refs(&raw_question)?;
+    let stdin = if cli.no_stdin {
+        None
+    } else {
+        context::read_stdin_if_piped()?
+    };
+    let expanded = context::question_from_args(&cli.question, !cli.no_expand)?;
     let question = context::merge_stdin(&expanded, stdin);
 
     // Load configuration

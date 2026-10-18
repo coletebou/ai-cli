@@ -61,8 +61,19 @@ ai --raw "generate a commit message" | pbcopy                 # raw/pipeable
 
 ### Context expansion
 
-- **Piped stdin.** When stdin isn't a TTY, its content is appended to the question as a fenced context block.
-- **`@path` references.** Any token starting with `@` at a word boundary is replaced with the file's contents inside a fenced code block. The path's extension is used as the fence language. Non-existent paths pass through as literal text, so typos are visible.
+Everything that gets inlined is announced on stderr, e.g. `[context] inlined src/main.rs (12.3 KB)`.
+
+- **Piped stdin.** When stdin is a pipe or a redirected file (`cmd | ai "…"`, `ai "…" < log.txt`), its content is appended to the question as a fenced context block. Anything else (a terminal, `/dev/null`, a socket such as the one Node's `spawn()` hands its children) is never read, so `ai` doesn't sit waiting for input that isn't coming. Stdin over 20 MB is an error; bytes that aren't valid UTF-8 are replaced (with a warning) rather than dropped.
+  - Pass `--no-stdin` when a parent process holds stdin open without writing to it (e.g. Python's `Popen(stdin=PIPE)`), since that looks exactly like `cmd | ai`.
+  - In shell loops, keep `ai` off the loop's input, or the first call reads the rest of the file as context:
+    ```bash
+    while read -r q; do ai "$q" </dev/null; done < questions.txt   # or: ai --no-stdin "$q"
+    ```
+- **`@path` references.** A token starting with `@` at a word boundary (or right after `(`, `[`, `"` or `'`) is replaced with the file's contents inside a fenced code block, using the path's extension as the fence language. The fence grows to outlast any backticks in the file, so a README with its own code blocks stays in one piece.
+  - `@~/notes.md` expands the home directory; `@"my notes.md"` quotes a path with spaces. That works as a separate shell word (`ai read @"my notes.md"`) and inside a quoted question (`ai 'read @"my notes.md" please'`). Trailing punctuation stays in the sentence: `(see @notes.md).`
+  - A path that doesn't exist passes through as literal text, with a warning if the token looks like a path (contains `/` or `.`). Directories, files over 20 MB, and binary or non-UTF-8 files are errors. UTF-8 with a BOM and UTF-16 with a BOM (what Windows PowerShell 5.1's `>` writes) are decoded.
+  - Write `\@notes.md` to send a literal `@notes.md`.
+  - `--no-expand` turns expansion off and sends the question exactly as typed. Use it whenever the question includes text you don't control, e.g. `ai --no-expand "Summarize this issue: $TITLE"`. Otherwise an `@/path/to/secret` in that text would be read and sent to the provider.
 
 ## Configuration
 

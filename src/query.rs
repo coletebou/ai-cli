@@ -406,6 +406,8 @@ async fn stream_bedrock(
     let mut total_input: Option<i32> = None;
     let mut total_output: Option<i32> = None;
     let mut final_text = String::new();
+    // Why the final answer is incomplete, if Bedrock said so (stopReason).
+    let mut final_note: Option<&'static str> = None;
 
     // Per-call streaming state. Declared here so helpers below can borrow.
     for iteration in 0..ctx.max_iterations.max(1) {
@@ -423,15 +425,17 @@ async fn stream_bedrock(
             // Spin up a child channel that the Bedrock client drives.
             let (child_tx, mut child_rx) = mpsc::channel::<BE>(64);
             let msgs_clone = messages.clone();
-            let system = ctx.system_prompt.clone();
             let tools = ctx.tools.clone();
             let model_for_call = model.clone();
+            // The system prompt already rides in `messages` (every caller
+            // seeds history with it), so don't pass it again separately —
+            // that used to send it to Bedrock twice.
             let stream_task = async move {
                 bedrock
                     .converse_stream(
                         &model_for_call,
                         &msgs_clone,
-                        system.as_deref(),
+                        None,
                         tools.as_deref(),
                         child_tx,
                     )
@@ -542,6 +546,19 @@ async fn stream_bedrock(
         let last_iter = iteration + 1 >= ctx.max_iterations;
 
         if no_tools || no_search || last_iter {
+            // Flag answers Bedrock cut short. Sent as a display-only chunk,
+            // so the note isn't persisted into the conversation history.
+            // With no text at all (e.g. a guardrail blocked everything) the
+            // note becomes the error below instead.
+            final_note = crate::bedrock::stop_reason_note(stop_reason.as_deref());
+            if let (Some(note), false) = (final_note, iter_text.is_empty()) {
+                let _ = tx
+                    .send(StreamEvent::Chunk {
+                        provider: provider_name.clone(),
+                        text: format!("\n\n*({})*\n", note),
+                    })
+                    .await;
+            }
             final_text = iter_text;
             break;
         }
@@ -574,7 +591,7 @@ async fn stream_bedrock(
             .send(StreamEvent::Error {
                 provider: provider_name,
                 model,
-                error: "Bedrock returned an empty response (no text content)".to_string(),
+                error: empty_bedrock_response_error(final_note),
                 duration_ms,
             })
             .await;
@@ -677,16 +694,38 @@ async fn handle_bedrock_event(
                 *total_output = Some(total_output.unwrap_or(0) + v);
             }
         }
-        BE::Error(msg) => {
-            *stream_error = Some(msg);
-        }
     }
 }
 
-/// Non-streaming Bedrock branch for `query_single`. Bedrock doesn't support
-/// genai-style tool-use in this codepath yet, so any tools in `ctx` are
-/// ignored (and a warning is not emitted — query_single keeps the same
-/// silent-skip behavior for missing search capability).
+/// The error for a Bedrock answer with no text. When Bedrock said why
+/// (a guardrail or content filter removed everything, or the context window
+/// ran out), say that rather than a generic "empty response".
+fn empty_bedrock_response_error(stop_note: Option<&str>) -> String {
+    match stop_note {
+        Some(note) => format!("Bedrock returned no text: {}", note),
+        None => "Bedrock returned an empty response (no text content)".to_string(),
+    }
+}
+
+/// The answer from a terminal non-streaming Bedrock call and why it's
+/// incomplete, if Bedrock said so. Only this call's text counts, as in
+/// `stream_bedrock`: text from an earlier tool-use iteration is narration
+/// ahead of a tool call ("let me search..."), and a guardrail or max_tokens
+/// note appended to it would describe the wrong reply. With no text the
+/// answer is empty and the caller reports the note as the error.
+fn bedrock_terminal_answer(
+    outcome: &crate::bedrock::BedrockOutcome,
+) -> (String, Option<&'static str>) {
+    let note = crate::bedrock::stop_reason_note(outcome.stop_reason.as_deref());
+    let mut text = outcome.text.clone();
+    if let (Some(note), false) = (note, text.is_empty()) {
+        text.push_str(&format!("\n\n*({})*", note));
+    }
+    (text, note)
+}
+
+/// Non-streaming Bedrock branch for `query_single`. Runs the same tool-use
+/// loop as the streaming path via the non-streaming Converse API.
 async fn query_single_bedrock(
     manager: &ProviderManager,
     provider: &Provider,
@@ -700,6 +739,7 @@ async fn query_single_bedrock(
     let mut total_input: Option<i32> = None;
     let mut total_output: Option<i32> = None;
     let mut final_text = String::new();
+    let mut final_note: Option<&'static str> = None;
 
     for iteration in 0..ctx.max_iterations.max(1) {
         let outcome = match manager
@@ -707,7 +747,7 @@ async fn query_single_bedrock(
                 bedrock,
                 &provider.model,
                 &messages,
-                ctx.system_prompt.as_deref(),
+                None, // already in `messages`; see stream_bedrock
                 ctx.tools.as_deref(),
             )
             .await
@@ -731,15 +771,12 @@ async fn query_single_bedrock(
             total_output = Some(total_output.unwrap_or(0) + v);
         }
 
-        if !outcome.text.is_empty() {
-            final_text = outcome.text.clone();
-        }
-
         // No tool calls -> we have our final answer.
         if outcome.tool_calls.is_empty()
             || ctx.search_client.is_none()
             || iteration + 1 >= ctx.max_iterations
         {
+            (final_text, final_note) = bedrock_terminal_answer(&outcome);
             break;
         }
 
@@ -766,7 +803,7 @@ async fn query_single_bedrock(
         return ProviderResponse::error(
             provider.clone(),
             provider.model.clone(),
-            "Bedrock returned an empty response (no text content)".to_string(),
+            empty_bedrock_response_error(final_note),
             duration_ms,
         );
     }
@@ -1129,6 +1166,46 @@ pub async fn stream_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_bedrock_answers_explain_why_when_bedrock_said() {
+        let with_note =
+            empty_bedrock_response_error(Some("response stopped by a Bedrock guardrail"));
+        assert!(with_note.contains("guardrail"), "got: {}", with_note);
+        assert!(empty_bedrock_response_error(None).contains("empty response"));
+    }
+
+    #[test]
+    fn bedrock_stop_note_rides_only_on_the_terminal_calls_text() {
+        let outcome = |text: &str, stop_reason: &str| crate::bedrock::BedrockOutcome {
+            text: text.to_string(),
+            tool_calls: Vec::new(),
+            input_tokens: None,
+            output_tokens: None,
+            stop_reason: Some(stop_reason.to_string()),
+        };
+
+        let (text, note) = bedrock_terminal_answer(&outcome("partial answer", "max_tokens"));
+        assert!(note.is_some());
+        assert!(
+            text.starts_with("partial answer\n\n*(response truncated"),
+            "got: {}",
+            text
+        );
+
+        // A guardrail blocked the whole final reply: nothing to annotate, so
+        // the answer is empty and the note becomes the error, rather than
+        // being attached to narration from an earlier tool-use call.
+        let (text, note) = bedrock_terminal_answer(&outcome("", "guardrail_intervened"));
+        assert!(text.is_empty());
+        assert_eq!(
+            empty_bedrock_response_error(note),
+            "Bedrock returned no text: response stopped by a Bedrock guardrail"
+        );
+
+        let (text, note) = bedrock_terminal_answer(&outcome("done", "end_turn"));
+        assert_eq!((text.as_str(), note), ("done", None));
+    }
 
     #[test]
     fn gen_ai_system_maps_known_aliases() {

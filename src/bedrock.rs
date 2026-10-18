@@ -13,7 +13,7 @@
 //! into `BedrockStreamEvent`s (TextDelta, ToolUseStart, ToolUseInputDelta,
 //! ContentBlockStop, MessageStop, Metadata).
 use crate::bedrock_eventstream::{Frame, FrameDecoder};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use futures::stream::StreamExt;
 use genai::chat::{ChatMessage, ChatRole, ContentPart, MessageContent, Tool, ToolCall};
 use serde::{Deserialize, Serialize};
@@ -21,9 +21,26 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 /// Detect whether a base_url points at AWS Bedrock. Used by the provider
-/// layer to decide between genai and this direct client.
+/// layer to decide between genai and this direct client — and therefore
+/// whether the Bedrock bearer token gets sent, so match the *host* rather
+/// than substrings anywhere in the URL. Covers standard, FIPS
+/// (`bedrock-runtime-fips.`), GovCloud, China (`.amazonaws.com.cn`) and
+/// PrivateLink (`vpce-….bedrock-runtime.<region>.vpce.amazonaws.com`)
+/// endpoints: some DNS label must be exactly `bedrock-runtime[-fips]` and
+/// the host must be under an AWS domain.
 pub fn is_bedrock_base_url(url: &str) -> bool {
-    url.contains("bedrock-runtime.") && url.contains("amazonaws.com")
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    let aws_domain = host.ends_with(".amazonaws.com") || host.ends_with(".amazonaws.com.cn");
+    aws_domain
+        && host
+            .split('.')
+            .any(|label| label == "bedrock-runtime" || label == "bedrock-runtime-fips")
 }
 
 /// Extract the Bedrock host (scheme + authority only) from a possibly
@@ -55,8 +72,18 @@ impl BedrockClient {
         if auth_token.is_empty() {
             return None;
         }
+        // Without timeouts a stalled connection hangs forever on the paths
+        // that have no cancel token (non-streaming and one-shot streaming).
+        // The read timeout is per read, so long streamed answers are fine
+        // as long as bytes keep arriving; it's generous because a
+        // non-streaming Converse call sends nothing until it's done.
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .read_timeout(std::time::Duration::from_secs(300))
+            .build()
+            .ok()?;
         Some(Self {
-            http: reqwest::Client::new(),
+            http,
             host: bedrock_host(base_url),
             auth_token,
         })
@@ -125,6 +152,7 @@ impl BedrockClient {
             tool_calls,
             input_tokens: parsed.usage.as_ref().and_then(|u| u.input_tokens),
             output_tokens: parsed.usage.as_ref().and_then(|u| u.output_tokens),
+            stop_reason: parsed.stop_reason,
         })
     }
 
@@ -132,7 +160,7 @@ impl BedrockClient {
     /// channel. Returns when the stream ends. Request-level failures (HTTP
     /// status, transport, framing) come back as `Err` so the caller can
     /// decide whether to retry; server-side exception frames that arrive
-    /// mid-stream are sent as `BedrockStreamEvent::Error`.
+    /// mid-stream also end it as a typed `Err` ([`BedrockStreamException`]).
     pub async fn converse_stream(
         &self,
         model_id: &str,
@@ -165,13 +193,17 @@ impl BedrockClient {
 
         let mut decoder = FrameDecoder::new();
         let mut body_stream = resp.bytes_stream();
+        let mut saw_message_stop = false;
 
         while let Some(chunk) = body_stream.next().await {
             let chunk = chunk.with_context(|| "reading Bedrock ConverseStream response body")?;
             decoder.feed(&chunk);
 
+            // Exception/error frames come back as Err (typed, so the caller
+            // can retry transient ones like throttling) and end the stream.
             while let Some(frame) = decoder.next_frame()? {
                 for ev in frame_to_events(frame)? {
+                    saw_message_stop |= matches!(ev, BedrockStreamEvent::MessageStop { .. });
                     // If the receiver dropped, stop reading more bytes.
                     if tx.send(ev).await.is_err() {
                         return Ok(());
@@ -179,9 +211,98 @@ impl BedrockClient {
                 }
             }
         }
+
+        // A connection closed early (proxy timeout, network drop) ends the
+        // body cleanly from reqwest's point of view. Without this check a
+        // half-finished answer would be reported as complete. Once
+        // messageStop has arrived the answer *is* complete; a partial frame
+        // after it can only be the trailing usage metadata, so it's dropped
+        // rather than failing a finished answer.
+        if !saw_message_stop {
+            return Err(anyhow::Error::new(BedrockStreamTruncated {
+                mid_frame: !decoder.is_empty(),
+            }));
+        }
         Ok(())
     }
 }
+
+/// Human-readable note for stop reasons that mean the answer is incomplete.
+/// `end_turn`, `tool_use` and `stop_sequence` are normal and return `None`.
+pub fn stop_reason_note(stop_reason: Option<&str>) -> Option<&'static str> {
+    match stop_reason? {
+        "max_tokens" => Some("response truncated: the model hit its output token limit"),
+        "model_context_window_exceeded" => {
+            Some("response truncated: the conversation exceeded the model's context window")
+        }
+        "guardrail_intervened" => Some("response stopped by a Bedrock guardrail"),
+        "content_filtered" => Some("response stopped by content filtering"),
+        _ => None,
+    }
+}
+
+/// A server-side exception delivered inside a ConverseStream (the HTTP
+/// status was 200). Typed so the retry layer can retry the transient kinds.
+#[derive(Debug)]
+pub struct BedrockStreamException {
+    pub kind: String,
+    pub message: String,
+}
+
+impl BedrockStreamException {
+    /// Exceptions worth retrying: capacity and transient server faults.
+    /// Validation/access errors will fail the same way again.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self.kind.as_str(),
+            "throttlingException"
+                | "serviceUnavailableException"
+                | "internalServerException"
+                | "modelStreamErrorException"
+                | "ThrottlingException"
+                | "ServiceUnavailableException"
+                | "InternalServerException"
+                | "ModelStreamErrorException"
+        )
+    }
+}
+
+impl std::fmt::Display for BedrockStreamException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Bedrock stream exception ({}): {}",
+            self.kind, self.message
+        )
+    }
+}
+
+impl std::error::Error for BedrockStreamException {}
+
+/// The ConverseStream body ended before `messageStop` — the connection was
+/// cut (proxy timeout, network drop). Retryable while nothing has been shown.
+#[derive(Debug)]
+pub struct BedrockStreamTruncated {
+    pub mid_frame: bool,
+}
+
+impl std::fmt::Display for BedrockStreamTruncated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.mid_frame {
+            write!(
+                f,
+                "Bedrock stream ended mid-frame (connection closed early)"
+            )
+        } else {
+            write!(
+                f,
+                "Bedrock stream ended before messageStop (connection closed early)"
+            )
+        }
+    }
+}
+
+impl std::error::Error for BedrockStreamTruncated {}
 
 /// A non-2xx response from Bedrock. Kept as a typed error (rather than a
 /// formatted string) so the retry layer can see the status code and any
@@ -223,6 +344,7 @@ pub struct BedrockOutcome {
     pub tool_calls: Vec<ToolCall>,
     pub input_tokens: Option<i32>,
     pub output_tokens: Option<i32>,
+    pub stop_reason: Option<String>,
 }
 
 /// Semantic events produced by the streaming `converse_stream()` call.
@@ -254,24 +376,50 @@ pub enum BedrockStreamEvent {
         input_tokens: Option<i32>,
         output_tokens: Option<i32>,
     },
-    /// Non-recoverable error. Always the last event on the channel.
-    Error(String),
 }
 
 /// Decode a single Event Stream frame into zero or more semantic events.
+/// Server-reported failures are returned as errors (a typed
+/// [`BedrockStreamException`] for exception frames), which ends the stream.
 fn frame_to_events(frame: Frame) -> Result<Vec<BedrockStreamEvent>> {
-    // Bedrock uses :message-type = "event" for data and "exception" for
-    // server-side errors.
-    if frame.message_type() == Some("exception") {
-        let text = String::from_utf8_lossy(&frame.payload).to_string();
-        return Ok(vec![BedrockStreamEvent::Error(format!(
-            "Bedrock stream exception ({}): {}",
-            frame.event_type().unwrap_or("?"),
-            truncate_for_error(&text),
-        ))]);
+    // :message-type is "event" for data, "exception" for modeled server
+    // errors (name in :exception-type, JSON `{"message": ...}` payload) and
+    // "error" for unmodeled ones (:error-code / :error-message headers).
+    match frame.message_type() {
+        Some("exception") => {
+            let message = serde_json::from_slice::<Value>(&frame.payload)
+                .ok()
+                .and_then(|v| v.get("message")?.as_str().map(String::from))
+                .unwrap_or_else(|| String::from_utf8_lossy(&frame.payload).into_owned());
+            return Err(anyhow::Error::new(BedrockStreamException {
+                kind: frame
+                    .exception_type()
+                    .or_else(|| frame.event_type())
+                    .unwrap_or("?")
+                    .to_string(),
+                message: truncate_for_error(&message),
+            }));
+        }
+        Some("error") => {
+            return Err(anyhow!(
+                "Bedrock stream error ({}): {}",
+                frame.error_code().unwrap_or("?"),
+                truncate_for_error(frame.error_message().unwrap_or("")),
+            ));
+        }
+        Some("event") | None => {}
+        Some(other) => bail!("unexpected event-stream message type {:?}", other),
     }
 
     let event_type = frame.event_type().unwrap_or("");
+    // Only parse payloads for event kinds we act on, so a future event kind
+    // with a non-JSON payload is ignored instead of aborting the stream.
+    if !matches!(
+        event_type,
+        "contentBlockStart" | "contentBlockDelta" | "contentBlockStop" | "messageStop" | "metadata"
+    ) {
+        return Ok(Vec::new());
+    }
     // Empty payload is legal for some frame types; skip JSON parsing then.
     let payload: Value = if frame.payload.is_empty() {
         Value::Null
@@ -286,7 +434,6 @@ fn frame_to_events(frame: Frame) -> Result<Vec<BedrockStreamEvent>> {
     };
 
     match event_type {
-        "messageStart" => Ok(Vec::new()),
         "contentBlockStart" => {
             let block_index = payload["contentBlockIndex"].as_u64().unwrap_or(0) as usize;
             if let Some(tu) = payload["start"].get("toolUse") {
@@ -331,19 +478,23 @@ fn frame_to_events(frame: Frame) -> Result<Vec<BedrockStreamEvent>> {
                 output_tokens: usage["outputTokens"].as_i64().map(|v| v as i32),
             }])
         }
-        // Unknown event types are ignored (forward-compat with new Bedrock
-        // event kinds — the critical ones above are stable).
         _ => Ok(Vec::new()),
     }
 }
 
+/// Cap an error body for display. Truncates on a char boundary: slicing at
+/// a raw byte offset panics when a multi-byte character (CJK, emoji, an
+/// HTML page's typographic quotes) straddles the limit.
 fn truncate_for_error(s: &str) -> String {
     const MAX: usize = 500;
     if s.len() <= MAX {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..MAX])
+        return s.to_string();
     }
+    let mut end = MAX;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 /// URL-encode a path segment, preserving characters that Bedrock's router
@@ -449,6 +600,8 @@ struct ConverseResponse {
     output: ConverseOutput,
     #[serde(default)]
     usage: Option<ConverseUsage>,
+    #[serde(default, rename = "stopReason")]
+    stop_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -506,41 +659,27 @@ fn build_converse_request(
     for msg in messages {
         match msg.role {
             ChatRole::System => {
+                // Callers may pass the same prompt both as `system_prompt`
+                // and as a System message in the history; send it once.
                 if let Some(t) = content_to_text(&msg.content) {
-                    system_texts.push(t);
+                    if !system_texts.contains(&t) {
+                        system_texts.push(t);
+                    }
                 }
             }
             ChatRole::User => {
                 let blocks = convert_user_content(&msg.content)?;
-                if blocks.is_empty() {
-                    continue;
-                }
-                out_messages.push(BedrockMessage {
-                    role: "user",
-                    content: blocks,
-                });
+                push_turn(&mut out_messages, "user", blocks);
             }
             ChatRole::Assistant => {
                 let blocks = convert_assistant_content(&msg.content)?;
-                if blocks.is_empty() {
-                    continue;
-                }
-                out_messages.push(BedrockMessage {
-                    role: "assistant",
-                    content: blocks,
-                });
+                push_turn(&mut out_messages, "assistant", blocks);
             }
             ChatRole::Tool => {
                 // genai uses a synthetic "tool" role for tool responses;
                 // Bedrock expects these as a user turn with toolResult blocks.
                 let blocks = convert_tool_content(&msg.content)?;
-                if blocks.is_empty() {
-                    continue;
-                }
-                out_messages.push(BedrockMessage {
-                    role: "user",
-                    content: blocks,
-                });
+                push_turn(&mut out_messages, "user", blocks);
             }
         }
     }
@@ -588,6 +727,24 @@ fn build_converse_request(
         system,
         tool_config,
     })
+}
+
+/// Append a turn, merging it into the previous message when the role
+/// repeats. Converse requires strictly alternating user/assistant turns,
+/// but genai emits one `Tool` message per tool response — so a model that
+/// makes two tool calls in one turn would otherwise produce two consecutive
+/// user turns, which Bedrock rejects with a ValidationException.
+fn push_turn(out: &mut Vec<BedrockMessage>, role: &'static str, blocks: Vec<BedrockContentOut>) {
+    if blocks.is_empty() {
+        return;
+    }
+    match out.last_mut() {
+        Some(prev) if prev.role == role => prev.content.extend(blocks),
+        _ => out.push(BedrockMessage {
+            role,
+            content: blocks,
+        }),
+    }
 }
 
 fn content_to_text(content: &MessageContent) -> Option<String> {
@@ -932,14 +1089,193 @@ mod tests {
             headers: h,
             payload: b"rate limited".to_vec(),
         };
-        let events = frame_to_events(frame).unwrap();
-        match &events[0] {
-            BedrockStreamEvent::Error(msg) => {
-                assert!(msg.contains("throttlingException"), "got: {}", msg);
-                assert!(msg.contains("rate limited"), "got: {}", msg);
-            }
-            other => panic!("expected Error, got {:?}", other),
+        let msg = frame_to_events(frame).unwrap_err().to_string();
+        assert!(msg.contains("throttlingException"), "got: {}", msg);
+        assert!(msg.contains("rate limited"), "got: {}", msg);
+    }
+
+    fn frame(headers: &[(&str, &str)], payload: &[u8]) -> Frame {
+        Frame {
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            payload: payload.to_vec(),
         }
+    }
+
+    #[test]
+    fn detects_fips_govcloud_and_china_endpoints_but_not_lookalikes() {
+        assert!(is_bedrock_base_url(
+            "https://bedrock-runtime-fips.us-gov-west-1.amazonaws.com"
+        ));
+        assert!(is_bedrock_base_url(
+            "https://bedrock-runtime.cn-north-1.amazonaws.com.cn/"
+        ));
+        // The bearer token must not be sent to a host that merely mentions
+        // Bedrock somewhere in its URL.
+        assert!(!is_bedrock_base_url(
+            "https://proxy.example.com/bedrock-runtime.us-east-1.amazonaws.com/"
+        ));
+        assert!(!is_bedrock_base_url(
+            "https://bedrock-runtime.us-east-1.amazonaws.com.evil.example/"
+        ));
+        assert!(!is_bedrock_base_url("not a url"));
+    }
+
+    #[test]
+    fn identical_system_prompts_are_sent_once() {
+        let msgs = vec![ChatMessage::system("be brief"), ChatMessage::user("hi")];
+        let req = build_converse_request(&msgs, Some("be brief"), None).unwrap();
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["system"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parallel_tool_results_merge_into_one_user_turn() {
+        // Two tool calls in one assistant turn yield two genai Tool
+        // messages; Converse needs them in a single user turn or it rejects
+        // the request for not alternating roles.
+        use genai::chat::{ToolCall, ToolResponse};
+        let call = |id: &str, q: &str| ToolCall {
+            call_id: id.into(),
+            fn_name: "web_search".into(),
+            fn_arguments: serde_json::json!({ "query": q }),
+            thought_signatures: None,
+        };
+        let msgs = vec![
+            ChatMessage::user("compare a and b"),
+            ChatMessage::from(vec![call("c1", "a"), call("c2", "b")]),
+            ChatMessage::from(ToolResponse::new("c1", "about a")),
+            ChatMessage::from(ToolResponse::new("c2", "about b")),
+        ];
+        let req = build_converse_request(&msgs, None, None).unwrap();
+        let json = serde_json::to_value(&req).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
+        let results = messages[2]["content"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["toolResult"]["toolUseId"], "c1");
+        assert_eq!(results[1]["toolResult"]["toolUseId"], "c2");
+    }
+
+    #[test]
+    fn truncate_for_error_never_splits_a_character() {
+        // 499 ASCII bytes, then a 3-byte character straddling byte 500.
+        let s = format!("{}€€", "a".repeat(499));
+        let out = truncate_for_error(&s);
+        assert!(out.ends_with('…'));
+        assert!(out.starts_with(&"a".repeat(499)));
+        assert_eq!(truncate_for_error("short"), "short");
+    }
+
+    #[test]
+    fn exception_frames_use_exception_type_header_and_message() {
+        let f = frame(
+            &[
+                (":message-type", "exception"),
+                (":exception-type", "throttlingException"),
+            ],
+            br#"{"message":"Too many requests, please wait."}"#,
+        );
+        let err = frame_to_events(f).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("throttlingException"), "got: {}", msg);
+        assert!(msg.contains("Too many requests"), "got: {}", msg);
+        assert!(!msg.contains('{'), "raw JSON leaked: {}", msg);
+        // Typed, and classified as transient so a stream that is throttled
+        // before any output gets retried.
+        let exception = err.downcast_ref::<BedrockStreamException>().unwrap();
+        assert!(exception.is_transient());
+        assert!(matches!(
+            crate::retry::classify(&err),
+            crate::retry::Retryable::Yes { .. }
+        ));
+    }
+
+    #[test]
+    fn validation_exceptions_are_not_retried() {
+        let f = frame(
+            &[
+                (":message-type", "exception"),
+                (":exception-type", "validationException"),
+            ],
+            br#"{"message":"bad input"}"#,
+        );
+        let err = frame_to_events(f).unwrap_err();
+        assert!(matches!(
+            crate::retry::classify(&err),
+            crate::retry::Retryable::No
+        ));
+    }
+
+    #[test]
+    fn truncated_streams_are_retryable() {
+        let err = anyhow::Error::new(BedrockStreamTruncated { mid_frame: false });
+        assert!(err.to_string().contains("before messageStop"));
+        assert!(matches!(
+            crate::retry::classify(&err),
+            crate::retry::Retryable::Yes { .. }
+        ));
+    }
+
+    #[test]
+    fn detects_privatelink_endpoints() {
+        assert!(is_bedrock_base_url(
+            "https://vpce-0abc-123.bedrock-runtime.us-east-1.vpce.amazonaws.com"
+        ));
+        assert!(!is_bedrock_base_url("https://bedrock-runtime.example.com/"));
+    }
+
+    #[test]
+    fn error_frames_are_surfaced_not_ignored() {
+        let f = frame(
+            &[
+                (":message-type", "error"),
+                (":error-code", "InternalFailure"),
+                (":error-message", "something broke"),
+            ],
+            b"",
+        );
+        let msg = frame_to_events(f).unwrap_err().to_string();
+        assert!(msg.contains("InternalFailure"), "got: {}", msg);
+        assert!(msg.contains("something broke"), "got: {}", msg);
+    }
+
+    #[test]
+    fn unknown_event_types_with_non_json_payloads_are_ignored() {
+        let f = frame(
+            &[
+                (":message-type", "event"),
+                (":event-type", "someFutureEvent"),
+            ],
+            b"\x00\x01 not json",
+        );
+        assert!(frame_to_events(f).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stop_reason_notes_only_flag_incomplete_answers() {
+        assert!(stop_reason_note(Some("max_tokens")).is_some());
+        assert!(stop_reason_note(Some("guardrail_intervened")).is_some());
+        assert!(stop_reason_note(Some("model_context_window_exceeded")).is_some());
+        assert!(stop_reason_note(Some("end_turn")).is_none());
+        assert!(stop_reason_note(Some("tool_use")).is_none());
+        assert!(stop_reason_note(None).is_none());
+    }
+
+    #[test]
+    fn parses_stop_reason_from_converse_response() {
+        let json = r#"{
+            "output": {"message": {"content": [{"text": "partial"}], "role": "assistant"}},
+            "stopReason": "max_tokens"
+        }"#;
+        let parsed: ConverseResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.stop_reason.as_deref(), Some("max_tokens"));
     }
 
     #[test]

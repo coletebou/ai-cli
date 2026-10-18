@@ -6,7 +6,7 @@
 //! exponential backoff; otherwise we double the base delay up to a
 //! configured ceiling.
 
-use crate::bedrock::BedrockHttpError;
+use crate::bedrock::{BedrockHttpError, BedrockStreamException, BedrockStreamTruncated};
 use crate::config::RetryConfig;
 use genai::Error as GenaiError;
 use reqwest::StatusCode;
@@ -29,6 +29,17 @@ pub fn classify(err: &anyhow::Error) -> Retryable {
         }
         if let Some(b) = cause.downcast_ref::<BedrockHttpError>() {
             return classify_status(b.status, b.retry_after);
+        }
+        // Bedrock failures that arrive after an HTTP 200, inside the stream.
+        if let Some(e) = cause.downcast_ref::<BedrockStreamException>() {
+            return if e.is_transient() {
+                Retryable::Yes { retry_after: None }
+            } else {
+                Retryable::No
+            };
+        }
+        if cause.downcast_ref::<BedrockStreamTruncated>().is_some() {
+            return Retryable::Yes { retry_after: None };
         }
         if let Some(r) = cause.downcast_ref::<reqwest::Error>() {
             return classify_reqwest(r);

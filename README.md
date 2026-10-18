@@ -105,7 +105,7 @@ Override at the CLI: `ai -w --search-provider tavily "query"`.
 
 ### Retry behavior
 
-Transient provider errors (HTTP 408/425/429/5xx and network timeouts) are retried automatically with exponential backoff. A `Retry-After` header from the server takes precedence over the default backoff.
+Transient provider errors (HTTP 408, 425, 429, 500, 502, 503, 504, Anthropic's 529 "overloaded", and connection failures/timeouts) are retried automatically with exponential backoff, for streaming and non-streaming requests and for Bedrock. A streaming request is only retried if it fails before any output has been shown. A `Retry-After` header from the server takes precedence over the default backoff.
 
 ```toml
 [retry]

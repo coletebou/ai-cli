@@ -37,8 +37,11 @@ dirs = "5"
 
 # HTTP Client. "stream" is required for Bedrock ConverseStream (we read
 # the response body chunk-by-chunk so we can decode AWS event-stream
-# frames incrementally as bytes arrive).
-reqwest = { version = "0.12", features = ["json", "stream"] }
+# frames incrementally as bytes arrive). Kept on the same major as genai's
+# reqwest so the retry classifier can downcast the transport errors genai
+# surfaces (a second reqwest major would be a distinct, un-downcastable
+# type), and so the default TLS stack is rustls rather than OpenSSL.
+reqwest = { version = "0.13", features = ["json", "stream"] }
 
 # Terminal Output
 colored = "2"

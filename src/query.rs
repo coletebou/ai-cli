@@ -378,7 +378,9 @@ pub async fn query_single(
 /// deltas to the main display channel, reconstructs any tool calls from
 /// split input deltas, and loops through tool-use iterations in the same
 /// way the genai streaming path does.
+#[allow(clippy::too_many_arguments)]
 async fn stream_bedrock(
+    manager: &ProviderManager,
     bedrock: &crate::bedrock::BedrockClient,
     provider: &Provider,
     mut messages: Vec<ChatMessage>,
@@ -407,27 +409,6 @@ async fn stream_bedrock(
 
     // Per-call streaming state. Declared here so helpers below can borrow.
     for iteration in 0..ctx.max_iterations.max(1) {
-        // Spin up a child channel that the Bedrock client drives.
-        let (child_tx, mut child_rx) = mpsc::channel::<BE>(64);
-        let bedrock_clone = bedrock; // reborrow
-        let msgs_clone = messages.clone();
-        let system = ctx.system_prompt.clone();
-        let tools = ctx.tools.clone();
-        let model_for_call = model.clone();
-        let stream_task = async move {
-            bedrock_clone
-                .converse_stream(
-                    &model_for_call,
-                    &msgs_clone,
-                    system.as_deref(),
-                    tools.as_deref(),
-                    child_tx,
-                )
-                .await;
-        };
-
-        tokio::pin!(stream_task);
-
         // State accumulated during this iteration.
         let mut iter_text = String::new();
         // block_index -> (tool_use_id, name, input_fragment_buffer)
@@ -436,30 +417,68 @@ async fn stream_bedrock(
         let mut stop_reason: Option<String> = None;
         let mut stream_error: Option<String> = None;
 
-        // Pump both the stream task and events from the child channel.
-        // The task running the HTTP request is kept polling so that
-        // `child_rx.recv()` can observe events as they arrive.
+        let mut attempt: u32 = 0;
         loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    let duration_ms = start.elapsed().as_millis() as u64;
-                    let _ = tx
-                        .send(StreamEvent::Error {
-                            provider: provider_name,
-                            model,
-                            error: "cancelled".to_string(),
-                            duration_ms,
-                        })
-                        .await;
-                    return messages;
-                }
-                _ = &mut stream_task => {
-                    // Stream task has finished sending; drain any remaining
-                    // events, then break the select loop.
-                    while let Ok(ev) = child_rx.try_recv() {
-                        handle_bedrock_event(
-                            ev,
+            attempt += 1;
+            // Spin up a child channel that the Bedrock client drives.
+            let (child_tx, mut child_rx) = mpsc::channel::<BE>(64);
+            let msgs_clone = messages.clone();
+            let system = ctx.system_prompt.clone();
+            let tools = ctx.tools.clone();
+            let model_for_call = model.clone();
+            let stream_task = async move {
+                bedrock
+                    .converse_stream(
+                        &model_for_call,
+                        &msgs_clone,
+                        system.as_deref(),
+                        tools.as_deref(),
+                        child_tx,
+                    )
+                    .await
+            };
+            tokio::pin!(stream_task);
+
+            // Pump both the stream task and events from the child channel.
+            // The task running the HTTP request is kept polling so that
+            // `child_rx.recv()` can observe events as they arrive.
+            let task_result = loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        let _ = tx
+                            .send(StreamEvent::Error {
+                                provider: provider_name,
+                                model,
+                                error: "cancelled".to_string(),
+                                duration_ms,
+                            })
+                            .await;
+                        return messages;
+                    }
+                    result = &mut stream_task => {
+                        // Stream task has finished sending; drain any remaining
+                        // events, then break the select loop.
+                        while let Ok(ev) = child_rx.try_recv() {
+                            handle_bedrock_event(
+                                ev,
+                                &provider_name,
+                                &tx,
+                                &mut iter_text,
+                                &mut tool_builders,
+                                &mut finalized_tool_calls,
+                                &mut stop_reason,
+                                &mut total_input,
+                                &mut total_output,
+                                &mut stream_error,
+                            ).await;
+                        }
+                        break result;
+                    }
+                    ev = child_rx.recv() => match ev {
+                        Some(e) => handle_bedrock_event(
+                            e,
                             &provider_name,
                             &tx,
                             &mut iter_text,
@@ -469,26 +488,38 @@ async fn stream_bedrock(
                             &mut total_input,
                             &mut total_output,
                             &mut stream_error,
-                        ).await;
-                    }
-                    break;
+                        ).await,
+                        // Channel closed: the task is finishing. Collect its
+                        // result so a request-level error isn't dropped.
+                        None => break (&mut stream_task).await,
+                    },
                 }
-                ev = child_rx.recv() => match ev {
-                    Some(e) => handle_bedrock_event(
-                        e,
-                        &provider_name,
-                        &tx,
-                        &mut iter_text,
-                        &mut tool_builders,
-                        &mut finalized_tool_calls,
-                        &mut stop_reason,
-                        &mut total_input,
-                        &mut total_output,
-                        &mut stream_error,
-                    ).await,
-                    None => break, // channel closed — stream_task will complete next
-                },
+            };
+
+            if let Err(e) = task_result {
+                // Retry only while nothing has reached the user yet — once
+                // text has streamed we can't take it back.
+                let nothing_emitted = iter_text.is_empty()
+                    && tool_builders.is_empty()
+                    && finalized_tool_calls.is_empty();
+                if nothing_emitted && stream_error.is_none() {
+                    if let Some(delay) = manager.retry_delay(&e, attempt) {
+                        crate::diag::warn(format!(
+                            "[retry] {} attempt {}/{} after {:?}",
+                            model,
+                            attempt,
+                            manager.max_attempts(),
+                            delay
+                        ));
+                        tokio::select! {
+                            _ = cancel.cancelled() => continue, // handled at the top of the next attempt
+                            _ = tokio::time::sleep(delay) => continue,
+                        }
+                    }
+                }
+                stream_error.get_or_insert_with(|| format!("{:#}", e));
             }
+            break;
         }
 
         // Surface any stream-level error and stop the iteration loop.
@@ -804,7 +835,10 @@ pub async fn stream_with_messages(
     // telemetry span setup so Bedrock requests stay on a clean codepath; the
     // root `ai.query` span still wraps this call via the calling task's Context.
     if let Some(bedrock) = manager.bedrock_for(&model) {
-        return stream_bedrock(&bedrock, provider, messages, ctx, tx, cancel, start).await;
+        return stream_bedrock(
+            manager, &bedrock, provider, messages, ctx, tx, cancel, start,
+        )
+        .await;
     }
 
     // Open a per-call OTel span. Inherits the current Context as parent —
@@ -844,16 +878,21 @@ pub async fn stream_with_messages(
     let mut final_text = String::new();
 
     for iteration in 0..ctx.max_iterations.max(1) {
-        let stream_response = match manager
-            .exec_chat_stream(
+        // Opening the stream includes connecting, the first response bytes,
+        // and any retry backoff — race all of it against cancellation so
+        // Ctrl+C doesn't have to wait for a slow or stalled provider.
+        let opened = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
+            r = manager.exec_chat_stream(
                 &provider.model,
                 messages.clone(),
                 options.as_ref(),
                 ctx.tools.clone(),
-            )
-            .await
-        {
-            Ok(r) => r,
+            ) => r,
+        };
+        let mut stream = match opened {
+            Ok(s) => s,
             Err(e) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 let err_msg = format!("{:#}", e);
@@ -872,7 +911,6 @@ pub async fn stream_with_messages(
             }
         };
 
-        let mut stream = stream_response.stream;
         let mut captured_tool_calls: Vec<ToolCall> = Vec::new();
         let mut captured_thoughts: Vec<String> = Vec::new();
         // Reset per-iteration text. Only the text from the iteration that

@@ -686,6 +686,9 @@ pub async fn run_tui(
     }
     drop(event_tx); // only panel tasks should hold senders; drop our copy
 
+    // Retry notices and auth warnings would print over the alternate screen;
+    // hold them until the terminal is restored.
+    crate::diag::defer();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -709,6 +712,7 @@ pub async fn run_tui(
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
+    crate::diag::flush();
 
     result
 }

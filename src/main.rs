@@ -5,6 +5,7 @@ mod chat;
 mod config;
 mod config_ui;
 mod context;
+mod diag;
 mod display;
 mod markdown;
 mod models;

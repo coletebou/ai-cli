@@ -4,12 +4,21 @@ use crate::config::{AuthMode, Config, ModelTier, ProviderConfig, RetryConfig};
 use crate::retry::{self, Retryable};
 use anyhow::{Context, Result};
 use colored::Color;
+use futures::{Stream, StreamExt};
 use genai::adapter::AdapterKind;
-use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatStreamResponse, Tool};
+use genai::chat::{
+    ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatStream, ChatStreamEvent, Tool,
+};
 use genai::resolver::{AuthData, AuthResolver, Endpoint, ServiceTargetResolver};
 use genai::{Client, ClientConfig, ModelIden, ServiceTarget};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// A provider's streamed response, with any events consumed while checking
+/// that the request actually succeeded replayed at the front.
+pub type ChatEventStream = Pin<Box<dyn Stream<Item = genai::Result<ChatStreamEvent>> + Send>>;
 
 fn adapter_kind_for_provider(name: &str) -> Option<AdapterKind> {
     match name {
@@ -51,10 +60,10 @@ fn resolve_provider_auth(config: &Config, provider_name: &str) -> Option<AuthDat
         return match anthropic_oauth::subscription_auth_data(provider_cfg.base_url.as_deref()) {
             Ok(auth) => Some(auth),
             Err(err) => {
-                eprintln!(
+                crate::diag::warn(format!(
                     "[warn] {} subscription auth unavailable: {}",
                     provider_name, err
-                );
+                ));
                 None
             }
         };
@@ -368,10 +377,10 @@ impl ProviderManager {
                 Ok(r) => return Ok(r),
                 Err(err) => {
                     if let Some(delay) = should_retry(&err, cfg, attempt) {
-                        eprintln!(
+                        crate::diag::warn(format!(
                             "[retry] {} attempt {}/{} after {:?}",
                             model, attempt, cfg.max_attempts, delay
-                        );
+                        ));
                         tokio::time::sleep(delay).await;
                         continue;
                     }
@@ -461,10 +470,10 @@ impl ProviderManager {
                 Err(e) => {
                     let err = anyhow::Error::from(e);
                     if let Some(delay) = should_retry(&err, cfg, attempt) {
-                        eprintln!(
+                        crate::diag::warn(format!(
                             "[retry] {} attempt {}/{} after {:?}",
                             model, attempt, cfg.max_attempts, delay
-                        );
+                        ));
                         tokio::time::sleep(delay).await;
                         continue;
                     }
@@ -476,13 +485,21 @@ impl ProviderManager {
         }
     }
 
+    /// Open a streaming chat request, retrying transient failures.
+    ///
+    /// genai sends the HTTP request lazily, on the first poll of the stream,
+    /// so a 429/5xx or a connect error doesn't come back from
+    /// `Client::exec_chat_stream` — it arrives as the first error *item* of
+    /// the stream. We therefore poll until the provider has actually
+    /// answered (see [`open_stream`]) and retry from here, before any text
+    /// has reached the caller.
     pub async fn exec_chat_stream(
         &self,
         model: &str,
         messages: Vec<ChatMessage>,
         options: Option<&ChatOptions>,
         tools: Option<Vec<Tool>>,
-    ) -> Result<ChatStreamResponse> {
+    ) -> Result<ChatEventStream> {
         let cfg = self.retry_cfg();
         let mut attempt: u32 = 0;
         loop {
@@ -491,23 +508,63 @@ impl ProviderManager {
             if let Some(t) = &tools {
                 request = request.with_tools(t.clone());
             }
-            match self.client.exec_chat_stream(model, request, options).await {
-                Ok(r) => return Ok(r),
-                Err(e) => {
-                    let err = anyhow::Error::from(e);
-                    if let Some(delay) = should_retry(&err, cfg, attempt) {
-                        eprintln!(
-                            "[retry] {} attempt {}/{} after {:?}",
-                            model, attempt, cfg.max_attempts, delay
-                        );
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                    return Err(err).with_context(|| format!("Model: {}", model));
-                }
+            let err = match self.client.exec_chat_stream(model, request, options).await {
+                Ok(response) => match open_stream(response.stream).await {
+                    Ok(stream) => return Ok(stream),
+                    Err(e) => anyhow::Error::from(e),
+                },
+                Err(e) => anyhow::Error::from(e),
+            };
+            if let Some(delay) = should_retry(&err, cfg, attempt) {
+                crate::diag::warn(format!(
+                    "[retry] {} attempt {}/{} after {:?}",
+                    model, attempt, cfg.max_attempts, delay
+                ));
+                tokio::time::sleep(delay).await;
+                continue;
             }
+            return Err(err).with_context(|| format!("Model: {}", model));
         }
     }
+
+    /// Backoff before retry `attempt` of a failed request, or `None` to give
+    /// up (non-transient error, or attempts exhausted).
+    pub fn retry_delay(&self, err: &anyhow::Error, attempt: u32) -> Option<Duration> {
+        should_retry(err, self.retry_cfg(), attempt)
+    }
+
+    pub fn max_attempts(&self) -> u32 {
+        self.retry_cfg().max_attempts
+    }
+}
+
+/// Poll a freshly-opened genai stream until the provider has really
+/// responded. genai yields a synthetic `Start` before the request is even
+/// sent, so we buffer leading `Start`s; if the next item is an error it's
+/// returned (so the caller can retry), otherwise the buffered events are
+/// replayed ahead of the rest of the stream.
+async fn open_stream(mut stream: ChatStream) -> genai::Result<ChatEventStream> {
+    let mut consumed = Vec::new();
+    loop {
+        match stream.next().await {
+            // Events the query layer doesn't show (reasoning, tool-call and
+            // thought-signature chunks) keep the retry window open: an error
+            // after them still hasn't put anything on the user's screen.
+            Some(Ok(
+                event @ (ChatStreamEvent::Start
+                | ChatStreamEvent::ReasoningChunk(_)
+                | ChatStreamEvent::ToolCallChunk(_)
+                | ChatStreamEvent::ThoughtSignatureChunk(_)),
+            )) => consumed.push(Ok(event)),
+            Some(Err(e)) => return Err(e),
+            Some(Ok(event)) => {
+                consumed.push(Ok(event));
+                break;
+            }
+            None => break,
+        }
+    }
+    Ok(Box::pin(futures::stream::iter(consumed).chain(stream)))
 }
 
 /// Decide whether to retry and how long to wait. Returns `None` on give-up:

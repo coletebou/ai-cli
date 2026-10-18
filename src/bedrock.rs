@@ -13,7 +13,7 @@
 //! into `BedrockStreamEvent`s (TextDelta, ToolUseStart, ToolUseInputDelta,
 //! ContentBlockStop, MessageStop, Metadata).
 use crate::bedrock_eventstream::{Frame, FrameDecoder};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use futures::stream::StreamExt;
 use genai::chat::{ChatMessage, ChatRole, ContentPart, MessageContent, Tool, ToolCall};
 use serde::{Deserialize, Serialize};
@@ -88,20 +88,14 @@ impl BedrockClient {
             .await
             .with_context(|| format!("POST {}", url))?;
 
-        let status = resp.status();
+        if !resp.status().is_success() {
+            return Err(http_error(model_id, resp).await);
+        }
+
         let text = resp
             .text()
             .await
             .with_context(|| "reading Bedrock response body")?;
-
-        if !status.is_success() {
-            return Err(anyhow!(
-                "Bedrock {} returned HTTP {}: {}",
-                model_id,
-                status.as_u16(),
-                truncate_for_error(&text)
-            ));
-        }
 
         let parsed: ConverseResponse = serde_json::from_str(&text).with_context(|| {
             format!(
@@ -135,9 +129,10 @@ impl BedrockClient {
     }
 
     /// Invoke the ConverseStream API and emit semantic events over a
-    /// channel. The task returns when the stream ends (naturally or on
-    /// error). On error, a `BedrockStreamEvent::Error` is sent before the
-    /// channel closes.
+    /// channel. Returns when the stream ends. Request-level failures (HTTP
+    /// status, transport, framing) come back as `Err` so the caller can
+    /// decide whether to retry; server-side exception frames that arrive
+    /// mid-stream are sent as `BedrockStreamEvent::Error`.
     pub async fn converse_stream(
         &self,
         model_id: &str,
@@ -145,22 +140,6 @@ impl BedrockClient {
         system_prompt: Option<&str>,
         tools: Option<&[Tool]>,
         tx: mpsc::Sender<BedrockStreamEvent>,
-    ) {
-        if let Err(e) = self
-            .converse_stream_inner(model_id, messages, system_prompt, tools, &tx)
-            .await
-        {
-            let _ = tx.send(BedrockStreamEvent::Error(format!("{:#}", e))).await;
-        }
-    }
-
-    async fn converse_stream_inner(
-        &self,
-        model_id: &str,
-        messages: &[ChatMessage],
-        system_prompt: Option<&str>,
-        tools: Option<&[Tool]>,
-        tx: &mpsc::Sender<BedrockStreamEvent>,
     ) -> Result<()> {
         let body = build_converse_request(messages, system_prompt, tools)?;
 
@@ -180,15 +159,8 @@ impl BedrockClient {
             .await
             .with_context(|| format!("POST {}", url))?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            bail!(
-                "Bedrock {} returned HTTP {}: {}",
-                model_id,
-                status.as_u16(),
-                truncate_for_error(&text)
-            );
+        if !resp.status().is_success() {
+            return Err(http_error(model_id, resp).await);
         }
 
         let mut decoder = FrameDecoder::new();
@@ -209,6 +181,40 @@ impl BedrockClient {
         }
         Ok(())
     }
+}
+
+/// A non-2xx response from Bedrock. Kept as a typed error (rather than a
+/// formatted string) so the retry layer can see the status code and any
+/// `Retry-After` hint — 429 throttling and 503s are routine on Bedrock.
+#[derive(Debug)]
+pub struct BedrockHttpError {
+    pub status: reqwest::StatusCode,
+    pub retry_after: Option<std::time::Duration>,
+    pub message: String,
+}
+
+impl std::fmt::Display for BedrockHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {}: {}", self.status.as_u16(), self.message)
+    }
+}
+
+impl std::error::Error for BedrockHttpError {}
+
+async fn http_error(model_id: &str, resp: reqwest::Response) -> anyhow::Error {
+    let status = resp.status();
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::retry::parse_retry_after);
+    let body = resp.text().await.unwrap_or_default();
+    anyhow::Error::new(BedrockHttpError {
+        status,
+        retry_after,
+        message: truncate_for_error(&body),
+    })
+    .context(format!("Bedrock {} request failed", model_id))
 }
 
 /// Shape returned from the non-streaming `converse()` call.

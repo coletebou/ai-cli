@@ -6,6 +6,7 @@
 //! exponential backoff; otherwise we double the base delay up to a
 //! configured ceiling.
 
+use crate::bedrock::BedrockHttpError;
 use crate::config::RetryConfig;
 use genai::Error as GenaiError;
 use reqwest::StatusCode;
@@ -18,11 +19,19 @@ pub enum Retryable {
     Yes { retry_after: Option<Duration> },
 }
 
-/// Walk the error chain for a genai::Error and classify it.
+/// Walk the error chain and classify the first error type we recognize:
+/// genai errors (both the request-time and stream-time shapes), Bedrock's
+/// typed HTTP error, and raw reqwest transport errors.
 pub fn classify(err: &anyhow::Error) -> Retryable {
     for cause in err.chain() {
         if let Some(g) = cause.downcast_ref::<GenaiError>() {
             return classify_genai(g);
+        }
+        if let Some(b) = cause.downcast_ref::<BedrockHttpError>() {
+            return classify_status(b.status, b.retry_after);
+        }
+        if let Some(r) = cause.downcast_ref::<reqwest::Error>() {
+            return classify_reqwest(r);
         }
     }
     Retryable::No
@@ -32,10 +41,51 @@ fn classify_genai(err: &GenaiError) -> Retryable {
     match err {
         GenaiError::WebAdapterCall { webc_error, .. }
         | GenaiError::WebModelCall { webc_error, .. } => classify_webc(webc_error),
-        GenaiError::HttpError { status, .. } if is_retryable_status(*status) => {
-            Retryable::Yes { retry_after: None }
-        }
+        GenaiError::HttpError { status, .. } => classify_status(*status, None),
+        // Streaming requests are sent lazily on the first poll of the stream,
+        // so HTTP status and transport failures surface here, boxed, rather
+        // than from `exec_chat_stream` itself.
+        GenaiError::WebStream { error, .. } => classify_boxed(error.as_ref()),
         _ => Retryable::No,
+    }
+}
+
+/// Classify the boxed error inside a `WebStream`. genai 0.5 boxes an
+/// `HttpError` or a raw `reqwest::Error` here; `webc::Error` and the
+/// `source()` chain are handled too so a genai upgrade that wraps these
+/// differently doesn't silently turn retries off again.
+fn classify_boxed(err: &(dyn std::error::Error + Send + Sync + 'static)) -> Retryable {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        if let Some(g) = e.downcast_ref::<GenaiError>() {
+            return classify_genai(g);
+        }
+        if let Some(w) = e.downcast_ref::<genai::webc::Error>() {
+            return classify_webc(w);
+        }
+        if let Some(r) = e.downcast_ref::<reqwest::Error>() {
+            return classify_reqwest(r);
+        }
+        current = e.source();
+    }
+    Retryable::No
+}
+
+fn classify_status(status: StatusCode, retry_after: Option<Duration>) -> Retryable {
+    if is_retryable_status(status) {
+        Retryable::Yes { retry_after }
+    } else {
+        Retryable::No
+    }
+}
+
+fn classify_reqwest(err: &reqwest::Error) -> Retryable {
+    if err.is_timeout() || err.is_connect() {
+        return Retryable::Yes { retry_after: None };
+    }
+    match err.status() {
+        Some(status) => classify_status(status, None),
+        None => Retryable::No,
     }
 }
 
@@ -60,8 +110,10 @@ fn classify_webc(err: &genai::webc::Error) -> Retryable {
     }
 }
 
+/// 529 is Anthropic's "overloaded" status — transient, and one of the most
+/// common errors a Claude user sees under load.
 fn is_retryable_status(s: StatusCode) -> bool {
-    matches!(s.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
+    matches!(s.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 
 /// Parse a `Retry-After` header value per RFC 7231 §7.1.3: either a
@@ -119,9 +171,98 @@ mod tests {
         assert_eq!(backoff(&c, 100), Duration::from_millis(5000));
     }
 
+    fn is_yes(r: Retryable) -> bool {
+        matches!(r, Retryable::Yes { .. })
+    }
+
+    fn http_error(code: u16) -> GenaiError {
+        GenaiError::HttpError {
+            status: StatusCode::from_u16(code).unwrap(),
+            canonical_reason: String::new(),
+            body: String::new(),
+        }
+    }
+
+    fn web_stream_error(inner: GenaiError) -> GenaiError {
+        GenaiError::WebStream {
+            model_iden: genai::ModelIden::new(genai::adapter::AdapterKind::Anthropic, "m"),
+            cause: inner.to_string(),
+            error: Box::new(inner),
+        }
+    }
+
+    #[test]
+    fn classifies_http_error_by_status() {
+        assert!(is_yes(classify(&anyhow::Error::from(http_error(503)))));
+        assert!(is_yes(classify(&anyhow::Error::from(http_error(529)))));
+        assert!(!is_yes(classify(&anyhow::Error::from(http_error(401)))));
+    }
+
+    #[test]
+    fn classifies_status_errors_surfaced_mid_stream() {
+        // genai sends streaming requests lazily, so a 429 arrives as a
+        // WebStream error wrapping a boxed HttpError. This used to fall
+        // through the catch-all and never retry.
+        let err = anyhow::Error::from(web_stream_error(http_error(429)));
+        assert!(is_yes(classify(&err)));
+        let err = anyhow::Error::from(web_stream_error(http_error(400)));
+        assert!(!is_yes(classify(&err)));
+    }
+
+    #[test]
+    fn classifies_stream_errors_wrapped_in_other_errors() {
+        // A future genai could box a wrapper instead of the HttpError
+        // itself; the classifier walks `source()` to find it.
+        #[derive(Debug)]
+        struct Wrapper(GenaiError);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "wrapped")
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let err = GenaiError::WebStream {
+            model_iden: genai::ModelIden::new(genai::adapter::AdapterKind::Anthropic, "m"),
+            cause: "wrapped".into(),
+            error: Box::new(Wrapper(http_error(503))),
+        };
+        assert!(is_yes(classify(&anyhow::Error::from(err))));
+    }
+
+    #[test]
+    fn classifies_bedrock_http_errors_and_keeps_retry_after() {
+        let err = anyhow::Error::from(BedrockHttpError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            retry_after: Some(Duration::from_secs(2)),
+            message: "throttled".into(),
+        })
+        .context("Failed to execute Bedrock Converse request");
+        match classify(&err) {
+            Retryable::Yes { retry_after } => {
+                assert_eq!(retry_after, Some(Duration::from_secs(2)))
+            }
+            Retryable::No => panic!("429 from Bedrock should retry"),
+        }
+        let err = anyhow::Error::from(BedrockHttpError {
+            status: StatusCode::FORBIDDEN,
+            retry_after: None,
+            message: "denied".into(),
+        });
+        assert!(!is_yes(classify(&err)));
+    }
+
+    #[test]
+    fn unrelated_errors_do_not_retry() {
+        assert!(!is_yes(classify(&anyhow::anyhow!("something else"))));
+    }
+
     #[test]
     fn is_retryable_status_covers_transients() {
-        for code in [408, 425, 429, 500, 502, 503, 504] {
+        for code in [408, 425, 429, 500, 502, 503, 504, 529] {
             assert!(
                 is_retryable_status(StatusCode::from_u16(code).unwrap()),
                 "{} should be retryable",

@@ -1,6 +1,6 @@
 use crate::providers::{Provider, ProviderManager, ProviderResponse};
 use crate::search::{format_results_for_model, SearchEngine};
-use crate::telemetry::TRACER_NAME;
+use crate::telemetry::{content_attr, truncate_content, MAX_CONTENT_BYTES, TRACER_NAME};
 use futures::future::join_all;
 use futures::StreamExt as FuturesStreamExt;
 use genai::chat::{
@@ -116,6 +116,13 @@ fn gen_ai_system_for(display_name: &str) -> &'static str {
 /// attribute. We use `serde_json::Value` rather than the genai types directly
 /// because `ChatMessage` doesn't implement Serialize. Failing to encode just
 /// drops the attribute — telemetry is opportunistic, not load-bearing.
+///
+/// Each message's text is capped at half of `MAX_CONTENT_BYTES` before
+/// encoding, so a 20 MB stdin paste isn't serialized in full only to be
+/// thrown away, and the usual oversized case (one huge `@file`/stdin message)
+/// still fits under the overall cap as valid JSON. Callers still pass the
+/// result through `content_attr`, which applies the overall cap (long chat
+/// histories) and the `LANGFUSE_CAPTURE_CONTENT` opt-out.
 fn messages_to_json(messages: &[ChatMessage]) -> Option<String> {
     let parts: Vec<serde_json::Value> = messages
         .iter()
@@ -130,6 +137,7 @@ fn messages_to_json(messages: &[ChatMessage]) -> Option<String> {
             if text.is_empty() {
                 return None;
             }
+            let text = truncate_content(&text, MAX_CONTENT_BYTES / 2);
             Some(serde_json::json!({ "role": role, "content": text }))
         })
         .collect();
@@ -307,8 +315,8 @@ pub async fn query_single(
             KeyValue::new("langfuse.observation.model.name", model.clone()),
         ])
         .start(&tracer);
-    if let Some(input_json) = messages_to_json(&messages) {
-        span.set_attribute(KeyValue::new("langfuse.observation.input", input_json));
+    if let Some(input) = messages_to_json(&messages).and_then(|json| content_attr(&json)) {
+        span.set_attribute(KeyValue::new("langfuse.observation.input", input));
     }
 
     let mut total_input: Option<i32> = None;
@@ -388,10 +396,9 @@ pub async fn query_single(
     if let Some(t) = total_output {
         span.set_attribute(KeyValue::new("gen_ai.usage.output_tokens", t as i64));
     }
-    span.set_attribute(KeyValue::new(
-        "langfuse.observation.output",
-        final_text.clone(),
-    ));
+    if let Some(output) = content_attr(&final_text) {
+        span.set_attribute(KeyValue::new("langfuse.observation.output", output));
+    }
     if final_text.is_empty() {
         let err_msg = empty_response_error(hit_search_cap, ctx.max_iterations);
         span.set_attribute(KeyValue::new("error", true));
@@ -941,8 +948,8 @@ pub async fn stream_with_messages(
             KeyValue::new("langfuse.observation.model.name", model.clone()),
         ])
         .start(&tracer);
-    if let Some(input_json) = messages_to_json(&messages) {
-        span.set_attribute(KeyValue::new("langfuse.observation.input", input_json));
+    if let Some(input) = messages_to_json(&messages).and_then(|json| content_attr(&json)) {
+        span.set_attribute(KeyValue::new("langfuse.observation.input", input));
     }
 
     let options = build_options(ctx);
@@ -1146,10 +1153,9 @@ pub async fn stream_with_messages(
     if let Some(t) = total_output {
         span.set_attribute(KeyValue::new("gen_ai.usage.output_tokens", t as i64));
     }
-    span.set_attribute(KeyValue::new(
-        "langfuse.observation.output",
-        final_text.clone(),
-    ));
+    if let Some(output) = content_attr(&final_text) {
+        span.set_attribute(KeyValue::new("langfuse.observation.output", output));
+    }
 
     // Silent-failure guard: report an empty final answer as an error so the
     // user sees something instead of "[complete]" with an empty body. Either
@@ -1338,7 +1344,10 @@ mod tests {
         let messages = vec![
             ChatMessage::system("you are helpful"),
             ChatMessage::user("hi"),
+            // Text-less messages (e.g. a pure tool-call turn) are dropped.
+            ChatMessage::assistant(""),
             ChatMessage::assistant("hello"),
+            ChatMessage::user(""),
         ];
         let json = messages_to_json(&messages).expect("encodes");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1348,6 +1357,24 @@ mod tests {
         assert_eq!(arr[0]["content"], "you are helpful");
         assert_eq!(arr[1]["role"], "user");
         assert_eq!(arr[2]["role"], "assistant");
+        assert_eq!(arr[2]["content"], "hello");
+    }
+
+    #[test]
+    fn messages_to_json_caps_each_message_and_stays_valid_json() {
+        // A huge piped-stdin question is capped per message before encoding,
+        // with the truncation marker inside the message content, and the
+        // whole encoding fits under the overall attribute cap — so
+        // `content_attr` won't cut it again and it stays parseable.
+        let huge = "y".repeat(MAX_CONTENT_BYTES * 10);
+        let messages = vec![ChatMessage::system("sys"), ChatMessage::user(huge)];
+        let json = messages_to_json(&messages).expect("encodes");
+        assert!(json.len() <= MAX_CONTENT_BYTES, "len {}", json.len());
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let content = parsed[1]["content"].as_str().unwrap();
+        let dropped = MAX_CONTENT_BYTES * 10 - MAX_CONTENT_BYTES / 2;
+        assert!(content.ends_with(&format!("…[truncated {} bytes]", dropped)));
+        assert_eq!(parsed[0]["content"], "sys");
     }
 
     #[test]

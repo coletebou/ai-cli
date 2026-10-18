@@ -155,6 +155,20 @@ base_ms = 250          # first backoff delay; doubles each subsequent retry
 max_delay_ms = 5000    # ceiling per attempt
 ```
 
+### Telemetry (optional)
+
+Traces can be exported over OpenTelemetry to a [Langfuse](https://langfuse.com) instance. It is off unless all three keys are set:
+
+| Env var                    | Meaning                                                        |
+|----------------------------|----------------------------------------------------------------|
+| `LANGFUSE_HOST`            | Base URL, e.g. `https://langfuse.example.com`                  |
+| `LANGFUSE_PUBLIC_KEY`      | Project public key                                             |
+| `LANGFUSE_SECRET_KEY`      | Project secret key                                             |
+| `LANGFUSE_ENABLED`         | `false` (or `0`) turns telemetry off even when keys are set    |
+| `LANGFUSE_CAPTURE_CONTENT` | `false` (or `0`) sends metadata only: no prompt or answer text |
+
+By default, traces include the question, message history and answers, and that includes any `@file` contents and piped stdin. Each text attribute is capped at 32 KiB and marked `…[truncated N bytes]`. With `LANGFUSE_CAPTURE_CONTENT=false`, only the model, token counts, timings and errors are sent. Calls to Bedrock-hosted models aren't traced yet.
+
 ## Subcommands
 
 ```bash

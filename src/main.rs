@@ -548,25 +548,32 @@ async fn run(cli: Cli) -> Result<ExitCode> {
 
     // Root span for the whole CLI invocation. All per-provider spans created
     // during dispatch become children of this. Dropping `_root_guard` (when
-    // run() returns) detaches the context; dropping `root_span` (when this
-    // function's locals go out of scope) ends the span itself.
+    // run() returns) detaches the context, and `_root_end` ends the span on
+    // every return path. We can't rely on the span ending when its last
+    // Context drops: detached tasks (stream_all, TUI panels) hold clones
+    // that can outlive telemetry::shutdown(), which would lose the root.
     use opentelemetry::trace::{TraceContextExt, Tracer};
     let tracer = opentelemetry::global::tracer(telemetry::TRACER_NAME);
+    let mut root_attrs = vec![opentelemetry::KeyValue::new(
+        "langfuse.trace.name",
+        if question.is_empty() {
+            "interactive session".to_string()
+        } else if telemetry::capture_content() {
+            truncate_for_trace_name(&question)
+        } else {
+            // Content capture is off: the name must not leak the prompt.
+            "query".to_string()
+        },
+    )];
+    if let Some(input) = telemetry::content_attr(&question) {
+        root_attrs.push(opentelemetry::KeyValue::new("langfuse.trace.input", input));
+    }
     let root_span = tracer
         .span_builder("ai.query")
-        .with_attributes(vec![
-            opentelemetry::KeyValue::new("langfuse.trace.input", question.clone()),
-            opentelemetry::KeyValue::new(
-                "langfuse.trace.name",
-                if question.is_empty() {
-                    "interactive session".to_string()
-                } else {
-                    truncate_for_trace_name(&question)
-                },
-            ),
-        ])
+        .with_attributes(root_attrs)
         .start(&tracer);
     let cx = opentelemetry::Context::current_with_span(root_span);
+    let _root_end = telemetry::EndSpanOnDrop(cx.clone());
     let _root_guard = cx.attach();
 
     // Interactive chat mode takes precedence over other dispatch modes.

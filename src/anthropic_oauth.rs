@@ -96,7 +96,10 @@ pub fn subscription_auth_data(base_url: Option<&str>) -> Result<AuthData> {
 
     let headers = Headers::from(vec![
         ("authorization".to_string(), format!("Bearer {token}")),
-        ("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()),
+        (
+            "anthropic-version".to_string(),
+            ANTHROPIC_VERSION.to_string(),
+        ),
         ("anthropic-beta".to_string(), OAUTH_BETA.to_string()),
     ]);
 

@@ -51,7 +51,10 @@ fn resolve_provider_auth(config: &Config, provider_name: &str) -> Option<AuthDat
         return match anthropic_oauth::subscription_auth_data(provider_cfg.base_url.as_deref()) {
             Ok(auth) => Some(auth),
             Err(err) => {
-                eprintln!("[warn] {} subscription auth unavailable: {}", provider_name, err);
+                eprintln!(
+                    "[warn] {} subscription auth unavailable: {}",
+                    provider_name, err
+                );
                 None
             }
         };
@@ -373,7 +376,10 @@ impl ProviderManager {
                         continue;
                     }
                     return Err(err).with_context(|| {
-                        format!("Failed to execute Bedrock Converse request for model: {}", model)
+                        format!(
+                            "Failed to execute Bedrock Converse request for model: {}",
+                            model
+                        )
                     });
                 }
             }

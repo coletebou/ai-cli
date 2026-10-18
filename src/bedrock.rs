@@ -195,8 +195,7 @@ impl BedrockClient {
         let mut body_stream = resp.bytes_stream();
 
         while let Some(chunk) = body_stream.next().await {
-            let chunk =
-                chunk.with_context(|| "reading Bedrock ConverseStream response body")?;
+            let chunk = chunk.with_context(|| "reading Bedrock ConverseStream response body")?;
             decoder.feed(&chunk);
 
             while let Some(frame) = decoder.next_frame()? {
@@ -275,9 +274,7 @@ fn frame_to_events(frame: Frame) -> Result<Vec<BedrockStreamEvent>> {
             format!(
                 "parsing {} payload as JSON (first 200 bytes: {:?})",
                 event_type,
-                String::from_utf8_lossy(
-                    &frame.payload[..frame.payload.len().min(200)]
-                )
+                String::from_utf8_lossy(&frame.payload[..frame.payload.len().min(200)])
             )
         })?
     };
@@ -571,9 +568,7 @@ fn build_converse_request(
                                     // Bedrock requires a valid JSON schema; if
                                     // the caller provided none, send an empty
                                     // object schema ("any input shape").
-                                    .unwrap_or_else(|| {
-                                        serde_json::json!({"type": "object"})
-                                    }),
+                                    .unwrap_or_else(|| serde_json::json!({"type": "object"})),
                             },
                         },
                     })
@@ -750,10 +745,7 @@ mod tests {
 
     #[test]
     fn folds_system_prompts() {
-        let msgs = vec![
-            ChatMessage::system("be brief"),
-            ChatMessage::user("hi"),
-        ];
+        let msgs = vec![ChatMessage::system("be brief"), ChatMessage::user("hi")];
         let req = build_converse_request(&msgs, Some("also: polite"), None).unwrap();
         let json = serde_json::to_value(&req).unwrap();
         let sys = json["system"].as_array().unwrap();
@@ -794,10 +786,7 @@ mod tests {
         );
         // genai's ChatRole::Tool becomes a user turn with toolResult.
         assert_eq!(messages[2]["role"], "user");
-        assert_eq!(
-            messages[2]["content"][0]["toolResult"]["toolUseId"],
-            "c1"
-        );
+        assert_eq!(messages[2]["content"][0]["toolResult"]["toolUseId"], "c1");
         assert_eq!(
             messages[2]["content"][0]["toolResult"]["content"][0]["text"],
             "search results here"
@@ -907,8 +896,7 @@ mod tests {
         }
 
         // contentBlockDelta with toolUse.input fragment
-        let delta_payload =
-            br#"{"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\"a\": 1"}}}"#;
+        let delta_payload = br#"{"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\"a\": 1"}}}"#;
         let mut h = std::collections::HashMap::new();
         h.insert(":event-type".to_string(), "contentBlockDelta".to_string());
         h.insert(":message-type".to_string(), "event".to_string());
@@ -956,7 +944,10 @@ mod tests {
             "stopReason": "end_turn"
         }"#;
         let parsed: ConverseResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.output.message.content[0].text.as_deref(), Some("Hello there!"));
+        assert_eq!(
+            parsed.output.message.content[0].text.as_deref(),
+            Some("Hello there!")
+        );
         assert_eq!(parsed.usage.as_ref().unwrap().input_tokens, Some(13));
         assert_eq!(parsed.usage.as_ref().unwrap().output_tokens, Some(5));
     }

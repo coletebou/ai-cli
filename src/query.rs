@@ -358,7 +358,8 @@ pub async fn query_single(
         return ProviderResponse::error(
             provider.clone(),
             model,
-            "provider returned an empty response (likely a wire-protocol mismatch; check base_url)".to_string(),
+            "provider returned an empty response (likely a wire-protocol mismatch; check base_url)"
+                .to_string(),
             duration_ms,
         );
     }
@@ -610,9 +611,11 @@ async fn handle_bedrock_event(
                 // Tool-use blocks: parse the accumulated JSON input. If
                 // parsing fails, the model emitted invalid JSON — surface it
                 // as a stream error rather than fabricating a tool call.
-                match serde_json::from_str::<serde_json::Value>(
-                    if input_buf.is_empty() { "{}" } else { &input_buf },
-                ) {
+                match serde_json::from_str::<serde_json::Value>(if input_buf.is_empty() {
+                    "{}"
+                } else {
+                    &input_buf
+                }) {
                     Ok(input) => finalized.push(ToolCall {
                         call_id: tool_use_id,
                         fn_name: name,
@@ -721,8 +724,7 @@ async fn query_single_bedrock(
 
         // Execute tool calls and append responses (user turns with toolResult).
         for tool_call in &outcome.tool_calls {
-            let result_text =
-                execute_tool_call(tool_call, ctx, &provider.display_name, None).await;
+            let result_text = execute_tool_call(tool_call, ctx, &provider.display_name, None).await;
             let tool_response = ToolResponse::new(tool_call.call_id.clone(), result_text);
             messages.push(ChatMessage::from(tool_response));
         }
@@ -1038,7 +1040,6 @@ pub async fn stream_with_messages(
     // Persist the final assistant reply in the message history so multi-turn
     // callers see it on subsequent turns.
     messages.push(ChatMessage::assistant(final_text));
-
 
     let _ = tx
         .send(StreamEvent::Done {

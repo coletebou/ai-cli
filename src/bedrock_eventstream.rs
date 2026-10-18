@@ -135,7 +135,11 @@ fn read_header_name(bytes: &[u8]) -> Result<(String, &[u8])> {
     }
     let name_len = bytes[0] as usize;
     if bytes.len() < 1 + name_len {
-        bail!("truncated header: name length {} exceeds remaining {}", name_len, bytes.len() - 1);
+        bail!(
+            "truncated header: name length {} exceeds remaining {}",
+            name_len,
+            bytes.len() - 1
+        );
     }
     let name = std::str::from_utf8(&bytes[1..1 + name_len])
         .map_err(|_| anyhow!("non-UTF8 header name"))?
@@ -274,10 +278,10 @@ mod tests {
     fn rejects_non_string_header_type() {
         // Craft a header with type=2 (byte) instead of 7 (string).
         let header_bytes: Vec<u8> = vec![
-            1u8,    // name_len
-            b'x',   // name
-            2u8,    // unsupported type
-            0u8,    // value byte
+            1u8,  // name_len
+            b'x', // name
+            2u8,  // unsupported type
+            0u8,  // value byte
         ];
         let total_len = PRELUDE_LEN + header_bytes.len() + CRC_TRAILER_LEN;
         let mut frame = Vec::new();
@@ -310,7 +314,10 @@ mod tests {
         assert!(!events.is_empty(), "expected at least one frame");
 
         let types: Vec<&str> = events.iter().filter_map(|f| f.event_type()).collect();
-        assert!(types.contains(&"messageStart"), "missing messageStart event");
+        assert!(
+            types.contains(&"messageStart"),
+            "missing messageStart event"
+        );
         assert!(
             types.contains(&"contentBlockDelta"),
             "missing contentBlockDelta events"

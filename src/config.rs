@@ -186,23 +186,15 @@ pub enum ModelTier {
     Smart,
 }
 
-/// How a provider authenticates its requests.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
-    /// Standard metered API billing via `api_key` / `api_key_env`.
     #[default]
     ApiKey,
-    /// Anthropic only. Rides a Claude Pro/Max subscription's included usage
-    /// by replaying the OAuth token Claude Code stores after `claude login`,
-    /// instead of billing against a separate API key. This is unofficial and
-    /// reverse-engineered (not a documented Anthropic API): it swaps in a
-    /// `Bearer` token and an `anthropic-beta: oauth-2025-04-20` header in
-    /// place of `x-api-key`. It can stop working without notice, and using a
-    /// subscription-scoped credential outside Anthropic's own clients is
-    /// outside the letter of Anthropic's usage terms — there's real risk of
-    /// the token or account getting flagged. See `anthropic_oauth.rs`.
+    /// Anthropic subscription OAuth from a local Claude Code login.
     Subscription,
+    ChatgptOauth,
+    BedrockBearer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -342,8 +334,12 @@ impl Default for FooterConfig {
 pub struct ProviderConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub auth_mode: AuthMode,
     pub api_key_env: Option<String>,
     pub api_key: Option<String>,
+    /// Codex auth.json or a single-profile OpenClaw export used for ChatGPT OAuth.
+    pub oauth_credentials_file: Option<PathBuf>,
     /// Legacy field - use fast_model/smart_model instead
     #[serde(default)]
     pub default_model: String,
@@ -351,15 +347,19 @@ pub struct ProviderConfig {
     pub fast_model: Option<String>,
     /// Model for smart tier (better quality, slower)
     pub smart_model: Option<String>,
+    /// Reasoning effort for the fast tier.
+    pub fast_reasoning: Option<String>,
+    /// Reasoning effort for the smart tier.
+    pub smart_reasoning: Option<String>,
+    /// Provider service tier for the fast tier.
+    pub fast_service_tier: Option<String>,
+    /// Provider service tier for the smart tier.
+    pub smart_service_tier: Option<String>,
     #[serde(default)]
     pub aliases: Vec<String>,
     #[serde(default = "default_color")]
     pub color: String,
     pub base_url: Option<String>,
-    /// How this provider authenticates. Defaults to `api_key`; `subscription`
-    /// only has an effect for the `anthropic` provider.
-    #[serde(default)]
-    pub auth_mode: AuthMode,
 }
 
 impl ProviderConfig {
@@ -368,6 +368,20 @@ impl ProviderConfig {
         match tier {
             ModelTier::Fast => self.fast_model.as_deref().unwrap_or(&self.default_model),
             ModelTier::Smart => self.smart_model.as_deref().unwrap_or(&self.default_model),
+        }
+    }
+
+    pub fn get_reasoning(&self, tier: &ModelTier) -> Option<&str> {
+        match tier {
+            ModelTier::Fast => self.fast_reasoning.as_deref(),
+            ModelTier::Smart => self.smart_reasoning.as_deref(),
+        }
+    }
+
+    pub fn get_service_tier(&self, tier: &ModelTier) -> Option<&str> {
+        match tier {
+            ModelTier::Fast => self.fast_service_tier.as_deref(),
+            ModelTier::Smart => self.smart_service_tier.as_deref(),
         }
     }
 }
@@ -399,15 +413,20 @@ impl Config {
             "anthropic".to_string(),
             ProviderConfig {
                 enabled: true,
+                auth_mode: AuthMode::ApiKey,
                 api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
                 api_key: None,
+                oauth_credentials_file: None,
                 default_model: "claude-haiku-4-5".to_string(),
                 fast_model: Some("claude-haiku-4-5".to_string()),
                 smart_model: Some("claude-opus-4-8".to_string()),
+                fast_reasoning: None,
+                smart_reasoning: None,
+                fast_service_tier: None,
+                smart_service_tier: None,
                 aliases: vec!["claude".to_string()],
                 color: "magenta".to_string(),
                 base_url: None,
-                auth_mode: AuthMode::ApiKey,
             },
         );
 
@@ -415,15 +434,41 @@ impl Config {
             "openai".to_string(),
             ProviderConfig {
                 enabled: true,
+                auth_mode: AuthMode::ApiKey,
                 api_key_env: Some("OPENAI_API_KEY".to_string()),
                 api_key: None,
+                oauth_credentials_file: None,
                 default_model: "gpt-5-nano".to_string(),
                 fast_model: Some("gpt-5-nano".to_string()),
                 smart_model: Some("gpt-5.5".to_string()),
+                fast_reasoning: None,
+                smart_reasoning: None,
+                fast_service_tier: None,
+                smart_service_tier: None,
                 aliases: vec!["chatgpt".to_string(), "gpt".to_string()],
                 color: "green".to_string(),
                 base_url: None,
-                auth_mode: AuthMode::ApiKey,
+            },
+        );
+
+        providers.insert(
+            "bedrock-openai".to_string(),
+            ProviderConfig {
+                enabled: false,
+                auth_mode: AuthMode::BedrockBearer,
+                api_key_env: Some("AWS_BEARER_TOKEN_BEDROCK".to_string()),
+                api_key: None,
+                oauth_credentials_file: None,
+                default_model: "openai.gpt-5.6-sol".to_string(),
+                fast_model: Some("openai.gpt-5.6-sol".to_string()),
+                smart_model: Some("openai.gpt-5.6-sol".to_string()),
+                fast_reasoning: Some("medium".to_string()),
+                smart_reasoning: Some("max".to_string()),
+                fast_service_tier: Some("default".to_string()),
+                smart_service_tier: Some("default".to_string()),
+                aliases: vec!["gpt-bedrock".to_string(), "bedrock-gpt".to_string()],
+                color: "yellow".to_string(),
+                base_url: Some("https://bedrock-mantle.us-east-1.api.aws/openai/v1".to_string()),
             },
         );
 
@@ -431,18 +476,23 @@ impl Config {
             "xai".to_string(),
             ProviderConfig {
                 enabled: true,
+                auth_mode: AuthMode::ApiKey,
                 api_key_env: Some("XAI_API_KEY".to_string()),
                 api_key: None,
+                oauth_credentials_file: None,
                 // xAI's newest model backs both tiers. It always reasons, so
                 // the fast tier trades ~0.6s of latency for recency versus
                 // grok-4.20-0309-non-reasoning.
                 default_model: "grok-4.7".to_string(),
                 fast_model: Some("grok-4.7".to_string()),
                 smart_model: Some("grok-4.7".to_string()),
+                fast_reasoning: None,
+                smart_reasoning: None,
+                fast_service_tier: None,
+                smart_service_tier: None,
                 aliases: vec!["grok".to_string()],
                 color: "blue".to_string(),
                 base_url: None,
-                auth_mode: AuthMode::ApiKey,
             },
         );
 
@@ -450,15 +500,20 @@ impl Config {
             "google".to_string(),
             ProviderConfig {
                 enabled: true,
+                auth_mode: AuthMode::ApiKey,
                 api_key_env: Some("GEMINI_API_KEY".to_string()),
                 api_key: None,
+                oauth_credentials_file: None,
                 default_model: "gemini-3.5-flash".to_string(),
                 fast_model: Some("gemini-3.5-flash".to_string()),
                 smart_model: Some("gemini-3.1-pro-preview".to_string()),
+                fast_reasoning: None,
+                smart_reasoning: None,
+                fast_service_tier: None,
+                smart_service_tier: None,
                 aliases: vec!["gemini".to_string()],
                 color: "cyan".to_string(),
                 base_url: None,
-                auth_mode: AuthMode::ApiKey,
             },
         );
 
@@ -466,15 +521,20 @@ impl Config {
             "openrouter".to_string(),
             ProviderConfig {
                 enabled: true,
+                auth_mode: AuthMode::ApiKey,
                 api_key_env: Some("OPENROUTER_API_KEY".to_string()),
                 api_key: None,
+                oauth_credentials_file: None,
                 default_model: "google/gemini-3.1-flash-lite-preview".to_string(),
                 fast_model: Some("google/gemini-3.1-flash-lite-preview".to_string()),
                 smart_model: Some("anthropic/claude-opus-4-8".to_string()),
+                fast_reasoning: None,
+                smart_reasoning: None,
+                fast_service_tier: None,
+                smart_service_tier: None,
                 aliases: vec!["openrouter".to_string(), "or".to_string()],
                 color: "yellow".to_string(),
                 base_url: Some("https://openrouter.ai/api/v1".to_string()),
-                auth_mode: AuthMode::ApiKey,
             },
         );
 
@@ -482,15 +542,20 @@ impl Config {
             "ollama".to_string(),
             ProviderConfig {
                 enabled: false,
+                auth_mode: AuthMode::ApiKey,
                 api_key_env: None,
                 api_key: None,
+                oauth_credentials_file: None,
                 default_model: "qwen3:8b".to_string(),
                 fast_model: Some("qwen3:8b".to_string()),
                 smart_model: Some("qwen3:14b".to_string()),
+                fast_reasoning: None,
+                smart_reasoning: None,
+                fast_service_tier: None,
+                smart_service_tier: None,
                 aliases: vec!["ollama".to_string(), "local".to_string()],
                 color: "red".to_string(),
                 base_url: Some("http://localhost:11434".to_string()),
-                auth_mode: AuthMode::ApiKey,
             },
         );
 
@@ -991,14 +1056,17 @@ max_delay_ms = 5000
 #
 # Fields:
 #   enabled      – include in provider list (default: true)
+#   auth_mode    – "api_key", "subscription", "chatgpt_oauth", or "bedrock_bearer"
 #   api_key_env  – env var holding the API key
 #   api_key      – hardcoded key (not recommended; prefer env vars)
+#   oauth_credentials_file – Codex auth.json or a single-profile OpenClaw export
 #   fast_model   – model used when model_tier = "fast"
 #   smart_model  – model used when model_tier = "smart"
+#   fast_reasoning / smart_reasoning – none, low, medium, high, xhigh, or max
+#   fast_service_tier / smart_service_tier – default, flex, or priority
 #   aliases      – short names for -p flag (first alias used as display name)
 #   color        – header color: red, green, blue, cyan, magenta, yellow, white
 #   base_url     – override the default API endpoint (for proxies, Bedrock, etc.)
-#   auth_mode    – "api_key" (default) or "subscription" (Anthropic only, see below)
 
 [providers.anthropic]
 enabled = true
@@ -1007,25 +1075,46 @@ fast_model = "claude-haiku-4-5"
 smart_model = "claude-opus-4-8"
 aliases = ["claude"]
 color = "magenta"
+# To use a Claude Pro/Max subscription instead of a metered API key:
+# auth_mode = "subscription"
 # For AWS Bedrock: set base_url and use a Bedrock API key.
 # Model IDs like "us.anthropic.claude-opus-4-7" are automatically
 # routed to the Anthropic adapter regardless of their prefix.
 # base_url = "https://bedrock-runtime.us-east-1.amazonaws.com/v1/"
 # api_key_env = "AWS_BEARER_TOKEN_BEDROCK"
-#
-# To bill against a Claude Pro/Max subscription instead of the metered API,
-# replay the OAuth token Claude Code stores at ~/.claude/.credentials.json
-# after `claude login`. This is unofficial/reverse-engineered — not a
-# documented Anthropic API — and can break or get flagged without notice.
-# auth_mode = "subscription"
 
 [providers.openai]
 enabled = true
+auth_mode = "api_key"
 api_key_env = "OPENAI_API_KEY"
 fast_model = "gpt-5-nano"
 smart_model = "gpt-5.5"
 aliases = ["chatgpt", "gpt"]
 color = "green"
+# ChatGPT subscription example:
+# auth_mode = "chatgpt_oauth"
+# oauth_credentials_file = "~/.codex/auth.json"
+# fast_model = "gpt-5.6-sol"
+# smart_model = "gpt-5.6-sol"
+# fast_reasoning = "medium"
+# smart_reasoning = "max"
+# fast_service_tier = "priority"
+# smart_service_tier = "priority"
+
+[providers.bedrock-openai]
+enabled = false
+auth_mode = "bedrock_bearer"
+api_key_env = "AWS_BEARER_TOKEN_BEDROCK"
+fast_model = "openai.gpt-5.6-sol"
+smart_model = "openai.gpt-5.6-sol"
+fast_reasoning = "medium"
+smart_reasoning = "max"
+# Bedrock Mantle currently supports the standard service tier.
+fast_service_tier = "default"
+smart_service_tier = "default"
+aliases = ["gpt-bedrock", "bedrock-gpt"]
+color = "yellow"
+base_url = "https://bedrock-mantle.us-east-1.api.aws/openai/v1"
 
 [providers.xai]
 enabled = true
@@ -1107,6 +1196,43 @@ base_url = "http://localhost:11434"
         None
     }
 
+    pub fn provider_is_available(&self, provider_name: &str) -> bool {
+        let Some(provider) = self.providers.get(provider_name) else {
+            return false;
+        };
+        if !provider.enabled {
+            return false;
+        }
+        if provider_name == "ollama" {
+            return true;
+        }
+        match provider.auth_mode {
+            AuthMode::ApiKey => self.get_api_key(provider_name).is_some(),
+            AuthMode::Subscription => {
+                provider_name == "anthropic" && crate::anthropic_oauth::is_available()
+            }
+            AuthMode::ChatgptOauth => {
+                provider_name == "openai"
+                    && provider
+                        .oauth_credentials_file
+                        .as_deref()
+                        .map(expand_home)
+                        .is_some_and(|path| path.is_file())
+            }
+            AuthMode::BedrockBearer => {
+                provider
+                    .base_url
+                    .as_deref()
+                    .is_some_and(|url| !url.trim().is_empty())
+                    && provider
+                        .api_key_env
+                        .as_deref()
+                        .and_then(|name| env::var(name).ok())
+                        .is_some_and(|token| !token.is_empty())
+            }
+        }
+    }
+
     pub fn resolve_provider_alias(&self, alias: &str) -> Option<String> {
         let alias_lower = alias.to_lowercase();
         for (name, config) in &self.providers {
@@ -1121,6 +1247,19 @@ base_url = "http://localhost:11434"
         }
         None
     }
+}
+
+pub fn expand_home(path: &std::path::Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if text == "~" {
+        return dirs::home_dir().unwrap_or_else(|| path.to_path_buf());
+    }
+    if let Some(rest) = text.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    path.to_path_buf()
 }
 
 #[cfg(test)]
@@ -1145,6 +1284,7 @@ mod tests {
         assert!(config.providers.contains_key("xai"));
         assert!(config.providers.contains_key("google"));
         assert!(config.providers.contains_key("openrouter"));
+        assert!(config.providers.contains_key("bedrock-openai"));
         assert!(config.providers.contains_key("ollama"));
         assert!(!config.providers["ollama"].enabled);
         assert_eq!(config.cli.single_provider, "claude");
@@ -1410,7 +1550,14 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            ["anthropic", "google", "openai", "openrouter", "xai"]
+            [
+                "anthropic",
+                "bedrock-openai",
+                "google",
+                "openai",
+                "openrouter",
+                "xai"
+            ]
         );
         let anthropic = &loaded.providers["anthropic"];
         assert_eq!(anthropic.fast_model.as_deref(), Some("claude-custom"));
@@ -1708,5 +1855,33 @@ mod tests {
         assert_eq!(mine.color, "white");
         assert_eq!(mine.api_key_env, None);
         assert_eq!(config.providers["anthropic"].color, "blue");
+    }
+
+    #[test]
+    fn oauth_availability_requires_the_openai_provider() {
+        let mut config = Config::default();
+        let mut provider = config.providers["openai"].clone();
+        provider.enabled = true;
+        provider.auth_mode = AuthMode::ChatgptOauth;
+        provider.oauth_credentials_file = Some(std::env::current_exe().unwrap());
+        config
+            .providers
+            .insert("other-openai".to_string(), provider);
+        assert!(!config.provider_is_available("other-openai"));
+    }
+
+    #[test]
+    fn bedrock_bearer_availability_requires_a_base_url() {
+        let mut config = Config::default();
+        let provider = config.providers.get_mut("bedrock-openai").unwrap();
+        provider.enabled = true;
+        provider.auth_mode = AuthMode::BedrockBearer;
+        provider.api_key_env = Some("PATH".to_string());
+        provider.base_url = None;
+        assert!(!config.provider_is_available("bedrock-openai"));
+
+        config.providers.get_mut("bedrock-openai").unwrap().base_url =
+            Some("https://bedrock-mantle.us-east-1.api.aws/openai/v1".to_string());
+        assert!(config.provider_is_available("bedrock-openai"));
     }
 }

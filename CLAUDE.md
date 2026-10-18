@@ -43,6 +43,7 @@ src/
 ├── config.rs              Config load/save (path resolution, partial-section merge, atomic 0600 writes)
 ├── config_ui.rs           `ai config` TUI editor
 ├── providers.rs           ProviderManager: genai client, model→provider routing, auth, retries, provider selection
+├── openai_responses.rs    OpenAI Responses transport: ChatGPT OAuth (Codex credentials) + Bedrock Mantle bearer
 ├── query.rs               Query execution, tool-use loop, StreamEvent enum (genai and Bedrock paths)
 ├── retry.rs               Error classification (genai, Bedrock, reqwest) + backoff / Retry-After
 ├── bedrock.rs             Direct Bedrock Converse/ConverseStream client (bearer token)
@@ -88,6 +89,10 @@ src/
 ### Provider Configuration
 
 API keys come from the env var named by each provider's `api_key_env` (built-in providers fall back to ANTHROPIC_API_KEY, OPENAI_API_KEY, XAI_API_KEY, GEMINI_API_KEY / GOOGLE_API_KEY, OPENROUTER_API_KEY), or from `api_key` in the config. Empty or whitespace-only values count as missing. Bedrock providers use a bearer token (`AWS_BEARER_TOKEN_BEDROCK`). Providers that are disabled or lack credentials are skipped; an explicit `-p` request prints why.
+
+API keys are resolved via environment variables or config. OpenAI can instead
+use ChatGPT OAuth credentials from Codex/OpenClaw. Bedrock Claude uses Runtime
+Converse; Bedrock GPT-5.6 uses the Mantle Responses endpoint.
 
 ### Dependencies
 

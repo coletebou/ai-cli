@@ -7,7 +7,7 @@ use genai::chat::{
     ChatMessage, ChatOptions, ChatStreamEvent, ContentPart, ReasoningEffort, Tool, ToolCall,
     ToolResponse,
 };
-use opentelemetry::trace::{FutureExt, Span, Tracer};
+use opentelemetry::trace::{FutureExt, Span, Status, Tracer};
 use opentelemetry::{global, Context, KeyValue};
 use std::sync::Arc;
 use std::time::Instant;
@@ -61,6 +61,10 @@ pub struct QueryContext {
     pub question: String,
     pub system_prompt: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Raw Codex reasoning keyword, including 5.6-only levels such as `max`.
+    pub codex_reasoning_effort: Option<String>,
+    /// Distinguishes an explicit non-keyword budget from no CLI override.
+    pub reasoning_explicit: bool,
     pub tools: Option<Vec<Tool>>,
     pub search_client: Option<Arc<SearchEngine>>,
     pub max_iterations: usize,
@@ -72,6 +76,8 @@ impl QueryContext {
             question: question.into(),
             system_prompt: None,
             reasoning_effort: None,
+            codex_reasoning_effort: None,
+            reasoning_explicit: false,
             tools: None,
             search_client: None,
             max_iterations: 5,
@@ -83,8 +89,14 @@ impl QueryContext {
         self
     }
 
-    pub fn with_reasoning(mut self, reasoning: Option<ReasoningEffort>) -> Self {
+    pub fn with_reasoning(
+        mut self,
+        reasoning: Option<ReasoningEffort>,
+        codex_reasoning: Option<String>,
+    ) -> Self {
+        self.reasoning_explicit = reasoning.is_some();
         self.reasoning_effort = reasoning;
+        self.codex_reasoning_effort = codex_reasoning;
         self
     }
 
@@ -144,6 +156,47 @@ fn messages_to_json(messages: &[ChatMessage]) -> Option<String> {
     serde_json::to_string(&parts).ok()
 }
 
+fn generation_span_attributes(provider: &Provider) -> Vec<KeyValue> {
+    vec![
+        KeyValue::new("gen_ai.system", gen_ai_system_for(&provider.display_name)),
+        KeyValue::new("gen_ai.request.model", provider.model.clone()),
+        KeyValue::new("gen_ai.operation.name", "chat"),
+        // Tells Langfuse to render this span as a generation, not a
+        // generic span — unlocks token/cost rollups in the UI.
+        KeyValue::new("langfuse.observation.type", "generation"),
+        KeyValue::new("langfuse.observation.model.name", provider.model.clone()),
+    ]
+}
+
+fn record_generation_result(
+    span: &mut global::BoxedSpan,
+    input_tokens: Option<i32>,
+    output_tokens: Option<i32>,
+    output: &str,
+) {
+    if let Some(tokens) = input_tokens {
+        span.set_attribute(KeyValue::new("gen_ai.usage.input_tokens", tokens as i64));
+    }
+    if let Some(tokens) = output_tokens {
+        span.set_attribute(KeyValue::new("gen_ai.usage.output_tokens", tokens as i64));
+    }
+    // Routed through `content_attr` so the Responses paths honour #93's
+    // content opt-out and size cap like the genai paths do.
+    if let Some(output) = content_attr(output) {
+        span.set_attribute(KeyValue::new("langfuse.observation.output", output));
+    }
+}
+
+fn record_generation_error(span: &mut global::BoxedSpan, error: &str) {
+    span.set_attribute(KeyValue::new("error", true));
+    span.set_attribute(KeyValue::new("exception.message", error.to_string()));
+    span.set_status(generation_error_status(error));
+}
+
+fn generation_error_status(error: &str) -> Status {
+    Status::error(error.to_string())
+}
+
 fn build_initial_messages(question: &str, system_prompt: Option<&str>) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     if let Some(system) = system_prompt {
@@ -153,15 +206,11 @@ fn build_initial_messages(question: &str, system_prompt: Option<&str>) -> Vec<Ch
     messages
 }
 
-fn build_options(ctx: &QueryContext) -> ChatOptions {
-    // Always capture usage: genai's streamers only report token counts in
-    // `StreamEnd.captured_usage` when this is set (and only then ask
-    // OpenAI-compatible servers for them via `stream_options.include_usage`).
-    // Without it, streamed replies never show tokens in the footer and the
-    // Langfuse spans carry no gen_ai.usage.* attributes. Non-streaming
-    // responses always include usage, so this is a no-op there.
+fn build_options(ctx: &QueryContext, provider: &Provider) -> ChatOptions {
+    let configured_reasoning = provider.reasoning.as_deref().and_then(reasoning_for_genai);
+    let reasoning = ctx.reasoning_effort.clone().or(configured_reasoning);
     let mut options = ChatOptions::default().with_capture_usage(true);
-    if let Some(r) = ctx.reasoning_effort.clone() {
+    if let Some(r) = reasoning {
         options = options.with_reasoning_effort(r);
     }
     if ctx.tools.is_some() {
@@ -170,16 +219,29 @@ fn build_options(ctx: &QueryContext) -> ChatOptions {
     options
 }
 
-/// Error for a genai run that ended with no answer text. Two very different
-/// causes end up here: the search tool loop hit `max_iterations` while the
-/// model still wanted to search (so the last round had only tool calls), or
-/// the provider sent nothing we could parse, which is almost always a
-/// wire-protocol mismatch (e.g. an adapter pointed at a server that doesn't
-/// speak its protocol).
+fn reasoning_for_genai(value: &str) -> Option<ReasoningEffort> {
+    match value.to_ascii_lowercase().as_str() {
+        "none" | "off" => Some(ReasoningEffort::None),
+        "minimal" => Some(ReasoningEffort::Minimal),
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        // genai 0.5 has no max/xhigh variants. Non-Codex providers get the
+        // closest supported level; Codex receives the original keyword.
+        "high" | "xhigh" | "max" => Some(ReasoningEffort::High),
+        _ => None,
+    }
+}
+
+fn codex_reasoning<'a>(ctx: &'a QueryContext, provider: &'a Provider) -> Option<&'a str> {
+    if ctx.reasoning_explicit {
+        ctx.codex_reasoning_effort.as_deref()
+    } else {
+        provider.reasoning.as_deref()
+    }
+}
+
 fn empty_response_error(hit_search_cap: bool, max_iterations: usize) -> String {
     if hit_search_cap {
-        // The cap only triggers on the last iteration, and every earlier
-        // iteration ran a search round (otherwise the loop would have ended).
         let rounds = max_iterations.max(1) - 1;
         format!(
             "stopped after {} search round{} without a final answer (raise [search] max_iterations, currently {})",
@@ -295,28 +357,27 @@ pub async fn query_single(
 
     // Bedrock-hosted models bypass genai (which cannot speak Bedrock's wire
     // protocol) and go through the direct Converse client.
-    if let Some(bedrock) = manager.bedrock_for(&model) {
+    if let Some(bedrock) = manager.bedrock_for(&provider.name) {
         return query_single_bedrock(manager, provider, ctx, &bedrock, start).await;
     }
-
     let mut messages = build_initial_messages(&ctx.question, ctx.system_prompt.as_deref());
-    let options = build_options(ctx);
+    let options = build_options(ctx, provider);
 
     // OTel span — same shape as `stream_with_messages` so both code paths
     // produce comparable Langfuse generations.
     let tracer = global::tracer(TRACER_NAME);
     let mut span = tracer
         .span_builder(format!("chat {}", provider.display_name))
-        .with_attributes(vec![
-            KeyValue::new("gen_ai.system", gen_ai_system_for(&provider.display_name)),
-            KeyValue::new("gen_ai.request.model", model.clone()),
-            KeyValue::new("gen_ai.operation.name", "chat"),
-            KeyValue::new("langfuse.observation.type", "generation"),
-            KeyValue::new("langfuse.observation.model.name", model.clone()),
-        ])
+        .with_attributes(generation_span_attributes(provider))
         .start(&tracer);
     if let Some(input) = messages_to_json(&messages).and_then(|json| content_attr(&json)) {
         span.set_attribute(KeyValue::new("langfuse.observation.input", input));
+    }
+    // TODO(oauth-split, design question 2): Responses-transport providers
+    // (chatgpt_oauth / bedrock_bearer) are dispatched here, after the shared
+    // span is opened, so they keep #93's content opt-out. Provisional.
+    if let Some(responses) = manager.responses_for(&provider.name) {
+        return query_single_responses(provider, ctx, &responses, messages, span, start).await;
     }
 
     let mut total_input: Option<i32> = None;
@@ -415,6 +476,249 @@ pub async fn query_single(
         total_output,
         duration_ms,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_responses(
+    client: &crate::openai_responses::OpenAIResponsesClient,
+    provider: &Provider,
+    mut messages: Vec<ChatMessage>,
+    ctx: &QueryContext,
+    tx: mpsc::Sender<StreamEvent>,
+    cancel: &CancellationToken,
+    mut span: global::BoxedSpan,
+    start: Instant,
+) -> Vec<ChatMessage> {
+    use crate::openai_responses::{
+        assistant_message_with_output_items, ResponsesStreamEvent as RE,
+    };
+
+    let provider_name = provider.display_name.clone();
+    let model = provider.model.clone();
+    let _ = tx
+        .send(StreamEvent::Start {
+            provider: provider_name.clone(),
+            model: model.clone(),
+        })
+        .await;
+
+    let mut total_input: Option<i32> = None;
+    let mut total_output: Option<i32> = None;
+    let mut final_text = String::new();
+    let mut final_output_items = Vec::new();
+    let request_messages = messages.clone();
+    let mut continuation_items = Vec::new();
+
+    for iteration in 0..ctx.max_iterations.max(1) {
+        let (child_tx, mut child_rx) = mpsc::channel::<RE>(64);
+        let model_for_call = model.clone();
+        let messages_for_call = request_messages.clone();
+        let continuation_for_call = continuation_items.clone();
+        let system_for_call = ctx.system_prompt.clone();
+        let tools_for_call = ctx.tools.clone();
+        let reasoning_for_call = codex_reasoning(ctx, provider).map(str::to_string);
+        let service_tier_for_call = provider.service_tier.clone();
+        let call = client.converse_stream(
+            &model_for_call,
+            &messages_for_call,
+            &continuation_for_call,
+            system_for_call.as_deref(),
+            tools_for_call.as_deref(),
+            reasoning_for_call.as_deref(),
+            service_tier_for_call.as_deref(),
+            child_tx,
+        );
+        tokio::pin!(call);
+
+        let mut iter_text = String::new();
+        let mut tool_calls = Vec::new();
+        let mut output_items = Vec::new();
+        let mut stream_error = None;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    record_generation_result(
+                        &mut span,
+                        total_input,
+                        total_output,
+                        &final_text,
+                    );
+                    span.set_attribute(KeyValue::new("cancelled", true));
+                    span.end();
+                    let _ = tx.send(StreamEvent::Error {
+                        provider: provider_name,
+                        model,
+                        error: "cancelled".to_string(),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    }).await;
+                    return messages;
+                }
+                _ = &mut call => {
+                    while let Ok(event) = child_rx.try_recv() {
+                        handle_responses_event(
+                            event,
+                            &provider_name,
+                            &tx,
+                            &mut iter_text,
+                            &mut tool_calls,
+                            &mut output_items,
+                            &mut total_input,
+                            &mut total_output,
+                            &mut stream_error,
+                        ).await;
+                    }
+                    break;
+                }
+                event = child_rx.recv() => match event {
+                    Some(event) => handle_responses_event(
+                        event,
+                        &provider_name,
+                        &tx,
+                        &mut iter_text,
+                        &mut tool_calls,
+                        &mut output_items,
+                        &mut total_input,
+                        &mut total_output,
+                        &mut stream_error,
+                    ).await,
+                    None => break,
+                },
+            }
+        }
+
+        if let Some(error) = stream_error {
+            record_generation_result(&mut span, total_input, total_output, &iter_text);
+            record_generation_error(&mut span, &error);
+            span.end();
+            let _ = tx
+                .send(StreamEvent::Error {
+                    provider: provider_name,
+                    model,
+                    error,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                })
+                .await;
+            return messages;
+        }
+        if tool_calls.is_empty() || ctx.search_client.is_none() {
+            final_text = iter_text;
+            if tool_calls.is_empty() {
+                final_output_items = output_items;
+            }
+            break;
+        }
+        if iteration + 1 >= ctx.max_iterations {
+            let error = format!(
+                "OpenAI Responses tool-use limit reached after {} iterations",
+                ctx.max_iterations.max(1)
+            );
+            record_generation_result(&mut span, total_input, total_output, &iter_text);
+            record_generation_error(&mut span, &error);
+            span.end();
+            let _ = tx
+                .send(StreamEvent::Error {
+                    provider: provider_name,
+                    model,
+                    error,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                })
+                .await;
+            return messages;
+        }
+
+        messages.push(assistant_message_with_output_items(
+            &iter_text,
+            &tool_calls,
+            &output_items,
+        ));
+        continuation_items.extend(output_items);
+        for tool_call in &tool_calls {
+            let result = execute_tool_call(tool_call, ctx, &provider_name, Some(&tx)).await;
+            continuation_items.push(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": tool_call.call_id,
+                "output": result.clone(),
+            }));
+            messages.push(ChatMessage::from(ToolResponse::new(
+                tool_call.call_id.clone(),
+                result,
+            )));
+        }
+    }
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    record_generation_result(&mut span, total_input, total_output, &final_text);
+    if final_text.is_empty() {
+        let error = "OpenAI Responses endpoint returned no text".to_string();
+        record_generation_error(&mut span, &error);
+        span.end();
+        let _ = tx
+            .send(StreamEvent::Error {
+                provider: provider_name,
+                model,
+                error,
+                duration_ms,
+            })
+            .await;
+        return messages;
+    }
+    span.end();
+    messages.push(assistant_message_with_output_items(
+        &final_text,
+        &[],
+        &final_output_items,
+    ));
+    let _ = tx
+        .send(StreamEvent::Done {
+            provider: provider_name,
+            model,
+            input_tokens: total_input,
+            output_tokens: total_output,
+            duration_ms,
+        })
+        .await;
+    messages
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_responses_event(
+    event: crate::openai_responses::ResponsesStreamEvent,
+    provider_name: &str,
+    tx: &mpsc::Sender<StreamEvent>,
+    iter_text: &mut String,
+    tool_calls: &mut Vec<ToolCall>,
+    output_items: &mut Vec<serde_json::Value>,
+    total_input: &mut Option<i32>,
+    total_output: &mut Option<i32>,
+    stream_error: &mut Option<String>,
+) {
+    use crate::openai_responses::ResponsesStreamEvent as RE;
+    match event {
+        RE::TextDelta(text) => {
+            iter_text.push_str(&text);
+            let _ = tx
+                .send(StreamEvent::Chunk {
+                    provider: provider_name.to_string(),
+                    text,
+                })
+                .await;
+        }
+        RE::ToolCall(call) => tool_calls.push(call),
+        RE::OutputItem(item) => output_items.push(item),
+        RE::Completed {
+            input_tokens,
+            output_tokens,
+        } => {
+            if let Some(value) = input_tokens {
+                *total_input = Some(total_input.unwrap_or(0) + value);
+            }
+            if let Some(value) = output_tokens {
+                *total_output = Some(total_output.unwrap_or(0) + value);
+            }
+        }
+        RE::Error(error) => *stream_error = Some(error),
+    }
 }
 
 /// Real streaming branch for Bedrock. Drives ConverseStream, forwards text
@@ -871,6 +1175,108 @@ async fn query_single_bedrock(
     )
 }
 
+async fn query_single_responses(
+    provider: &Provider,
+    ctx: &QueryContext,
+    client: &crate::openai_responses::OpenAIResponsesClient,
+    messages: Vec<ChatMessage>,
+    mut span: global::BoxedSpan,
+    start: Instant,
+) -> ProviderResponse {
+    let mut continuation_items = Vec::new();
+    let mut total_input: Option<i32> = None;
+    let mut total_output: Option<i32> = None;
+    let mut final_text = String::new();
+
+    for iteration in 0..ctx.max_iterations.max(1) {
+        let outcome = match client
+            .converse(
+                &provider.model,
+                &messages,
+                &continuation_items,
+                ctx.system_prompt.as_deref(),
+                ctx.tools.as_deref(),
+                codex_reasoning(ctx, provider),
+                provider.service_tier.as_deref(),
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let error = format!("{error:#}");
+                record_generation_result(&mut span, total_input, total_output, &final_text);
+                record_generation_error(&mut span, &error);
+                span.end();
+                return ProviderResponse::error(
+                    provider.clone(),
+                    provider.model.clone(),
+                    error,
+                    start.elapsed().as_millis() as u64,
+                );
+            }
+        };
+
+        if let Some(value) = outcome.input_tokens {
+            total_input = Some(total_input.unwrap_or(0) + value);
+        }
+        if let Some(value) = outcome.output_tokens {
+            total_output = Some(total_output.unwrap_or(0) + value);
+        }
+        if outcome.tool_calls.is_empty() || ctx.search_client.is_none() {
+            final_text = outcome.text;
+            break;
+        }
+        if iteration + 1 >= ctx.max_iterations {
+            let error = format!(
+                "OpenAI Responses tool-use limit reached after {} iterations",
+                ctx.max_iterations.max(1)
+            );
+            record_generation_result(&mut span, total_input, total_output, &outcome.text);
+            record_generation_error(&mut span, &error);
+            span.end();
+            return ProviderResponse::error(
+                provider.clone(),
+                provider.model.clone(),
+                error,
+                start.elapsed().as_millis() as u64,
+            );
+        }
+
+        continuation_items.extend(outcome.output_items);
+        for tool_call in &outcome.tool_calls {
+            let result = execute_tool_call(tool_call, ctx, &provider.display_name, None).await;
+            continuation_items.push(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": tool_call.call_id,
+                "output": result,
+            }));
+        }
+    }
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    record_generation_result(&mut span, total_input, total_output, &final_text);
+    if final_text.is_empty() {
+        let error = "OpenAI Responses endpoint returned no text".to_string();
+        record_generation_error(&mut span, &error);
+        span.end();
+        return ProviderResponse::error(
+            provider.clone(),
+            provider.model.clone(),
+            error,
+            duration_ms,
+        );
+    }
+    span.end();
+    ProviderResponse::success(
+        provider.clone(),
+        provider.model.clone(),
+        final_text,
+        total_input,
+        total_output,
+        duration_ms,
+    )
+}
+
 pub async fn query_all(
     manager: Arc<ProviderManager>,
     providers: Vec<Provider>,
@@ -925,7 +1331,9 @@ pub async fn stream_with_messages(
     // protocol) and drive ConverseStream directly. The dispatch happens before
     // telemetry span setup so Bedrock requests stay on a clean codepath; the
     // root `ai.query` span still wraps this call via the calling task's Context.
-    if let Some(bedrock) = manager.bedrock_for(&model) {
+    // TODO(oauth-split, design question 1): dispatch by provider name to match
+    // the provisional per-provider Bedrock keying.
+    if let Some(bedrock) = manager.bedrock_for(&provider.name) {
         return stream_bedrock(
             manager, &bedrock, provider, messages, ctx, tx, cancel, start,
         )
@@ -938,21 +1346,19 @@ pub async fn stream_with_messages(
     let tracer = global::tracer(TRACER_NAME);
     let mut span = tracer
         .span_builder(format!("chat {}", provider_name))
-        .with_attributes(vec![
-            KeyValue::new("gen_ai.system", gen_ai_system_for(&provider_name)),
-            KeyValue::new("gen_ai.request.model", model.clone()),
-            KeyValue::new("gen_ai.operation.name", "chat"),
-            // Tells Langfuse to render this span as a generation, not a
-            // generic span — unlocks token/cost rollups in the UI.
-            KeyValue::new("langfuse.observation.type", "generation"),
-            KeyValue::new("langfuse.observation.model.name", model.clone()),
-        ])
+        .with_attributes(generation_span_attributes(provider))
         .start(&tracer);
     if let Some(input) = messages_to_json(&messages).and_then(|json| content_attr(&json)) {
         span.set_attribute(KeyValue::new("langfuse.observation.input", input));
     }
+    // TODO(oauth-split, design question 2): Responses-transport providers are
+    // dispatched after the shared span is opened (keeps #93's content opt-out).
+    if let Some(responses) = manager.responses_for(&provider.name) {
+        return stream_responses(&responses, provider, messages, ctx, tx, cancel, span, start)
+            .await;
+    }
 
-    let options = build_options(ctx);
+    let options = build_options(ctx, provider);
 
     let _ = tx
         .send(StreamEvent::Start {
@@ -1157,13 +1563,12 @@ pub async fn stream_with_messages(
         span.set_attribute(KeyValue::new("langfuse.observation.output", output));
     }
 
-    // Silent-failure guard: report an empty final answer as an error so the
-    // user sees something instead of "[complete]" with an empty body. Either
-    // the search loop ran out of rounds while the model still wanted to
-    // search, or (no text AND no tool calls) it's almost always a
-    // wire-protocol mismatch, e.g. an adapter pointed at a server that
-    // doesn't speak its protocol (Bedrock's 200 + UnknownOperationException
-    // was the canonical trigger).
+    // Silent-failure guard: a stream that ended with no text AND no tool
+    // calls is almost always a wire-protocol mismatch (e.g. an adapter
+    // pointed at a server that doesn't speak its protocol — Bedrock's
+    // 200 + UnknownOperationException was the canonical trigger). Report
+    // it as an error so the user sees something instead of "[complete]"
+    // with an empty body.
     if final_text.is_empty() {
         let err_msg = empty_response_error(hit_search_cap, ctx.max_iterations);
         span.set_attribute(KeyValue::new("error", true));
@@ -1265,6 +1670,7 @@ fn panic_message(err: tokio::task::JoinError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use colored::Color;
 
     #[test]
     fn empty_bedrock_answers_explain_why_when_bedrock_said() {
@@ -1340,6 +1746,64 @@ mod tests {
     }
 
     #[test]
+    fn responses_generation_attributes_match_other_provider_paths() {
+        let provider = Provider {
+            name: "openai".to_string(),
+            display_name: "CHATGPT".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            reasoning: Some("max".to_string()),
+            service_tier: Some("priority".to_string()),
+            color: Color::Green,
+        };
+        let attributes = generation_span_attributes(&provider);
+        let values: std::collections::HashMap<_, _> = attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(values.get("gen_ai.system").unwrap(), "openai");
+        assert_eq!(values.get("gen_ai.request.model").unwrap(), "gpt-5.6-sol");
+        assert_eq!(values.get("gen_ai.operation.name").unwrap(), "chat");
+        assert_eq!(
+            values.get("langfuse.observation.type").unwrap(),
+            "generation"
+        );
+        assert_eq!(
+            values.get("langfuse.observation.model.name").unwrap(),
+            "gpt-5.6-sol"
+        );
+    }
+
+    #[test]
+    fn responses_generation_errors_set_otel_error_status() {
+        let status = generation_error_status("request failed");
+        assert!(matches!(
+            status,
+            opentelemetry::trace::Status::Error { description }
+                if description == "request failed"
+        ));
+    }
+
+    #[test]
+    fn explicit_numeric_reasoning_does_not_use_provider_default() {
+        let provider = Provider {
+            name: "openai".to_string(),
+            display_name: "GPT".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            reasoning: Some("max".to_string()),
+            service_tier: None,
+            color: Color::Green,
+        };
+        let ctx =
+            QueryContext::new("test").with_reasoning(Some(ReasoningEffort::Budget(1_000)), None);
+        assert_eq!(codex_reasoning(&ctx, &provider), None);
+    }
+
+    #[test]
     fn messages_to_json_skips_empty_text_and_preserves_order() {
         let messages = vec![
             ChatMessage::system("you are helpful"),
@@ -1379,9 +1843,15 @@ mod tests {
 
     #[test]
     fn build_options_always_captures_usage() {
-        // genai only fills StreamEnd.captured_usage when capture_usage is
-        // set; a plain query (no reasoning, no tools) must still get tokens.
-        let options = build_options(&QueryContext::new("hi"));
+        let provider = Provider {
+            name: "openai".to_string(),
+            display_name: "GPT".to_string(),
+            model: "gpt-5-nano".to_string(),
+            reasoning: None,
+            service_tier: None,
+            color: Color::Green,
+        };
+        let options = build_options(&QueryContext::new("hi"), &provider);
         assert_eq!(options.capture_usage, Some(true));
         assert_eq!(options.capture_tool_calls, None);
         assert!(options.reasoning_effort.is_none());
@@ -1389,9 +1859,17 @@ mod tests {
 
     #[test]
     fn build_options_keeps_reasoning_and_tool_capture() {
-        let mut ctx = QueryContext::new("hi").with_reasoning(Some(ReasoningEffort::High));
+        let provider = Provider {
+            name: "openai".to_string(),
+            display_name: "GPT".to_string(),
+            model: "gpt-5-nano".to_string(),
+            reasoning: None,
+            service_tier: None,
+            color: Color::Green,
+        };
+        let mut ctx = QueryContext::new("hi").with_reasoning(Some(ReasoningEffort::High), None);
         ctx.tools = Some(vec![crate::search::web_search_tool()]);
-        let options = build_options(&ctx);
+        let options = build_options(&ctx, &provider);
         assert_eq!(options.capture_usage, Some(true));
         assert_eq!(options.capture_tool_calls, Some(true));
         assert!(matches!(
@@ -1402,8 +1880,6 @@ mod tests {
 
     #[test]
     fn empty_response_error_names_the_search_cap() {
-        // With -w, running out of search rounds used to be reported as a
-        // wire-protocol mismatch.
         let msg = empty_response_error(true, 5);
         assert!(msg.contains("stopped after 4 search rounds"), "{msg}");
         assert!(msg.contains("[search] max_iterations"), "{msg}");

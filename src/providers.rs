@@ -1,6 +1,7 @@
 use crate::anthropic_oauth;
 use crate::bedrock::{is_bedrock_base_url, BedrockClient, BedrockOutcome};
-use crate::config::{AuthMode, Config, ModelTier, ProviderConfig, RetryConfig};
+use crate::config::{expand_home, AuthMode, Config, ModelTier, ProviderConfig, RetryConfig};
+use crate::openai_responses::OpenAIResponsesClient;
 use crate::retry::{self, Retryable};
 use anyhow::{Context, Result};
 use colored::Color;
@@ -24,6 +25,7 @@ fn adapter_kind_for_provider(name: &str) -> Option<AdapterKind> {
     match name {
         "anthropic" => Some(AdapterKind::Anthropic),
         "openai" => Some(AdapterKind::OpenAI),
+        "bedrock-openai" => Some(AdapterKind::OpenAI),
         "google" => Some(AdapterKind::Gemini),
         "xai" => Some(AdapterKind::Xai),
         "ollama" => Some(AdapterKind::Ollama),
@@ -404,8 +406,11 @@ fn default_auth(route: &RouteDecision) -> AuthData {
 
 #[derive(Debug, Clone)]
 pub struct Provider {
+    pub name: String,
     pub display_name: String,
     pub model: String,
+    pub reasoning: Option<String>,
+    pub service_tier: Option<String>,
     pub color: Color,
 }
 
@@ -433,8 +438,11 @@ impl Provider {
         let model = config.get_model(tier).to_string();
 
         Provider {
+            name: name.to_string(),
             display_name,
             model,
+            reasoning: config.get_reasoning(tier).map(str::to_string),
+            service_tier: config.get_service_tier(tier).map(str::to_string),
             color,
         }
     }
@@ -468,10 +476,12 @@ pub struct ProviderManager {
     providers: HashMap<String, Provider>,
     #[allow(dead_code)]
     model_tier: ModelTier,
-    /// Map from model name -> Bedrock client. Populated for providers whose
+    /// Map from provider name -> Bedrock client. Populated for providers whose
     /// `base_url` points at AWS Bedrock (genai cannot speak Bedrock's wire
     /// protocol, so those requests bypass genai entirely).
-    bedrock_by_model: HashMap<String, Arc<BedrockClient>>,
+    bedrock_by_provider: HashMap<String, Arc<BedrockClient>>,
+    /// Responses clients keyed by canonical provider name.
+    responses_by_provider: HashMap<String, Arc<OpenAIResponsesClient>>,
 }
 
 impl ProviderManager {
@@ -538,10 +548,12 @@ impl ProviderManager {
         }
 
         // Build Bedrock clients for any provider whose base_url points at
-        // AWS Bedrock. Every configured model for that provider gets mapped
-        // to the same shared client so query_single() can dispatch by model.
-        let mut bedrock_by_model: HashMap<String, Arc<BedrockClient>> = HashMap::new();
-        for p in config.providers.values() {
+        // AWS Bedrock Runtime.
+        // TODO(oauth-split, design question 1): provisional per-provider keying
+        // (as in #75). Master keyed Bedrock clients by model name (#40); see the
+        // PR description for the tradeoffs.
+        let mut bedrock_by_provider: HashMap<String, Arc<BedrockClient>> = HashMap::new();
+        for (name, p) in &config.providers {
             if !p.enabled {
                 continue;
             }
@@ -560,16 +572,57 @@ impl ProviderManager {
             let Some(client) = BedrockClient::from_env(base_url, env_var) else {
                 continue;
             };
-            let shared = Arc::new(client);
-            for model in [
-                &p.default_model,
-                p.fast_model.as_deref().unwrap_or_default(),
-                p.smart_model.as_deref().unwrap_or_default(),
-            ] {
-                if !model.is_empty() {
-                    bedrock_by_model.insert(model.to_string(), Arc::clone(&shared));
-                }
+            bedrock_by_provider.insert(name.clone(), Arc::new(client));
+        }
+
+        let mut responses_by_provider: HashMap<String, Arc<OpenAIResponsesClient>> = HashMap::new();
+        for (name, provider) in &config.providers {
+            if !provider.enabled {
+                continue;
             }
+            let client = match provider.auth_mode {
+                AuthMode::ChatgptOauth => {
+                    if name != "openai" {
+                        eprintln!(
+                            "[warn] provider {} requested chatgpt_oauth; only openai supports it",
+                            name
+                        );
+                        continue;
+                    }
+                    let Some(credentials_file) = provider.oauth_credentials_file.as_deref() else {
+                        eprintln!(
+                            "[warn] provider {} requested chatgpt_oauth but has no oauth_credentials_file",
+                            name
+                        );
+                        continue;
+                    };
+                    OpenAIResponsesClient::chatgpt_oauth(
+                        expand_home(credentials_file),
+                        provider.base_url.as_deref(),
+                    )
+                    .with_retry_config(config.retry.clone())
+                }
+                AuthMode::BedrockBearer => {
+                    let Some(env_var) = provider.api_key_env.as_deref() else {
+                        eprintln!(
+                            "[warn] provider {} requested bedrock_bearer but has no api_key_env",
+                            name
+                        );
+                        continue;
+                    };
+                    let Some(base_url) = provider.base_url.as_deref() else {
+                        eprintln!(
+                            "[warn] provider {} requested bedrock_bearer but has no base_url",
+                            name
+                        );
+                        continue;
+                    };
+                    OpenAIResponsesClient::bedrock_bearer(env_var, base_url)
+                        .with_retry_config(config.retry.clone())
+                }
+                AuthMode::ApiKey | AuthMode::Subscription => continue,
+            };
+            responses_by_provider.insert(name.clone(), Arc::new(client));
         }
 
         Ok(ProviderManager {
@@ -577,13 +630,18 @@ impl ProviderManager {
             config,
             providers,
             model_tier,
-            bedrock_by_model,
+            bedrock_by_provider,
+            responses_by_provider,
         })
     }
 
-    /// If this model is served by Bedrock, return the client for it.
-    pub fn bedrock_for(&self, model: &str) -> Option<Arc<BedrockClient>> {
-        self.bedrock_by_model.get(model).cloned()
+    /// If this provider is served by Bedrock Runtime, return its client.
+    pub fn bedrock_for(&self, provider: &str) -> Option<Arc<BedrockClient>> {
+        self.bedrock_by_provider.get(provider).cloned()
+    }
+
+    pub fn responses_for(&self, provider: &str) -> Option<Arc<OpenAIResponsesClient>> {
+        self.responses_by_provider.get(provider).cloned()
     }
 
     /// Non-streaming Bedrock Converse invocation with retry on transient errors.
@@ -682,7 +740,12 @@ impl ProviderManager {
                 // at, say, AWS_BEARER_TOKEN_BEDROCK must not be "rescued" by
                 // ANTHROPIC_API_KEY and sent to the Bedrock URL with it.
                 || (cfg.api_key_env.is_none()
-                    && standard_key_env(&name).is_some_and(env_is_set));
+                    && standard_key_env(&name).is_some_and(env_is_set))
+                // TODO(oauth-split, design question 2): provisional. The
+                // Responses auth modes use #75's availability rules
+                // (credentials file / bearer token + base_url).
+                || (matches!(cfg.auth_mode, AuthMode::ChatgptOauth | AuthMode::BedrockBearer)
+                    && self.config.provider_is_available(&name));
             if !available {
                 let reason = if cfg.auth_mode == AuthMode::Subscription {
                     SkipReason::NoSubscriptionToken
@@ -940,15 +1003,20 @@ mod tests {
     fn fake_provider_config(aliases: Vec<&str>, color: &str) -> ProviderConfig {
         ProviderConfig {
             enabled: true,
+            auth_mode: AuthMode::ApiKey,
             api_key_env: None,
             api_key: Some("test-key".to_string()),
+            oauth_credentials_file: None,
             default_model: "test".to_string(),
             fast_model: Some("test".to_string()),
             smart_model: Some("test".to_string()),
+            fast_reasoning: None,
+            smart_reasoning: None,
+            fast_service_tier: None,
+            smart_service_tier: None,
             aliases: aliases.into_iter().map(String::from).collect(),
             color: color.to_string(),
             base_url: None,
-            auth_mode: AuthMode::ApiKey,
         }
     }
 
@@ -1091,15 +1159,20 @@ mod tests {
     fn routed_provider(fast: &str, smart: Option<&str>, base_url: Option<&str>) -> ProviderConfig {
         ProviderConfig {
             enabled: true,
+            auth_mode: AuthMode::ApiKey,
             api_key_env: None,
             api_key: Some("test-key".to_string()),
+            oauth_credentials_file: None,
             default_model: fast.to_string(),
             fast_model: Some(fast.to_string()),
             smart_model: smart.map(String::from),
+            fast_reasoning: None,
+            smart_reasoning: None,
+            fast_service_tier: None,
+            smart_service_tier: None,
             aliases: Vec::new(),
             color: "white".to_string(),
             base_url: base_url.map(String::from),
-            auth_mode: AuthMode::ApiKey,
         }
     }
 
@@ -1458,5 +1531,34 @@ mod tests {
             .unwrap();
         assert_eq!(target.model.adapter_kind, AdapterKind::OpenAI);
         assert_eq!(target.endpoint.base_url(), "https://openrouter.ai/api/v1/");
+    }
+
+    #[test]
+    fn responses_clients_are_keyed_by_provider_not_model() {
+        let mut config = Config::default();
+        config.providers.clear();
+
+        let mut chatgpt = fake_provider_config(vec!["gpt"], "green");
+        chatgpt.auth_mode = AuthMode::ChatgptOauth;
+        chatgpt.api_key = None;
+        chatgpt.oauth_credentials_file = Some(std::path::PathBuf::from("/tmp/chatgpt-oauth.json"));
+        chatgpt.default_model = "shared-model".to_string();
+
+        let mut bedrock = fake_provider_config(vec!["gpt-bedrock"], "blue");
+        bedrock.auth_mode = AuthMode::BedrockBearer;
+        bedrock.api_key = None;
+        bedrock.api_key_env = Some("AWS_BEARER_TOKEN_BEDROCK".to_string());
+        bedrock.base_url = Some("https://bedrock-mantle.us-east-1.api.aws/openai/v1".to_string());
+        bedrock.default_model = "shared-model".to_string();
+
+        config.providers.insert("openai".to_string(), chatgpt);
+        config
+            .providers
+            .insert("bedrock-openai".to_string(), bedrock);
+
+        let manager = ProviderManager::new(config, ModelTier::Fast).unwrap();
+        let chatgpt = manager.responses_for("openai").unwrap();
+        let bedrock = manager.responses_for("bedrock-openai").unwrap();
+        assert!(!Arc::ptr_eq(&chatgpt, &bedrock));
     }
 }

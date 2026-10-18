@@ -72,7 +72,14 @@ On first run, generate a config file:
 ai --init
 ```
 
-This writes to `~/.config/ai-cli/config.toml` (Linux) or `~/Library/Application Support/ai-cli/config.toml` (macOS).
+This writes to `~/.config/ai-cli/config.toml` on Linux and macOS, or `%APPDATA%\ai-cli\config.toml` on Windows. The location can be changed:
+
+- `AI_CLI_CONFIG=/path/to/config.toml` uses that file instead.
+- If `XDG_CONFIG_HOME` is set, the file is `$XDG_CONFIG_HOME/ai-cli/config.toml`.
+
+Older versions used `~/Library/Application Support/ai-cli/config.toml` on macOS. A config there is still used, as long as there's no file at the new location. To switch, move it to `~/.config/ai-cli/`.
+
+On Linux and macOS the file is created readable only by you (mode 0600), because it can hold an `api_key`.
 
 Or edit visually:
 

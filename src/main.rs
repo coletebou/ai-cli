@@ -87,7 +87,7 @@ struct Cli {
     /// The question to ask (multiple words joined automatically)
     question: Vec<String>,
 
-    /// Generate default config file at ~/.config/ai-cli/config.toml
+    /// Generate default config file at ~/.config/ai-cli/config.toml (or $AI_CLI_CONFIG)
     #[arg(long)]
     init: bool,
 

@@ -417,9 +417,12 @@ impl Config {
                 enabled: true,
                 api_key_env: Some("XAI_API_KEY".to_string()),
                 api_key: None,
-                default_model: "grok-4-1-fast-non-reasoning".to_string(),
-                fast_model: Some("grok-4-1-fast-non-reasoning".to_string()),
-                smart_model: Some("grok-4".to_string()),
+                // xAI's newest model backs both tiers. It always reasons, so
+                // the fast tier trades ~0.6s of latency for recency versus
+                // grok-4.20-0309-non-reasoning.
+                default_model: "grok-4.7".to_string(),
+                fast_model: Some("grok-4.7".to_string()),
+                smart_model: Some("grok-4.7".to_string()),
                 aliases: vec!["grok".to_string()],
                 color: "blue".to_string(),
                 base_url: None,
@@ -998,8 +1001,8 @@ color = "green"
 [providers.xai]
 enabled = true
 api_key_env = "XAI_API_KEY"
-fast_model = "grok-4-1-fast-non-reasoning"
-smart_model = "grok-4"
+fast_model = "grok-4.7"
+smart_model = "grok-4.7"
 aliases = ["grok"]
 color = "blue"
 
@@ -1159,6 +1162,17 @@ mod tests {
             config.resolve_provider_alias("gemini"),
             Some("google".to_string())
         );
+    }
+
+    #[test]
+    fn xai_defaults_use_current_grok_model() {
+        // xAI silently serves retired ids as some other model (e.g.
+        // grok-4-1-fast-non-reasoning comes back as grok-4.3), so a stale
+        // default never errors; pin the current id explicitly instead.
+        let xai = &Config::default().providers["xai"];
+        assert_eq!(xai.default_model, "grok-4.7");
+        assert_eq!(xai.get_model(&ModelTier::Fast), "grok-4.7");
+        assert_eq!(xai.get_model(&ModelTier::Smart), "grok-4.7");
     }
 
     // ── Config path resolution ──────────────────────────────────────────

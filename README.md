@@ -39,7 +39,7 @@ The script picks the build for your OS and CPU from the [latest release](https:/
 
 Prebuilt binaries:
 
-- Linux x86_64 and aarch64 (glibc 2.34+ and OpenSSL 3, e.g. Ubuntu 22.04+, Debian 12+, RHEL 9+).
+- Linux x86_64 and aarch64 (glibc 2.34+, e.g. Ubuntu 22.04+, Debian 12+, RHEL 9+, Amazon Linux 2023).
 - macOS Intel and Apple Silicon. The binaries aren't notarized, so if you download one with a browser instead of using the script, clear the quarantine flag before running it: `xattr -d com.apple.quarantine ai`.
 - Windows x86_64. Download the `.zip` from the [releases page](https://github.com/coletebou/ai-cli/releases) and put `ai.exe` on your `PATH`.
 

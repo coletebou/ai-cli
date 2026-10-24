@@ -121,16 +121,16 @@ dir=$(cd "$dir" && pwd)
 dest=$dir/ai
 
 # Stage the binary next to the destination and check that it runs here
-# before touching anything, so a build that can't start (glibc too old, no
-# OpenSSL 3) leaves an existing install alone. Staging in $dir rather than
-# $tmp also works where /tmp is mounted noexec. Then rename over the old
-# binary: the swap is atomic and works even while the old `ai` is running.
+# before touching anything, so a build that can't start (glibc too old, say)
+# leaves an existing install alone. Staging in $dir rather than $tmp also
+# works where /tmp is mounted noexec. Then rename over the old binary: the
+# swap is atomic and works even while the old `ai` is running.
 staged=$dest.new
 cp "$tmp/$name/ai" "$staged"
 chmod 755 "$staged"
 if ! installed=$("$staged" --version); then
   rm -f "$staged"
-  die "the $target build doesn't run on this system (the Linux builds need glibc 2.34+ and OpenSSL 3); nothing was installed"
+  die "the $target build doesn't run on this system (the Linux builds need glibc 2.34+); nothing was installed"
 fi
 mv -f "$staged" "$dest"
 say "installed $installed to $dest"

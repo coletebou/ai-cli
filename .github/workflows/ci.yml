@@ -34,17 +34,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows differs in Ctrl+C handling, rustyline's console backend,
-        # `@C:\path` references and the %APPDATA% config dir. There is no
-        # personal Windows host, so that leg stays GitHub-hosted.
         include:
           - os: linux
             runner: [self-hosted, personal-linux]
           - os: macos
             runner: [self-hosted, personal-macos]
-          - os: windows-latest
-            runner: windows-latest
-    steps:
+    steps: &clippy-test-steps
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -52,6 +47,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --locked
+
+  # Windows differs in Ctrl+C handling, rustyline's console backend,
+  # `@C:\path` references and the %APPDATA% config dir. There is no personal
+  # Windows runner yet, and GitHub-hosted runners are not used, so this leg
+  # runs only once the repository variable PERSONAL_WINDOWS_RUNNER is `true`
+  # (set it when a runner with these labels exists). Until then it is skipped:
+  # a self-hosted job that no runner picks up would wait 24 hours and fail.
+  # It is a job of its own because a job's `if` cannot read `matrix`.
+  clippy-test-windows:
+    name: clippy + test (windows)
+    if: vars.PERSONAL_WINDOWS_RUNNER == 'true'
+    runs-on: [self-hosted, personal-windows]
+    steps: *clippy-test-steps
 
   msrv:
     name: MSRV

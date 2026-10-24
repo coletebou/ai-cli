@@ -48,11 +48,14 @@ defaults:
 jobs:
   version:
     name: check version
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, personal-linux]
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+      # The self-hosted runner has no preinstalled Rust; `cargo metadata`
+      # needs one.
+      - uses: dtolnay/rust-toolchain@stable
       - id: version
         run: |
           version=$(cargo metadata --no-deps --format-version 1 \
@@ -88,17 +91,20 @@ jobs:
           # distro they were built on, or newer. Built on 22.04 they need
           # glibc 2.34 and OpenSSL 3 (Ubuntu 22.04, Debian 12, RHEL 9); built
           # on 24.04 they need glibc 2.39 and won't start on 22.04. Move to
-          # 24.04 only when GitHub retires the 22.04 images.
+          # 24.04 only when GitHub retires the 22.04 images. The personal
+          # Linux runner is 24.04, so this leg stays GitHub-hosted.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
-          # Native arm64 runner, so no cross-compiling OpenSSL.
+          # Native arm64 runner, so no cross-compiling OpenSSL. There is no
+          # personal arm64 Linux host, so this leg stays GitHub-hosted.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04-arm
-          # macos-latest is Apple Silicon and cross-compiles the Intel build.
+          # The personal Mac is Apple Silicon and cross-compiles the Intel
+          # build.
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: [self-hosted, personal-macos]
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: [self-hosted, personal-macos]
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             exe: .exe
@@ -170,12 +176,16 @@ jobs:
   install-test:
     name: install.sh (${{ matrix.os }})
     needs: [version, build]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-latest]
+        include:
+          - os: linux
+            runner: [self-hosted, personal-linux]
+          - os: macos
+            runner: [self-hosted, personal-macos]
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
@@ -200,10 +210,15 @@ jobs:
     needs: [version, build, install-test]
     # Tag pushes only; manual runs and pull requests are dry runs.
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, personal-linux]
     permissions:
       contents: write
     steps:
+      # A self-hosted runner keeps its workspace between jobs, and this job has
+      # no checkout to clean it: start from an empty dist so another release's
+      # archives can't end up in this one.
+      - name: Empty dist
+        run: rm -rf dist
       - uses: actions/download-artifact@v8
         with:
           pattern: dist-*

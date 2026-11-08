@@ -51,8 +51,11 @@ defaults:
     shell: bash
 
 jobs:
+  # Every other job needs this one, so a fork's pull request (which must never run
+  # on the personal self-hosted runners) skips the whole dry run.
   version:
     name: check version
+    if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
     runs-on: [self-hosted, personal-linux]
     outputs:
       version: ${{ steps.version.outputs.version }}

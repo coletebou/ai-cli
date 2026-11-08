@@ -210,6 +210,8 @@ ai models --refresh                 # force-refresh model cache
 ai models "llama"                   # filter by name
 ai completions zsh                  # generate shell completion script
 ai doctor                           # check config, keys and connectivity
+ai sessions                         # list saved chat sessions, newest first
+ai sessions --json --limit 5        # same, as machine-readable JSON
 ```
 
 ## Diagnostics (`ai doctor`)
@@ -242,6 +244,52 @@ ai completions bash > ~/.local/share/bash-completion/completions/ai
 # fish
 ai completions fish > ~/.config/fish/completions/ai.fish
 ```
+
+## Listing sessions (`ai sessions`)
+
+`ai sessions` lists saved chat sessions (see [Sessions](#interactive-chat) below for how they're created), newest first, without starting a chat:
+
+```bash
+ai sessions                   # human table: name, provider/model, turns, updated
+ai sessions --limit 5         # only the 5 most recently updated
+ai sessions --json            # stable JSON for scripts and other tools
+```
+
+`--json` prints one object:
+
+```json
+{
+  "version": 1,
+  "dir": "~/.local/share/ai-cli/chats",
+  "sessions": [
+    {
+      "name": "proj",
+      "updated": "2026-11-07T18:30:00Z",
+      "turns": 4,
+      "providers": ["CLAUDE"],
+      "model": "claude-sonnet-4-5"
+    }
+  ],
+  "skipped": 0
+}
+```
+
+`updated` is RFC 3339 UTC. `skipped` counts session files that exist but couldn't be read or parsed (same ones `/sessions` reports inside chat); they're never included in `sessions`. A missing or empty sessions directory is an empty list, not an error (exit status `0`). Only session *metadata* is ever included here — names, providers, models, turn counts, timestamps — never message text, file contents, or API keys, even though the session files on disk hold the full conversation.
+
+### Use from other tools
+
+`ai sessions --json` is meant to be shelled out to by other programs. Its shape is versioned: adding a field keeps
+`"version": 1`, renaming or removing one bumps it. It carries metadata only, never a message, a key or a config value.
+
+[porchlight](https://github.com/coletebou/porchlight), the login dashboard, reads it out of the box: when `ai` is
+installed its AI CHATS panel lists your newest chats, and `A` in `porchlight -i` opens `ai -t` and comes back
+(porchlight's `docs/ai-cli.md`). Anything else can pipe it through `jq`:
+
+```bash
+ai sessions --json | jq -r '.sessions[] | "\(.updated)  \(.name)  \(.providers | join(","))"'
+```
+
+`ai sessions` only lists what's saved; it doesn't open anything. `ai -t` launches the (fresh) side-by-side TUI chat — see [Interactive TUI](#interactive-tui). To resume a saved session instead of starting a new one, use interactive chat mode: `ai -i --continue` resumes whichever session was saved most recently, or `ai -i` then `/load <name>` for a specific one (there's no `--load <name>` flag yet, and the TUI doesn't resume sessions at all).
 
 ## Interactive chat
 
@@ -363,6 +411,7 @@ src/
 ├── pricing.rs             Per-model prices and the footer's cost estimate
 ├── chat.rs                Interactive chat (rustyline) with slash commands
 ├── sessions.rs            Saved chat sessions (/save, /load, --continue)
+├── sessions_cmd.rs        `ai sessions`: table/JSON listing for scripts and other tools
 ├── ui.rs                  Ratatui TUI — interactive side-by-side chat panels
 ├── term.rs                Terminal guard for the full-screen UIs
 ├── diag.rs                Diagnostics held back while a full-screen UI is up

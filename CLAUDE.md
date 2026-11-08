@@ -55,6 +55,7 @@ src/
 ├── diag.rs                stderr diagnostics, held back while a full-screen UI owns the terminal
 ├── chat.rs                `ai -i`: rustyline chat with slash commands, history, @file expansion
 ├── sessions.rs            Chat session files (/save, /load, /sessions, --continue)
+├── sessions_cmd.rs        `ai sessions`: table/JSON session listing for scripts and other tools
 ├── context.rs             Piped stdin and @file expansion into the prompt
 ├── search.rs              web_search tool: Gemini grounding / Tavily with fallback
 ├── models.rs              `ai models`: OpenRouter model listing (cached)

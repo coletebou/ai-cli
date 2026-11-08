@@ -17,7 +17,7 @@ If you install the binary from a checkout (`cargo install --path .`), it warns o
 
 ## Before you submit a PR
 
-CI runs clippy and the tests on Linux, macOS **and Windows**, so run the same commands locally:
+CI runs clippy and the tests on Linux and macOS (Windows is a supported target too, so keep it working), so run the same commands locally:
 
 1. **Build clean:** `cargo build` with no warnings.
 2. **Lint:** `cargo clippy --all-targets --all-features -- -D warnings`.
@@ -31,7 +31,7 @@ CI runs clippy and the tests on Linux, macOS **and Windows**, so run the same co
 
 ### Platforms, MSRV and the lockfile
 
-- **Windows is a CI target.** Paths (`@C:\path` references, the `%APPDATA%` config dir), Ctrl+C handling and rustyline's console backend all behave differently there. Use `std::path`/`dirs` rather than hand-built `/` paths, and if a test genuinely can't run on one platform, gate it with `#[cfg(...)]` and a comment saying why.
+- **Windows is a supported target.** (Its CI leg runs only when a Windows runner is configured, so check your change there by hand if it touches any of the following.) Paths (`@C:\path` references, the `%APPDATA%` config dir), Ctrl+C handling and rustyline's console backend all behave differently there. Use `std::path`/`dirs` rather than hand-built `/` paths, and if a test genuinely can't run on one platform, gate it with `#[cfg(...)]` and a comment saying why.
 - **Minimum supported Rust version** is the `rust-version` in `Cargo.toml` (currently 1.88, set by dependencies). The `msrv` CI job runs `cargo check --all-targets --locked` on exactly that toolchain. To check locally: `rustup toolchain install 1.88 && cargo +1.88 check --all-targets --locked`. If a dependency bump or a newer std API needs a newer Rust, raise `rust-version` in the same PR and say why.
 - **CI builds with `--locked`.** If you change dependencies, commit the updated `Cargo.lock`.
 
@@ -52,6 +52,10 @@ Key invariants:
 - Conventional-commit-style prefixes (`feat:`, `fix:`, `docs:`, `refactor:`, `chore:`) are appreciated but not strictly required.
 - Explain the **why** in the commit body if it's not obvious from the diff.
 
+## Reporting security issues
+
+Please don't open a public issue for a vulnerability. See [SECURITY.md](SECURITY.md).
+
 ## Reporting bugs
 
 Open a GitHub issue with:
@@ -60,7 +64,7 @@ Open a GitHub issue with:
 - OS / terminal emulator
 - Exact command that reproduced the bug
 - Expected vs. actual behavior
-- Any relevant error output (with API keys scrubbed)
+- Any relevant error output (with API keys, tokens and proxy credentials scrubbed)
 
 ## License
 

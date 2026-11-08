@@ -151,7 +151,12 @@ fn display_dir(dir: &Path) -> String {
     match dirs::home_dir() {
         Some(home) => match dir.strip_prefix(&home) {
             Ok(rest) if !rest.as_os_str().is_empty() => {
-                format!("~/{}", rest.display())
+                // Join components with '/' so Windows shows `~/foo/bar`, not `~/foo\bar`.
+                let parts: Vec<String> = rest
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                format!("~/{}", parts.join("/"))
             }
             Ok(_) => "~".to_string(),
             Err(_) => dir.display().to_string(),

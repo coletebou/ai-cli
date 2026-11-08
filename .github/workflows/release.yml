@@ -56,7 +56,7 @@ jobs:
   version:
     name: check version
     if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
-    runs-on: [self-hosted, personal-linux]
+    runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -104,17 +104,17 @@ jobs:
           # openssl-sys or native-tls), so there is no OpenSSL to link and
           # nothing to install on the runner.
           - target: x86_64-unknown-linux-gnu
-            os: [self-hosted, personal-linux]
+            os: ubuntu-latest
             glibc: "2.34"
           - target: aarch64-unknown-linux-gnu
-            os: [self-hosted, personal-linux]
+            os: ubuntu-latest
             glibc: "2.34"
           # The personal Mac is Apple Silicon and cross-compiles the Intel
           # build.
           - target: x86_64-apple-darwin
-            os: [self-hosted, personal-macos]
+            os: macos-latest
           - target: aarch64-apple-darwin
-            os: [self-hosted, personal-macos]
+            os: macos-latest
     env:
       TARGET: ${{ matrix.target }}
       VERSION: ${{ needs.version.outputs.version }}
@@ -326,8 +326,7 @@ jobs:
   build-windows:
     name: build (x86_64-pc-windows-msvc)
     needs: version
-    if: vars.PERSONAL_WINDOWS_RUNNER == 'true'
-    runs-on: [self-hosted, personal-windows]
+    runs-on: windows-latest
     timeout-minutes: 45
     strategy:
       matrix:
@@ -350,9 +349,9 @@ jobs:
       matrix:
         include:
           - os: linux
-            runner: [self-hosted, personal-linux]
+            runner: ubuntu-latest
           - os: macos
-            runner: [self-hosted, personal-macos]
+            runner: macos-latest
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
@@ -379,7 +378,7 @@ jobs:
     needs: [version, build, build-windows, install-test]
     # Tag pushes only; manual runs and pull requests are dry runs.
     if: github.event_name == 'push'
-    runs-on: [self-hosted, personal-linux]
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:

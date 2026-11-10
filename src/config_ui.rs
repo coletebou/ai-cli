@@ -959,8 +959,37 @@ fn draw_providers_section(frame: &mut Frame, area: Rect, app: &App) {
             let details_text = [
                 format!("Provider: {}", provider_name),
                 format!("Enabled: {}", if provider.enabled { "Yes" } else { "No" }),
+                format!("Auth: {:?}", provider.auth_mode),
                 format!("Fast Model: {}", fast),
+                format!(
+                    "Fast Reasoning: {}",
+                    provider
+                        .fast_reasoning
+                        .as_deref()
+                        .unwrap_or("provider default")
+                ),
+                format!(
+                    "Fast Service: {}",
+                    provider
+                        .fast_service_tier
+                        .as_deref()
+                        .unwrap_or("provider default")
+                ),
                 format!("Smart Model: {}", smart),
+                format!(
+                    "Smart Reasoning: {}",
+                    provider
+                        .smart_reasoning
+                        .as_deref()
+                        .unwrap_or("provider default")
+                ),
+                format!(
+                    "Smart Service: {}",
+                    provider
+                        .smart_service_tier
+                        .as_deref()
+                        .unwrap_or("provider default")
+                ),
                 format!("Color: {}", provider.color),
             ]
             .join("\n");
@@ -1093,6 +1122,7 @@ mod tests {
             names,
             [
                 "anthropic",
+                "bedrock-openai",
                 "google",
                 "ollama",
                 "openai",
@@ -1105,6 +1135,7 @@ mod tests {
             labels,
             [
                 "claude",
+                "gpt-bedrock",
                 "gemini",
                 "ollama",
                 "chatgpt",
@@ -1207,7 +1238,7 @@ mod tests {
         // "gpt" is OpenAI's second alias; cycling must continue from OpenAI.
         assert_eq!(next("gpt"), "openrouter");
         assert_eq!(next("chatgpt"), "openrouter");
-        assert_eq!(next("claude"), "gemini");
+        assert_eq!(next("claude"), "gpt-bedrock");
         // Wraps from the last provider back to the first.
         assert_eq!(next("grok"), "claude");
         // Unknown values restart at the first provider.
@@ -1223,6 +1254,7 @@ mod tests {
         assert_eq!(
             seen,
             [
+                "gpt-bedrock",
                 "gemini",
                 "ollama",
                 "chatgpt",

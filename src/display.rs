@@ -1036,8 +1036,11 @@ mod tests {
 
     fn provider(name: &str, model: &str) -> Provider {
         Provider {
+            name: name.to_lowercase(),
             display_name: name.to_string(),
             model: model.to_string(),
+            reasoning: None,
+            service_tier: None,
             color: colored::Color::White,
         }
     }

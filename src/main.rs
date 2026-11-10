@@ -10,6 +10,7 @@ mod display;
 mod doctor;
 mod markdown;
 mod models;
+mod openai_responses;
 mod pricing;
 mod providers;
 mod query;
@@ -225,7 +226,7 @@ struct Cli {
     #[arg(long)]
     no_tui: bool,
 
-    /// Reasoning effort level (none, low, medium, high, or a number for budget)
+    /// Reasoning effort (none, low, medium, high, max, or a numeric budget)
     #[arg(short = 'r', long)]
     reasoning: Option<String>,
 
@@ -411,25 +412,37 @@ fn select_mode(cli: &Cli, config_tui: bool, stdout_is_terminal: bool) -> Mode {
 /// Parse `-r/--reasoning`. Returns the effort plus the label shown in the
 /// footer. Unknown values are an error rather than a silent (and pricier)
 /// fallback to medium.
-fn parse_reasoning(value: &str) -> Result<(ReasoningEffort, String)> {
+fn parse_reasoning(value: &str) -> Result<(ReasoningEffort, Option<String>, String)> {
+    // The middle value is the effort sent to OpenAI Responses providers
+    // (#75). `xhigh` and `max` only exist there; genai providers get High.
+    // TODO(oauth-split, design question 3): #75 also mapped "4" to `max`;
+    // master treats any number above 3 as a token budget, so "4" stays a
+    // budget here until that is decided.
     let parsed = match value.to_lowercase().as_str() {
-        "none" | "off" | "0" => (ReasoningEffort::None, "none".to_string()),
-        "low" | "l" | "1" => (ReasoningEffort::Low, "low".to_string()),
-        "medium" | "med" | "m" | "2" => (ReasoningEffort::Medium, "medium".to_string()),
-        "high" | "h" | "3" => (ReasoningEffort::High, "high".to_string()),
+        "none" | "off" | "0" => (ReasoningEffort::None, Some("none"), "none".to_string()),
+        "low" | "l" | "1" => (ReasoningEffort::Low, Some("low"), "low".to_string()),
+        "medium" | "med" | "m" | "2" => (
+            ReasoningEffort::Medium,
+            Some("medium"),
+            "medium".to_string(),
+        ),
+        "high" | "h" | "3" => (ReasoningEffort::High, Some("high"), "high".to_string()),
+        "xhigh" => (ReasoningEffort::High, Some("xhigh"), "xhigh".to_string()),
+        "max" => (ReasoningEffort::High, Some("max"), "max".to_string()),
         s => match s.parse::<u32>() {
             Ok(budget) => (
                 ReasoningEffort::Budget(budget),
+                None,
                 format!("budget {}", budget),
             ),
             Err(_) => anyhow::bail!(
-                "unknown reasoning level '{}': use none, low, medium, high, or a token budget \
-                 (a number; 0-3 are shorthand for none..high)",
+                "unknown reasoning level '{}': use none, low, medium, high, xhigh, max, or a \
+                 token budget (a number; 0-3 are shorthand for none..high)",
                 value
             ),
         },
     };
-    Ok(parsed)
+    Ok((parsed.0, parsed.1.map(str::to_string), parsed.2))
 }
 
 /// Explain an empty provider selection: why each requested provider was
@@ -506,12 +519,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     // Parse reasoning effort and get display string. Done before provider
     // selection so a bad flag is reported as such, not masked by a
     // missing-API-key error.
-    let (reasoning_effort, reasoning_str) = match cli.reasoning.as_deref() {
+    let (reasoning_effort, codex_reasoning, reasoning_str) = match cli.reasoning.as_deref() {
         Some(r) => {
-            let (effort, label) = parse_reasoning(r)?;
-            (Some(effort), Some(label))
+            let (effort, codex, label) = parse_reasoning(r)?;
+            (Some(effort), codex, Some(label))
         }
-        None => (None, None), // Default: no reasoning specified
+        None => (None, None, None), // Provider tier defaults apply
     };
 
     // Determine the mode first — it affects provider and model tier selection
@@ -590,6 +603,25 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     footer.show_cost &= !cli.no_cost;
     footer.pricing = config.pricing.clone();
 
+    // TODO(oauth-split, design question 3): these two checks need the selected
+    // providers, so they run here rather than inside parse_reasoning. Provisional.
+    // OpenAI Responses providers reject numeric budgets (#75).
+    if matches!(reasoning_effort, Some(ReasoningEffort::Budget(_)))
+        && providers_to_query
+            .iter()
+            .any(|provider| manager.responses_for(&provider.name).is_some())
+    {
+        anyhow::bail!("numeric reasoning budgets are not supported by OpenAI Responses providers");
+    }
+    // With no -r flag, a single provider's configured tier reasoning is shown.
+    let reasoning_str = reasoning_str.or_else(|| {
+        if providers_to_query.len() == 1 {
+            providers_to_query[0].reasoning.clone()
+        } else {
+            None
+        }
+    });
+
     // Build search engine (primary + optional fallback) if --search flag set
     let search_client = if cli.search {
         // Determine primary: CLI override > config
@@ -655,7 +687,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     // Build query context
     let mut ctx = query::QueryContext::new(&question)
         .with_system_prompt(system_prompt)
-        .with_reasoning(reasoning_effort);
+        .with_reasoning(reasoning_effort, codex_reasoning);
     if let Some(client) = search_client {
         ctx = ctx.with_search(client, config.search.max_iterations);
     }
@@ -816,9 +848,9 @@ mod cli_tests {
 
     #[test]
     fn reasoning_levels_parse_and_unknown_values_error() {
-        assert_eq!(parse_reasoning("high").unwrap().1, "high");
-        assert_eq!(parse_reasoning("2").unwrap().1, "medium");
-        assert_eq!(parse_reasoning("4096").unwrap().1, "budget 4096");
+        assert_eq!(parse_reasoning("high").unwrap().2, "high");
+        assert_eq!(parse_reasoning("2").unwrap().2, "medium");
+        assert_eq!(parse_reasoning("4096").unwrap().2, "budget 4096");
         assert!(matches!(
             parse_reasoning("4096").unwrap().0,
             ReasoningEffort::Budget(4096)

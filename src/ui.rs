@@ -1234,8 +1234,11 @@ mod tests {
 
     fn fake_provider(name: &str) -> Provider {
         Provider {
+            name: name.to_ascii_lowercase(),
             display_name: name.to_string(),
             model: "test-model".to_string(),
+            reasoning: None,
+            service_tier: None,
             color: colored::Color::Cyan,
         }
     }

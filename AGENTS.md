@@ -52,6 +52,7 @@ this file is what an agent needs on top of them. `CLAUDE.md` only imports this f
 | `doctor.rs` | `ai doctor` diagnostics |
 | `telemetry.rs` | optional Langfuse export, including whether prompt content leaks into traces |
 | `anthropic_oauth.rs` | `auth_mode = "subscription"` token loading (Anthropic only) |
+| `openai_responses.rs` | the OpenAI Responses transport: `auth_mode = "chatgpt_oauth"` (Codex credentials) and `bedrock_bearer` (Bedrock Mantle) |
 
 ## Checks: run what your diff can break, and let CI run the rest
 

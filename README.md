@@ -66,7 +66,8 @@ Set the env vars for whichever providers you want to use. Providers without keys
 | Provider    | Env var                                  |
 |-------------|------------------------------------------|
 | Claude      | `ANTHROPIC_API_KEY`                      |
-| ChatGPT     | `OPENAI_API_KEY`                         |
+| ChatGPT API | `OPENAI_API_KEY`                         |
+| Bedrock     | `AWS_BEARER_TOKEN_BEDROCK`               |
 | Grok        | `XAI_API_KEY`                            |
 | Gemini      | `GEMINI_API_KEY` *(or `GOOGLE_API_KEY`)* |
 | OpenRouter  | `OPENROUTER_API_KEY`                     |
@@ -127,6 +128,44 @@ ai config
 ```
 
 The config UI has sections for **CLI mode**, **TUI mode**, **Footer display**, and **Search**. Each mode has its own default provider(s) and model tier.
+
+### ChatGPT OAuth and Bedrock GPT
+
+ChatGPT subscription credentials can use Codex's `auth.json` or a dedicated
+OpenClaw export containing exactly one `openai-codex` profile. Direct
+multi-profile stores are rejected to avoid refreshing the wrong account. Keep
+the credential file mode `0600`.
+
+```toml
+[providers.openai]
+enabled = true
+auth_mode = "chatgpt_oauth"
+oauth_credentials_file = "~/.codex/auth.json"
+fast_model = "gpt-5.6-sol"
+smart_model = "gpt-5.6-sol"
+fast_reasoning = "medium"
+smart_reasoning = "max"
+fast_service_tier = "priority"
+smart_service_tier = "priority"
+aliases = ["chatgpt", "gpt"]
+color = "green"
+```
+
+Bedrock GPT-5.6 uses Mantle's Responses API, while Claude uses Bedrock Runtime
+Converse. Configure them as separate providers:
+
+```toml
+[providers.bedrock-openai]
+enabled = true
+auth_mode = "bedrock_bearer"
+api_key_env = "AWS_BEARER_TOKEN_BEDROCK"
+fast_model = "openai.gpt-5.6-sol"
+smart_model = "openai.gpt-5.6-sol"
+fast_reasoning = "medium"
+smart_reasoning = "max"
+aliases = ["gpt-bedrock"]
+base_url = "https://bedrock-mantle.us-east-1.api.aws/openai/v1"
+```
 
 ### Search providers
 
@@ -401,6 +440,7 @@ src/
 ├── config_ui.rs           TUI config editor (`ai config`)
 ├── context.rs             @file expansion and stdin context merging
 ├── providers.rs           ProviderManager: genai client, model routing, auth, retries
+├── openai_responses.rs    ChatGPT OAuth + Bedrock Mantle Responses transport
 ├── query.rs               Query execution, tool-use loop, StreamEvent enum
 ├── retry.rs               Transient-error classification and backoff
 ├── bedrock.rs             Direct AWS Bedrock Converse / ConverseStream client

@@ -90,7 +90,8 @@ fn classify_status(status: StatusCode, retry_after: Option<Duration>) -> Retryab
     }
 }
 
-fn classify_reqwest(err: &reqwest::Error) -> Retryable {
+/// Also used by the OpenAI Responses transport (#75).
+pub fn classify_reqwest(err: &reqwest::Error) -> Retryable {
     if err.is_timeout() || err.is_connect() {
         return Retryable::Yes { retry_after: None };
     }
@@ -123,7 +124,7 @@ fn classify_webc(err: &genai::webc::Error) -> Retryable {
 
 /// 529 is Anthropic's "overloaded" status — transient, and one of the most
 /// common errors a Claude user sees under load.
-fn is_retryable_status(s: StatusCode) -> bool {
+pub fn is_retryable_status(s: StatusCode) -> bool {
     matches!(s.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 

@@ -13,10 +13,15 @@
 # The tag has to match the Cargo.toml version, or the run stops before
 # building anything.
 #
+# Nothing is published until the Windows target builds, which needs a
+# personal Windows runner and the repository variable PERSONAL_WINDOWS_RUNNER
+# set to `true` (see build-windows).
+#
 # Running the workflow by hand (Actions > Release > Run workflow), or from a
 # pull request that changes this file or install.sh, is a dry run: every
-# target is built, packaged and install-tested, and the archives are attached
-# to the run as artifacts, but nothing is published.
+# target (Windows only while it is enabled) is built, packaged and
+# install-tested, and the archives are attached to the run as artifacts, but
+# nothing is published.
 
 name: Release
 
@@ -46,13 +51,19 @@ defaults:
     shell: bash
 
 jobs:
+  # Every other job needs this one, so a fork's pull request (which must never run
+  # on the personal self-hosted runners) skips the whole dry run.
   version:
     name: check version
+    if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+      # The self-hosted runner has no preinstalled Rust; `cargo metadata`
+      # needs one.
+      - uses: dtolnay/rust-toolchain@stable
       - id: version
         run: |
           version=$(cargo metadata --no-deps --format-version 1 \
@@ -84,49 +95,183 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux binaries need the glibc and OpenSSL major version of the
-          # distro they were built on, or newer. Built on 22.04 they need
-          # glibc 2.34 and OpenSSL 3 (Ubuntu 22.04, Debian 12, RHEL 9); built
-          # on 24.04 they need glibc 2.39 and won't start on 22.04. Move to
-          # 24.04 only when GitHub retires the 22.04 images.
+          # Both Linux builds run on the personal Linux runner (x86_64), with
+          # zig as the C compiler and linker (cargo-zigbuild). zig links
+          # against the symbols of the glibc version given here rather than
+          # the runner's own, so the binaries start on glibc 2.34 or newer
+          # (Ubuntu 22.04+, Debian 12+, RHEL 9+, Amazon Linux 2023), and the
+          # arm64 one needs no arm64 host. TLS is rustls (Cargo.lock has no
+          # openssl-sys or native-tls), so there is no OpenSSL to link and
+          # nothing to install on the runner.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
-          # Native arm64 runner, so no cross-compiling OpenSSL.
+            os: ubuntu-latest
+            glibc: "2.34"
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04-arm
-          # macos-latest is Apple Silicon and cross-compiles the Intel build.
+            os: ubuntu-latest
+            glibc: "2.34"
+          # The personal Mac is Apple Silicon and cross-compiles the Intel
+          # build.
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            exe: .exe
     env:
       TARGET: ${{ matrix.target }}
       VERSION: ${{ needs.version.outputs.version }}
-      EXE: ${{ matrix.exe }}
-    steps:
+      GLIBC: ${{ matrix.glibc }}
+    steps: &build-steps
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      # reqwest's native-tls backend links the system OpenSSL on Linux.
-      - if: runner.os == 'Linux'
+      # zig and cargo-zigbuild, pinned by version and SHA-256 and unpacked in
+      # the job's temporary directory (the runner has no sudo). ziglang.org
+      # asks automated downloads to use its community mirrors, in random
+      # order, and the site itself only as the last resort. No mirror is
+      # trusted: only a tarball with the pinned SHA-256 (the one in
+      # https://ziglang.org/download/index.json) is used. cargo-zigbuild is
+      # the static musl build from its GitHub release.
+      - name: Install zig and cargo-zigbuild
+        if: runner.os == 'Linux'
+        env:
+          ZIG_VERSION: 0.17.0
+          ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+          CARGO_ZIGBUILD_VERSION: 0.24.0
+          CARGO_ZIGBUILD_SHA256: 52be2cb85ad3875682564a29bac1832b2ab3db68b1c504765c92d5249cc9b96f
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -yq --no-install-recommends libssl-dev pkg-config
+          tools=$RUNNER_TEMP/zigbuild
+          mkdir -p "$tools/zig" "$tools/bin"
+          cd "$tools"
+          zig=zig-x86_64-linux-$ZIG_VERSION.tar.xz
+          mapfile -t mirrors < <(curl -fsS --max-time 30 https://ziglang.org/download/community-mirrors.txt |
+            grep '^https://[^[:space:]]*$' | shuf || true)
+          for base in "${mirrors[@]}" "https://ziglang.org/download/$ZIG_VERSION"; do
+            if curl -fsSL --connect-timeout 10 --max-time 300 --speed-limit 100000 --speed-time 30 \
+              -o "$zig" "$base/$zig?source=coletebou-ai-cli-release" &&
+              echo "$ZIG_SHA256  $zig" | sha256sum -c --status; then
+              echo "zig $ZIG_VERSION from $base"
+              break
+            fi
+            rm -f "$zig"
+          done
+          if [ ! -f "$zig" ]; then
+            echo "::error::no mirror served $zig with SHA-256 $ZIG_SHA256"
+            exit 1
+          fi
+          curl -fsSL --retry 3 --max-time 120 -o cargo-zigbuild.tar.xz \
+            "https://github.com/rust-cross/cargo-zigbuild/releases/download/v$CARGO_ZIGBUILD_VERSION/cargo-zigbuild-x86_64-unknown-linux-musl.tar.xz"
+          echo "$CARGO_ZIGBUILD_SHA256  cargo-zigbuild.tar.xz" | sha256sum -c
+          tar -xJf "$zig" -C zig --strip-components=1
+          tar -xJf cargo-zigbuild.tar.xz -C bin --strip-components=1 \
+            cargo-zigbuild-x86_64-unknown-linux-musl/cargo-zigbuild
+          rm "$zig" cargo-zigbuild.tar.xz
+          echo "$tools/bin" >> "$GITHUB_PATH"
+          {
+            echo "CARGO_ZIGBUILD_ZIG_PATH=$tools/zig/zig"
+            # cargo-zigbuild tries `python3 -m ziglang` (zig from PyPI) before
+            # zig itself; a python that doesn't exist leaves it the pinned zig.
+            echo "CARGO_ZIGBUILD_PYTHON_PATH=$tools/no-python"
+            # Both tools cache in the job's temporary directory, which goes
+            # with the job, so nothing another job wrote can end up in the
+            # binary.
+            echo "CARGO_ZIGBUILD_CACHE_DIR=$tools/cache"
+            echo "ZIG_GLOBAL_CACHE_DIR=$tools/cache/zig"
+            echo "ZIG_LOCAL_CACHE_DIR=$tools/cache/zig-local"
+          } >> "$GITHUB_ENV"
+          echo "zig $("$tools/zig/zig" version), $("$tools/bin/cargo-zigbuild" --version)"
       # No build cache on purpose: release binaries start from a clean
       # target directory, so nothing written by another run can end up in
       # them.
-      - run: cargo build --release --locked --target "$TARGET"
+      - if: runner.os != 'Linux'
+        run: cargo build --release --locked --target "$TARGET"
+      - name: Build with cargo-zigbuild
+        if: runner.os == 'Linux'
+        env:
+          # Two compile jobs at a time keep the build inside the runner's
+          # 1 GiB memory cap.
+          CARGO_BUILD_JOBS: 2
+        # `<target>.<glibc version>` makes zig link against that glibc's
+        # symbols; the binary still lands in target/<target>/release/.
+        run: cargo zigbuild --release --locked --target "$TARGET.$GLIBC"
+      # Fail unless the Linux binary is for the target's CPU and asks for no
+      # glibc newer than $GLIBC: the newest GLIBC_ symbol version it uses is
+      # the oldest glibc it starts on.
+      - name: Check the architecture and glibc version
+        if: runner.os == 'Linux'
+        run: |
+          for tool in file readelf; do
+            command -v "$tool" > /dev/null || { echo "::error::$tool is not installed on this runner"; exit 1; }
+          done
+          bin=target/$TARGET/release/ai
+          case $TARGET in
+            x86_64-*) arch=x86-64 ;;
+            aarch64-*) arch="ARM aarch64" ;;
+            *) echo "::error::no expected architecture for $TARGET"; exit 1 ;;
+          esac
+          desc=$(file -b "$bin")
+          echo "file: $desc"
+          case $desc in
+            "ELF 64-bit LSB "*", $arch, "*) ;;
+            *) echo "::error::$bin is not a 64-bit $arch ELF binary"; exit 1 ;;
+          esac
+          # `|| true`: no match must reach the error below, not end the step
+          # silently under pipefail.
+          newest=$(readelf -W --dyn-syms --version-info "$bin" |
+            { grep -o 'GLIBC_[0-9][0-9.]*' || true; } | sed 's/^GLIBC_//' | sort -uV | tail -n 1)
+          echo "highest GLIBC_ symbol version: ${newest:-none}"
+          if [ -z "$newest" ]; then
+            echo "::error::$bin has no GLIBC_ symbol versions"
+            exit 1
+          fi
+          if [ "$(printf '%s\n' "$GLIBC" "$newest" | sort -V | tail -n 1)" != "$GLIBC" ]; then
+            echo "::error::$bin needs glibc $newest, newer than $GLIBC"
+            exit 1
+          fi
       - name: Smoke test
-        # The Intel macOS binary can't be run on the Apple Silicon runner.
-        if: matrix.target != 'x86_64-apple-darwin'
+        # The Intel macOS binary can't be run on the Apple Silicon runner, and
+        # the arm64 Linux one can't run natively on the x86_64 Linux runner
+        # (see the next step).
+        if: matrix.target != 'x86_64-apple-darwin' && matrix.target != 'aarch64-unknown-linux-gnu'
         run: |
           out=$("target/$TARGET/release/ai$EXE" --version)
           echo "$out"
           # `ai 0.2.0`, or `ai 0.2.0 (<commit>)`
+          reported=$(echo "$out" | awk '{ print $2 }')
+          if [ "$reported" != "$VERSION" ]; then
+            echo "::error::the binary reports version '$reported', expected $VERSION"
+            exit 1
+          fi
+      # The same check for the arm64 Linux binary, under qemu-user, and only
+      # if the runner's host already has it (qemu-aarch64 on PATH, or a
+      # binfmt_misc handler for aarch64); nothing is installed. Its C library
+      # is Ubuntu 21.10's arm64 glibc 2.34, the oldest the build supports: the
+      # package, pinned by SHA-256, is unpacked (no root needed) as the root
+      # qemu looks up libraries under. Without qemu, or if that package can't
+      # be fetched, the run says the binary was not executed and goes on.
+      - name: Smoke test under qemu
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        env:
+          LIBC6_URL: https://old-releases.ubuntu.com/ubuntu/pool/main/g/glibc/libc6_2.34-0ubuntu3.2_arm64.deb
+          LIBC6_SHA256: 0cdbd7b5d06f0b1e9358ba946db2ee512e9f94d5fd6a9b0ad05ee3d6d196cee4
+        run: |
+          qemu=$(command -v qemu-aarch64 || command -v qemu-aarch64-static || true)
+          if [ -z "$qemu" ] && ! grep -qx enabled /proc/sys/fs/binfmt_misc/qemu-aarch64 2> /dev/null; then
+            echo "::notice::$TARGET binary not executed: this runner has no qemu-aarch64 and no binfmt_misc handler for aarch64"
+            exit 0
+          fi
+          deb=$RUNNER_TEMP/libc6.deb
+          if ! curl -fsSL --retry 3 --max-time 120 -o "$deb" "$LIBC6_URL" ||
+            ! echo "$LIBC6_SHA256  $deb" | sha256sum -c --status; then
+            echo "::warning::$TARGET binary not executed: could not fetch $LIBC6_URL with SHA-256 $LIBC6_SHA256"
+            exit 0
+          fi
+          root=$RUNNER_TEMP/arm64-glibc
+          dpkg-deb -x "$deb" "$root"
+          export QEMU_LD_PREFIX=$root
+          echo "qemu: ${qemu:-the binfmt_misc handler for aarch64}"
+          ${qemu:+"$qemu"} "$root/lib/ld-linux-aarch64.so.1" --version | sed -n 1p
+          out=$(${qemu:+"$qemu"} "target/$TARGET/release/ai" --version)
+          echo "$out"
           reported=$(echo "$out" | awk '{ print $2 }')
           if [ "$reported" != "$VERSION" ]; then
             echo "::error::the binary reports version '$reported', expected $VERSION"
@@ -164,18 +309,49 @@ jobs:
           name: dist-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
+          # Dry runs (pull requests, manual runs) keep their archives for 3
+          # days, which is enough to download and try them; a tag release
+          # keeps the repository default (0). Artifacts count against the
+          # account's Actions storage.
+          retention-days: ${{ github.event_name != 'push' && 3 || 0 }}
+
+  # The Windows build: the build job's steps, on a personal Windows runner.
+  # There is none yet, and GitHub-hosted runners are not used, so it runs only
+  # once the repository variable PERSONAL_WINDOWS_RUNNER is `true` (set it when
+  # a runner with these labels exists). Until then it is skipped: a self-hosted
+  # job that no runner picks up would wait 24 hours and fail. It is a job of
+  # its own because a job's `if` cannot read `matrix`; the one-entry matrix
+  # keeps `matrix.target` working in the shared steps. The name is spelled out
+  # because a skipped job never expands its matrix.
+  build-windows:
+    name: build (x86_64-pc-windows-msvc)
+    needs: version
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        target: [x86_64-pc-windows-msvc]
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.version.outputs.version }}
+      EXE: .exe
+    steps: *build-steps
 
   # Run install.sh against the archives just built, served the way GitHub
   # lays out release downloads, before anything is published.
   install-test:
     name: install.sh (${{ matrix.os }})
     needs: [version, build]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-latest]
+        include:
+          - os: linux
+            runner: ubuntu-latest
+          - os: macos
+            runner: macos-latest
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
@@ -197,13 +373,20 @@ jobs:
 
   publish:
     name: publish release
-    needs: [version, build, install-test]
+    # build-windows is needed too: while it is skipped, so is this job, so a
+    # release is never published without its Windows archive.
+    needs: [version, build, build-windows, install-test]
     # Tag pushes only; manual runs and pull requests are dry runs.
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      # A self-hosted runner keeps its workspace between jobs, and this job has
+      # no checkout to clean it: start from an empty dist so another release's
+      # archives can't end up in this one.
+      - name: Empty dist
+        run: rm -rf dist
       - uses: actions/download-artifact@v8
         with:
           pattern: dist-*

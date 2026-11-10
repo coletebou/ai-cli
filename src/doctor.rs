@@ -2815,7 +2815,7 @@ mod tests {
 
     #[test]
     fn redaction_leaves_ordinary_text_alone() {
-        let text = "unknown variant `grok-4-1-fast-non-reasoning-extra`, expected one of `fast`, `smart` in /Users/Cole/Library/Application Support/ai-cli/config.toml";
+        let text = "unknown variant `grok-4-1-fast-non-reasoning-extra`, expected one of `fast`, `smart` in /Users/me/Library/Application Support/ai-cli/config.toml";
         assert_eq!(redact_secrets(text), text);
     }
 

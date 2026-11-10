@@ -52,6 +52,10 @@ pub struct Session {
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub name: String,
+    /// Display name of the provider the session was last saved with, e.g.
+    /// `CLAUDE` (copied from `Session::provider`, which has always been a
+    /// required field, so this is never empty for a real session).
+    pub provider: String,
     pub model: String,
     pub updated: u64,
     /// Number of user messages.
@@ -64,6 +68,7 @@ impl SessionSummary {
     fn of(name: &str, session: &Session) -> Self {
         Self {
             name: name.to_string(),
+            provider: session.provider.clone(),
             model: session.model.clone(),
             updated: session.updated,
             turns: user_turns(&session.messages),
@@ -187,6 +192,21 @@ fn civil_from_unix(ts: u64) -> (i64, u32, u32, u64) {
 fn utc_date(ts: u64) -> String {
     let (y, m, d, _) = civil_from_unix(ts);
     format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+/// `updated` as RFC 3339 in UTC (`2026-11-07T18:30:00Z`), for `ai sessions
+/// --json`. Stable and parseable, unlike the `format_age` shown in tables.
+pub fn rfc3339_utc(ts: u64) -> String {
+    let (y, m, d, secs) = civil_from_unix(ts);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        secs / 3_600,
+        secs / 60 % 60,
+        secs % 60
+    )
 }
 
 /// Default name for `/save` without a name: `chat-YYYYMMDD-HHMMSS` in UTC.
@@ -968,6 +988,13 @@ mod tests {
         std::fs::write(dir.join("junk.json"), "[1, 2]").unwrap();
         let err = format!("{:#}", store.load("junk").unwrap_err());
         assert!(err.contains("no format version"), "{err}");
+    }
+
+    #[test]
+    fn rfc3339_utc_matches_civil_date_and_time() {
+        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
     }
 
     #[test]

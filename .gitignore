@@ -6,3 +6,17 @@
 # Local session/memory state (not part of the project)
 .remember/
 .claude/
+
+# Secrets and local credentials: never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+credentials.json
+secrets.toml
+config.local.toml

@@ -17,9 +17,14 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# The personal self-hosted runners never run a pull request from a fork: once the
+# repository is public, anyone can open one, and its code would run on those
+# machines. Every self-hosted job carries `if: <not a fork PR>`, and the `fork-pr`
+# job runs the same checks for forks on a GitHub-hosted runner instead.
 jobs:
   fmt:
     name: rustfmt
+    if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -30,14 +35,17 @@ jobs:
 
   clippy-test:
     name: clippy + test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        # Windows differs in Ctrl+C handling, rustyline's console backend,
-        # `@C:\path` references and the %APPDATA% config dir.
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
+        include:
+          - os: linux
+            runner: ubuntu-latest
+          - os: macos
+            runner: macos-latest
+    steps: &clippy-test-steps
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -46,8 +54,21 @@ jobs:
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --locked
 
+  # Windows differs in Ctrl+C handling, rustyline's console backend,
+  # `@C:\path` references and the %APPDATA% config dir. There is no personal
+  # Windows runner yet, and GitHub-hosted runners are not used, so this leg
+  # runs only once the repository variable PERSONAL_WINDOWS_RUNNER is `true`
+  # (set it when a runner with these labels exists). Until then it is skipped:
+  # a self-hosted job that no runner picks up would wait 24 hours and fail.
+  # It is a job of its own because a job's `if` cannot read `matrix`.
+  clippy-test-windows:
+    name: clippy + test (windows)
+    runs-on: windows-latest
+    steps: *clippy-test-steps
+
   msrv:
     name: MSRV
+    if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -63,3 +84,20 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --locked
+
+  # A pull request from a fork: the same checks on a GitHub-hosted runner, with
+  # the read-only token and no secrets, so fork code never reaches a personal machine.
+  fork-pr:
+    name: fork PR (fmt, clippy, test)
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --locked

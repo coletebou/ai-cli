@@ -10,7 +10,7 @@
   "excludeAuthors": ["dependabot[bot]", "renovate[bot]"],
   "disabledLabels": ["skip-review", "wip"],
   "ignorePatterns": "target/**\nCargo.lock\ndist/**\n**/*.snap\nbacklog/**",
-  "instructions": "Rust CLI for multi-provider AI queries (Anthropic, OpenAI, Google, xAI, OpenRouter). Tokio async + ratatui TUI + genai crate. Single binary, distributed via `cargo install` and homebrew. Users install personal configs at ~/.config/ai-cli/config.toml. Org-level review rules already apply — this file only adds ai-cli-specific rules.",
+  "instructions": "Rust CLI for multi-provider AI queries (Anthropic, OpenAI, Google, xAI, OpenRouter). Tokio async + ratatui TUI + genai crate. Single binary, distributed via `cargo install` and homebrew. Users install personal configs at ~/.config/ai-cli/config.toml.",
   "rules": [
     {
       "id": "streaming-is-product-requirement",

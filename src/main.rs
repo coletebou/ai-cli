@@ -17,6 +17,7 @@ mod query;
 mod retry;
 mod search;
 mod sessions;
+mod sessions_cmd;
 mod telemetry;
 mod term;
 mod ui;
@@ -284,6 +285,15 @@ enum Command {
         #[arg(long)]
         offline: bool,
     },
+    /// List saved chat sessions (newest first); for scripts and other tools
+    Sessions {
+        /// Print a stable, machine-readable JSON object instead of a table
+        #[arg(long)]
+        json: bool,
+        /// Show at most this many sessions
+        #[arg(long, default_value_t = sessions_cmd::DEFAULT_LIMIT)]
+        limit: usize,
+    },
 }
 
 /// Parse argv, treating a question that merely *starts* with a subcommand
@@ -477,6 +487,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
             }
             Command::Doctor { offline } => doctor::run(offline).await?,
+            Command::Sessions { json, limit } => sessions_cmd::run(
+                sessions::SessionStore::default_location().as_ref(),
+                json,
+                limit,
+            )?,
         }
         return Ok(ExitCode::SUCCESS);
     }

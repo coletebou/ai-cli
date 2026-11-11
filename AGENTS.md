@@ -41,8 +41,9 @@ this file is what an agent needs on top of them. `CLAUDE.md` only imports this f
 |---|---|
 | `config.rs`, `config_ui.rs` | settings loading/merging/writing and the `ai config` editor together |
 | `providers.rs`, `bedrock.rs`, `bedrock_eventstream.rs`, `retry.rs` | model routing, auth and retry for *every* provider and mode at once |
+| `bedrock_catalog.rs` | the TUI model picker's list and `ai models --bedrock` |
 | `query.rs` | the tool-use loop and `StreamEvent` production — streaming, non-streaming and the search tool |
-| `display.rs`, `markdown.rs`, `ui.rs`, `term.rs`, `diag.rs` | CLI rendering, TUI panels, or terminal-state restoration on exit/panic |
+| `display.rs`, `markdown.rs`, `ui.rs`, `ui_picker.rs`, `term.rs`, `diag.rs` | CLI rendering, TUI panels and model picker, or terminal-state restoration on exit/panic |
 | `chat.rs`, `sessions.rs` | interactive chat (`-i`) and `/save`, `/load`, `/sessions`, `--continue` |
 | `sessions_cmd.rs` | `ai sessions`: table/JSON session listing for scripts and other tools |
 | `context.rs` | `@file` and piped-stdin expansion into the prompt |
@@ -94,6 +95,9 @@ at the new `$XDG_CONFIG_HOME` path — a "wrong config" report can come from eit
 
 ## Known traps
 
+- **Bedrock routing is by provider, not model.** `ProviderManager::bedrock_for` sends every model of a
+  Bedrock-backed provider (`Provider::name` is its config key) to Converse, so a model picked at
+  runtime works without being listed in the config. Don't key new Bedrock dispatch on the model name.
 - **No `eprintln!` while a full-screen UI is up.** Use `crate::diag::warn` for anything that can
   fire mid-request; it's held back while the TUI owns the terminal and flushed after.
 - **Never call rustyline's `FileHistory::save`** (or `append` on a file that doesn't exist yet,

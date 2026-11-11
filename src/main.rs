@@ -1,5 +1,6 @@
 mod anthropic_oauth;
 mod bedrock;
+mod bedrock_catalog;
 mod bedrock_eventstream;
 mod chat;
 mod config;
@@ -20,6 +21,7 @@ mod sessions_cmd;
 mod telemetry;
 mod term;
 mod ui;
+mod ui_picker;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -197,6 +199,11 @@ struct Cli {
     #[arg(short, long)]
     all: bool,
 
+    /// Model ID to use instead of each selected provider's configured one
+    /// (any ID a Bedrock provider's region serves; see `ai models --bedrock`)
+    #[arg(short = 'm', long, value_name = "ID")]
+    model: Option<String>,
+
     /// System prompt / persona for all providers
     #[arg(short, long)]
     system: Option<String>,
@@ -262,7 +269,7 @@ struct Cli {
 enum Command {
     /// Open the TUI config editor
     Config,
-    /// List available models from OpenRouter
+    /// List available models from OpenRouter (or, with --bedrock, AWS Bedrock)
     Models {
         /// Search/filter models by name or ID
         search: Option<String>,
@@ -270,8 +277,11 @@ enum Command {
         #[arg(long)]
         refresh: bool,
         /// Show only free models
-        #[arg(long)]
+        #[arg(long, conflicts_with = "bedrock")]
         free: bool,
+        /// List the chat models your Bedrock provider's region serves instead
+        #[arg(long)]
+        bedrock: bool,
     },
     /// Generate shell completion script (bash, zsh, fish, elvish, powershell)
     Completions {
@@ -465,8 +475,14 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Command::Config => config_ui::run_config_ui().await?,
             Command::Models {
                 search,
+                bedrock: true,
+                ..
+            } => bedrock_catalog::print_models(search.as_deref()).await?,
+            Command::Models {
+                search,
                 refresh,
                 free,
+                ..
             } => models::list_models(search.as_deref(), refresh, free).await?,
             Command::Completions { shell } => {
                 let mut cmd = Cli::command();
@@ -569,7 +585,17 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             eprintln!("note: skipping {}: {}", name, reason);
         }
     }
-    let providers_to_query = selection.providers;
+    let mut providers_to_query = selection.providers;
+    if let Some(model) = cli
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        for provider in &mut providers_to_query {
+            provider.model = model.to_string();
+        }
+    }
 
     // Determine system prompt
     let system_prompt = cli

@@ -295,7 +295,7 @@ pub async fn query_single(
 
     // Bedrock-hosted models bypass genai (which cannot speak Bedrock's wire
     // protocol) and go through the direct Converse client.
-    if let Some(bedrock) = manager.bedrock_for(&model) {
+    if let Some(bedrock) = manager.bedrock_for(provider) {
         return query_single_bedrock(manager, provider, ctx, &bedrock, start).await;
     }
 
@@ -925,7 +925,7 @@ pub async fn stream_with_messages(
     // protocol) and drive ConverseStream directly. The dispatch happens before
     // telemetry span setup so Bedrock requests stay on a clean codepath; the
     // root `ai.query` span still wraps this call via the calling task's Context.
-    if let Some(bedrock) = manager.bedrock_for(&model) {
+    if let Some(bedrock) = manager.bedrock_for(provider) {
         return stream_bedrock(
             manager, &bedrock, provider, messages, ctx, tx, cancel, start,
         )

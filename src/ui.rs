@@ -1,5 +1,7 @@
+use crate::bedrock_catalog::BedrockModel;
 use crate::providers::{Provider, ProviderManager};
 use crate::query::{stream_with_messages, QueryContext, StreamEvent};
+use crate::ui_picker::{CatalogState, ModelPicker, PickerAction, PickerItem};
 use anyhow::Result;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
@@ -15,6 +17,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -74,7 +77,16 @@ enum PanelCommand {
         cancel: CancellationToken,
     },
     Clear,
+    /// Use a different model (served by `provider_name`'s config entry)
+    /// from the next turn on. The conversation so far is kept.
+    SetModel {
+        provider_name: String,
+        model: String,
+    },
 }
+
+/// A finished catalog fetch: (Bedrock provider name, models or error text).
+type CatalogResult = (String, Result<Vec<BedrockModel>, String>);
 
 pub struct PanelState {
     pub provider: Provider,
@@ -165,6 +177,16 @@ pub struct App {
     /// Cancellation token for the currently in-flight turn. Cloned into every
     /// panel's Ask command so a single Ctrl+C cancels them all.
     current_turn_cancel: Option<CancellationToken>,
+    /// The model picker, while it's open.
+    picker: Option<ModelPicker>,
+    /// Bedrock model lists, by the provider name they were fetched through.
+    catalogs: HashMap<String, CatalogState>,
+    /// Providers that route to Bedrock, in display order (empty in tests
+    /// unless set).
+    bedrock_providers: Vec<String>,
+    /// Catalogs to fetch; the main loop (which holds the ProviderManager)
+    /// drains this and reports back through `catalog_loaded`.
+    catalog_requests: Vec<String>,
 }
 
 impl App {
@@ -187,7 +209,161 @@ impl App {
             should_quit: false,
             status_message: None,
             current_turn_cancel: None,
+            picker: None,
+            catalogs: HashMap::new(),
+            bedrock_providers: Vec::new(),
+            catalog_requests: Vec::new(),
         }
+    }
+
+    // ── Model picker ──────────────────────────────────────────────────────
+
+    /// The Bedrock provider whose catalog panel `idx` picks from: its own
+    /// provider when that routes to Bedrock, else the first one that does.
+    fn catalog_provider_for(&self, idx: usize) -> Option<String> {
+        let own = &self.panels.get(idx)?.provider.name;
+        if self.bedrock_providers.contains(own) {
+            return Some(own.clone());
+        }
+        self.bedrock_providers.first().cloned()
+    }
+
+    /// Queue a catalog fetch unless one is loaded or already loading. A
+    /// failed fetch is retried the next time the picker opens.
+    fn request_catalog(&mut self, provider: &str) {
+        if matches!(
+            self.catalogs.get(provider),
+            Some(CatalogState::Loading | CatalogState::Ready(_))
+        ) {
+            return;
+        }
+        self.catalogs
+            .insert(provider.to_string(), CatalogState::Loading);
+        self.catalog_requests.push(provider.to_string());
+    }
+
+    fn catalog_loaded(&mut self, provider: String, result: Result<Vec<BedrockModel>, String>) {
+        let state = match result {
+            Ok(models) => CatalogState::Ready(models),
+            Err(err) => CatalogState::Failed(err),
+        };
+        self.catalogs.insert(provider, state);
+    }
+
+    fn open_model_picker(&mut self) {
+        let idx = self.selected_panel;
+        let Some(panel) = self.panels.get(idx) else {
+            return;
+        };
+        if panel.is_busy() {
+            self.status_message = Some(format!(
+                "{} is answering; change its model when it's done",
+                panel.provider.display_name
+            ));
+            return;
+        }
+        let catalog_provider = self.catalog_provider_for(idx);
+        self.picker = Some(ModelPicker::new(
+            idx,
+            panel.provider.display_name.clone(),
+            panel.model.clone(),
+            catalog_provider.clone(),
+        ));
+        if let Some(name) = catalog_provider {
+            self.request_catalog(&name);
+        }
+    }
+
+    fn picker_items(&self) -> Vec<PickerItem> {
+        let Some(picker) = &self.picker else {
+            return Vec::new();
+        };
+        let catalog = picker
+            .catalog_provider
+            .as_ref()
+            .and_then(|name| self.catalogs.get(name));
+        picker.items(catalog)
+    }
+
+    fn handle_picker_key(&mut self, key: KeyEvent) {
+        let items = self.picker_items();
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        match picker.handle_key(key, &items) {
+            PickerAction::None => {}
+            PickerAction::Close => self.picker = None,
+            PickerAction::Pick(item) => {
+                let picker = self.picker.take().expect("picker is open");
+                let provider = match &item {
+                    // Catalog models are served by the provider the catalog
+                    // came from.
+                    PickerItem::Model(_) => picker
+                        .catalog_provider
+                        .unwrap_or_else(|| self.panels[picker.panel].provider.name.clone()),
+                    PickerItem::Typed(id) => self.route_for_typed(picker.panel, id),
+                };
+                self.set_panel_model(picker.panel, provider, item.model_id().to_string());
+            }
+        }
+    }
+
+    /// Which provider serves a model ID typed by hand on panel `idx`: the
+    /// panel's own provider, unless that doesn't reach Bedrock and the ID is
+    /// a model some Bedrock catalog lists (so `/model us.xai.grok-4.7` on a
+    /// Gemini panel goes to Bedrock, while `/model gemini-3.1-pro-preview`
+    /// stays with Google).
+    fn route_for_typed(&self, idx: usize, model: &str) -> String {
+        let own = self.panels[idx].provider.name.clone();
+        if self.bedrock_providers.contains(&own) {
+            return own;
+        }
+        self.bedrock_providers
+            .iter()
+            .find(|name| match self.catalogs.get(*name) {
+                Some(CatalogState::Ready(models)) => models.iter().any(|m| m.id == model),
+                _ => false,
+            })
+            .cloned()
+            .unwrap_or(own)
+    }
+
+    /// Switch panel `idx` to `model`, served by `provider_name`, from its
+    /// next turn on. The panel keeps its conversation.
+    fn set_panel_model(&mut self, idx: usize, provider_name: String, model: String) {
+        let Some(panel) = self.panels.get_mut(idx) else {
+            return;
+        };
+        if panel.is_busy() {
+            self.status_message = Some(format!(
+                "{} is answering; change its model when it's done",
+                panel.provider.display_name
+            ));
+            return;
+        }
+        let Some(tx) = self.senders.get(idx) else {
+            return;
+        };
+        if tx
+            .try_send(PanelCommand::SetModel {
+                provider_name: provider_name.clone(),
+                model: model.clone(),
+            })
+            .is_err()
+        {
+            self.status_message = Some(format!(
+                "couldn't switch {}: its worker stopped",
+                panel.provider.display_name
+            ));
+            return;
+        }
+        panel.provider.name = provider_name;
+        panel.provider.model = model.clone();
+        panel.model = model.clone();
+        self.status_message = Some(format!(
+            "{} now uses {}",
+            panel.provider.display_name, model
+        ));
     }
 
     /// A turn is visibly in progress: Esc/Ctrl+C should cancel it rather
@@ -834,16 +1010,25 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     } else {
         match app.mode {
             Mode::Insert => {
-                "Esc: normal | Enter: send | Ctrl+C: cancel turn | PgUp/PgDn: scroll | /clear /exit"
+                "Esc: normal | Enter: send | Ctrl+C: cancel turn | Ctrl+O: model | PgUp/PgDn: scroll | /model /clear /exit"
                     .to_string()
             }
             Mode::Normal => {
-                "i: insert | h/l or ←/→: select panel | j/k or ↑/↓: scroll | q: quit".to_string()
+                "i: insert | h/l or ←/→: select panel | j/k or ↑/↓: scroll | m: model | q: quit"
+                    .to_string()
             }
         }
     };
     let footer = Paragraph::new(help_text).style(Style::default().fg(Color::Gray));
     frame.render_widget(footer, main_layout[2]);
+
+    if let Some(picker) = app.picker.as_mut() {
+        let catalog = picker
+            .catalog_provider
+            .as_ref()
+            .and_then(|name| app.catalogs.get(name));
+        crate::ui_picker::draw(frame, picker, catalog);
+    }
 }
 
 /// Give panels distinct display names. Stream events are routed to panels
@@ -937,6 +1122,12 @@ pub async fn run_tui(
             Ok(_guard) => {
                 let mut app = App::new(panels, senders, show_tokens);
                 app.tasks = tasks;
+                app.bedrock_providers = manager.bedrock_provider_names();
+                // Fetch the catalog the picker will most likely show now, so
+                // it opens ready.
+                if let Some(first) = app.catalog_provider_for(0) {
+                    app.request_catalog(&first);
+                }
 
                 // Seed the first turn with the CLI-provided question, if any.
                 let initial = initial_question.trim();
@@ -945,7 +1136,9 @@ pub async fn run_tui(
                 }
 
                 let result = match Terminal::new(CrosstermBackend::new(io::stdout())) {
-                    Ok(mut terminal) => run_main_loop(&mut terminal, &mut app, event_rx).await,
+                    Ok(mut terminal) => {
+                        run_main_loop(&mut terminal, &mut app, &manager, event_rx).await
+                    }
                     Err(e) => Err(e.into()),
                 };
 
@@ -985,7 +1178,7 @@ fn ends_with_final_reply(messages: &[ChatMessage]) -> bool {
 /// command. On Clear, resets history back to just the system prompt.
 async fn panel_task(
     manager: Arc<ProviderManager>,
-    provider: Provider,
+    mut provider: Provider,
     ctx: QueryContext,
     mut cmd_rx: mpsc::Receiver<PanelCommand>,
     event_tx: mpsc::Sender<StreamEvent>,
@@ -1024,6 +1217,13 @@ async fn panel_task(
             PanelCommand::Clear => {
                 messages = base_messages.clone();
             }
+            PanelCommand::SetModel {
+                provider_name,
+                model,
+            } => {
+                provider.name = provider_name;
+                provider.model = model;
+            }
         }
     }
 }
@@ -1031,46 +1231,90 @@ async fn panel_task(
 async fn run_main_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
+    manager: &Arc<ProviderManager>,
     mut event_rx: mpsc::Receiver<StreamEvent>,
 ) -> Result<()> {
     // Only redraw when something changed. Redrawing re-parses every panel's
     // markdown, so doing it on a fixed 50ms tick burned CPU while idle.
     let mut dirty = true;
-    loop {
-        if dirty {
-            terminal.draw(|frame| draw_ui(frame, app))?;
-            dirty = false;
+    let (catalog_tx, mut catalog_rx) = mpsc::unbounded_channel::<CatalogResult>();
+    let mut catalog_tasks: Vec<JoinHandle<()>> = Vec::new();
+    let result = loop {
+        for provider in std::mem::take(&mut app.catalog_requests) {
+            let Some(client) = manager.bedrock_client(&provider) else {
+                app.catalog_loaded(provider, Err("not a Bedrock provider".into()));
+                continue;
+            };
+            let tx = catalog_tx.clone();
+            catalog_tasks.push(tokio::spawn(async move {
+                let result = crate::bedrock_catalog::list_models(&client)
+                    .await
+                    .map_err(|e| format!("{:#}", e));
+                let _ = tx.send((provider, result));
+            }));
         }
+        while let Ok((provider, result)) = catalog_rx.try_recv() {
+            app.catalog_loaded(provider, result);
+            dirty = true;
+        }
+        match main_loop_step(terminal, app, &mut event_rx, &mut dirty).await {
+            Ok(true) => continue,
+            Ok(false) => break Ok(()),
+            Err(e) => break Err(e),
+        }
+    };
+    for task in catalog_tasks {
+        task.abort();
+    }
+    result
+}
 
-        if event::poll(std::time::Duration::from_millis(50))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    // Any key clears the transient status hint so it doesn't
-                    // linger past user acknowledgement.
-                    app.status_message = None;
-                    handle_key(app, key);
-                    if app.should_quit {
-                        return Ok(());
-                    }
+/// One pass of the UI loop: redraw if needed, handle input and stream
+/// events. `Ok(false)` means quit.
+async fn main_loop_step(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+    event_rx: &mut mpsc::Receiver<StreamEvent>,
+    dirty: &mut bool,
+) -> Result<bool> {
+    if *dirty {
+        terminal.draw(|frame| draw_ui(frame, app))?;
+        *dirty = false;
+    }
+
+    if event::poll(std::time::Duration::from_millis(50))? {
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                // Any key clears the transient status hint so it doesn't
+                // linger past user acknowledgement.
+                app.status_message = None;
+                handle_key(app, key);
+                if app.should_quit {
+                    return Ok(false);
                 }
-                Event::Mouse(mouse) => handle_mouse(app, mouse),
-                Event::Paste(text) if app.mode == Mode::Insert => {
+            }
+            Event::Mouse(mouse) if app.picker.is_none() => handle_mouse(app, mouse),
+            Event::Paste(text) => {
+                if let Some(picker) = app.picker.as_mut() {
+                    picker.insert_text(&text);
+                } else if app.mode == Mode::Insert {
                     app.insert_text(&normalize_newlines(&text));
                 }
-                _ => {}
             }
-            dirty = true;
+            _ => {}
         }
-
-        while let Ok(event) = event_rx.try_recv() {
-            app.handle_event(event);
-            dirty = true;
-        }
-
-        if app.reap_dead_tasks() {
-            dirty = true;
-        }
+        *dirty = true;
     }
+
+    while let Ok(event) = event_rx.try_recv() {
+        app.handle_event(event);
+        *dirty = true;
+    }
+
+    if app.reap_dead_tasks() {
+        *dirty = true;
+    }
+    Ok(true)
 }
 
 /// Pasted text arrives with whatever line endings the source used; keep
@@ -1080,6 +1324,10 @@ fn normalize_newlines(s: &str) -> String {
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
+    if app.picker.is_some() {
+        app.handle_picker_key(key);
+        return;
+    }
     match app.mode {
         Mode::Normal => handle_normal_key(app, key),
         Mode::Insert => handle_insert_key(app, key),
@@ -1103,6 +1351,7 @@ fn handle_normal_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('i') => app.mode = Mode::Insert,
+        KeyCode::Char('m') => app.open_model_picker(),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if app.any_streaming() {
                 app.cancel_current_turn();
@@ -1152,6 +1401,21 @@ fn handle_insert_key(app: &mut App, key: KeyEvent) {
                         app.clear_all_panels();
                         app.clear_input();
                     }
+                    "model" | "models" => {
+                        // The ID keeps its case: only the command name is
+                        // matched case-insensitively.
+                        let id = cmd.split_whitespace().nth(1).unwrap_or("");
+                        app.clear_input();
+                        if id.is_empty() {
+                            app.open_model_picker();
+                        } else {
+                            let idx = app.selected_panel;
+                            if idx < app.panels.len() {
+                                let provider = app.route_for_typed(idx, id);
+                                app.set_panel_model(idx, provider, id.to_string());
+                            }
+                        }
+                    }
                     _ => {
                         app.status_message = Some(format!("unknown command: /{}", cmd_name));
                         app.clear_input();
@@ -1194,6 +1458,7 @@ fn handle_insert_key(app: &mut App, key: KeyEvent) {
             app.input_buffer.truncate(app.input_cursor);
         }
         KeyCode::Char('w') if ctrl && !alt => app.delete_word_back(),
+        KeyCode::Char('o') if ctrl && !alt => app.open_model_picker(),
         // Other Ctrl- or Alt- chords are commands, not text: don't type a
         // literal letter for them. Ctrl+Alt together is AltGr on Windows
         // and produces real characters (e.g. `@`, `€`), so let it through.
@@ -1234,6 +1499,7 @@ mod tests {
 
     fn fake_provider(name: &str) -> Provider {
         Provider {
+            name: name.to_lowercase(),
             display_name: name.to_string(),
             model: "test-model".to_string(),
             color: colored::Color::Cyan,
@@ -1659,5 +1925,204 @@ mod tests {
         let lines = lines_for_turn(&turn, Color::Red, false);
         // header, two text lines, trailing blank
         assert_eq!(lines.len(), 4);
+    }
+
+    // ── Model picker ──────────────────────────────────────────────────────
+
+    fn bedrock_model(id: &str) -> BedrockModel {
+        BedrockModel {
+            id: id.into(),
+            name: id.into(),
+            vendor: "V".into(),
+        }
+    }
+
+    /// Two panels; "p0" routes to Bedrock (its catalog is loaded), "p1"
+    /// doesn't.
+    fn picker_app() -> (App, Vec<mpsc::Receiver<PanelCommand>>) {
+        let (mut app, rxs) = app_with(2);
+        app.bedrock_providers = vec!["p0".into()];
+        app.catalog_loaded(
+            "p0".into(),
+            Ok(vec![
+                bedrock_model("us.anthropic.claude-opus-5-5"),
+                bedrock_model("us.xai.grok-4.7"),
+            ]),
+        );
+        (app, rxs)
+    }
+
+    fn expect_set_model(rx: &mut mpsc::Receiver<PanelCommand>) -> (String, String) {
+        match rx.try_recv() {
+            Ok(PanelCommand::SetModel {
+                provider_name,
+                model,
+            }) => (provider_name, model),
+            Ok(_) => panic!("expected SetModel, got another command"),
+            Err(e) => panic!("expected SetModel, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn m_opens_the_picker_and_enter_switches_the_panel() {
+        let (mut app, mut rxs) = picker_app();
+        app.mode = Mode::Normal;
+        handle_key(&mut app, key(KeyCode::Char('m')));
+        assert!(app.picker.is_some());
+        // Keys now go to the picker, not to normal-mode navigation.
+        type_str(&mut app, "grok");
+        assert_eq!(app.selected_panel, 0);
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.picker.is_none());
+        assert_eq!(
+            expect_set_model(&mut rxs[0]),
+            ("p0".into(), "us.xai.grok-4.7".into())
+        );
+        assert_eq!(app.panels[0].model, "us.xai.grok-4.7");
+        assert_eq!(app.panels[0].provider.model, "us.xai.grok-4.7");
+    }
+
+    #[test]
+    fn ctrl_o_opens_the_picker_and_esc_closes_it_unchanged() {
+        let (mut app, mut rxs) = picker_app();
+        app.mode = Mode::Insert;
+        type_str(&mut app, "draft");
+        handle_key(&mut app, ctrl('o'));
+        assert!(app.picker.is_some());
+        type_str(&mut app, "opus");
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(app.picker.is_none());
+        // Esc closed the picker only: still in insert mode, draft intact.
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.input_buffer, "draft");
+        assert!(rxs[0].try_recv().is_err());
+        assert_eq!(app.panels[0].model, "test-model");
+    }
+
+    #[test]
+    fn a_non_bedrock_panel_picks_from_the_bedrock_catalog_and_is_rerouted() {
+        let (mut app, mut rxs) = picker_app();
+        app.mode = Mode::Normal;
+        app.selected_panel = 1;
+        handle_key(&mut app, key(KeyCode::Char('m')));
+        assert_eq!(
+            app.picker.as_ref().unwrap().catalog_provider.as_deref(),
+            Some("p0")
+        );
+        type_str(&mut app, "opus");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            expect_set_model(&mut rxs[1]),
+            ("p0".into(), "us.anthropic.claude-opus-5-5".into())
+        );
+        assert_eq!(app.panels[1].provider.name, "p0");
+    }
+
+    #[test]
+    fn model_command_sets_any_id_and_keeps_its_case() {
+        let (mut app, mut rxs) = picker_app();
+        app.mode = Mode::Insert;
+        type_str(&mut app, "/model us.meta.Llama-Custom:0");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            expect_set_model(&mut rxs[0]),
+            ("p0".into(), "us.meta.Llama-Custom:0".into())
+        );
+        assert!(app.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn typed_ids_on_a_non_bedrock_panel_only_go_to_bedrock_when_listed() {
+        let (mut app, mut rxs) = picker_app();
+        app.selected_panel = 1;
+        app.mode = Mode::Insert;
+        // Not in the catalog: stays with the panel's own provider.
+        type_str(&mut app, "/model gemini-3.1-pro-preview");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            expect_set_model(&mut rxs[1]),
+            ("p1".into(), "gemini-3.1-pro-preview".into())
+        );
+        // A listed Bedrock model goes to Bedrock.
+        type_str(&mut app, "/model us.xai.grok-4.7");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            expect_set_model(&mut rxs[1]),
+            ("p0".into(), "us.xai.grok-4.7".into())
+        );
+    }
+
+    #[test]
+    fn model_command_without_an_id_opens_the_picker() {
+        let (mut app, _rxs) = picker_app();
+        app.mode = Mode::Insert;
+        type_str(&mut app, "/model");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.picker.is_some());
+    }
+
+    #[test]
+    fn the_model_cant_change_mid_answer() {
+        let (mut app, mut rxs) = picker_app();
+        app.panels[0].is_streaming = true;
+        app.mode = Mode::Normal;
+        handle_key(&mut app, key(KeyCode::Char('m')));
+        assert!(app.picker.is_none());
+        assert!(app.status_message.as_deref().unwrap().contains("answering"));
+        app.set_panel_model(0, "p0".into(), "us.xai.grok-4.7".into());
+        assert!(rxs[0].try_recv().is_err());
+        assert_eq!(app.panels[0].model, "test-model");
+    }
+
+    #[test]
+    fn opening_the_picker_requests_its_catalog_once() {
+        let (mut app, _rxs) = app_with(1);
+        app.bedrock_providers = vec!["p0".into()];
+        app.mode = Mode::Normal;
+        handle_key(&mut app, key(KeyCode::Char('m')));
+        handle_key(&mut app, key(KeyCode::Esc));
+        handle_key(&mut app, key(KeyCode::Char('m')));
+        assert_eq!(app.catalog_requests, ["p0"]);
+        // A failed fetch is retried on the next open.
+        app.catalog_requests.clear();
+        app.catalog_loaded("p0".into(), Err("boom".into()));
+        handle_key(&mut app, key(KeyCode::Esc));
+        handle_key(&mut app, key(KeyCode::Char('m')));
+        assert_eq!(app.catalog_requests, ["p0"]);
+    }
+
+    #[test]
+    fn without_bedrock_the_picker_still_accepts_a_typed_id() {
+        let (mut app, mut rxs) = app_with(1);
+        app.mode = Mode::Normal;
+        handle_key(&mut app, key(KeyCode::Char('m')));
+        assert!(app.picker.as_ref().unwrap().catalog_provider.is_none());
+        type_str(&mut app, "gpt-5.6-sol");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            expect_set_model(&mut rxs[0]),
+            ("p0".into(), "gpt-5.6-sol".into())
+        );
+    }
+
+    #[test]
+    fn the_picker_draws_over_the_panels() {
+        let (mut app, _rxs) = picker_app();
+        app.mode = Mode::Normal;
+        handle_key(&mut app, key(KeyCode::Char('m')));
+        type_str(&mut app, "grok");
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Model for P0"), "{text}");
+        assert!(text.contains("us.xai.grok-4.7"), "{text}");
+        assert!(text.contains("use \"grok\" as the model ID"), "{text}");
+        assert!(!text.contains("claude-opus"), "{text}");
     }
 }

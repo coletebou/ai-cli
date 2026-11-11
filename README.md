@@ -149,6 +149,26 @@ api_key_env = "TAVILY_API_KEY"
 
 Override at the CLI: `ai -w --search-provider tavily "query"`.
 
+### AWS Bedrock
+
+Any provider whose `base_url` points at a Bedrock runtime endpoint is sent to Bedrock's Converse API with the bearer token named by `api_key_env`. That covers far more than Claude: commercial Bedrock also serves GPT, Grok, Kimi, DeepSeek, Llama, Qwen, Mistral, Nova and more, all under the same token.
+
+```toml
+[providers.xai]
+api_key_env = "AWS_BEARER_TOKEN_BEDROCK"
+base_url = "https://bedrock-runtime.us-east-1.amazonaws.com/"
+default_model = "us.xai.grok-4.7"
+aliases = ["grok"]
+```
+
+A Bedrock provider takes any model ID its region serves, not just the ones in its config:
+
+- `ai models --bedrock [search]` lists the region's chat models: system inference profiles (`us.…`, `global.…`) and models callable on demand. Speech, rerank and retired models are left out.
+- `ai -p grok -m global.xai.grok-4.6 "…"` uses another model for one query (`-m` works with any provider).
+- In the TUI, `m` (normal mode), `Ctrl+O` or `/model` opens a model picker for the selected panel (see [Interactive TUI](#interactive-tui)).
+
+Token counts include prompt tokens that Bedrock served from its cache, which it reports separately from `inputTokens`.
+
 ### Cost estimate
 
 When a response reports its token counts, the footer shows an estimated cost, e.g. `cost: $0.0042`, and a multi-provider run ends with a `total: $…` line. The estimate uses built-in list prices (USD per million tokens) for the default Anthropic, OpenAI, Google, and xAI models, matched on the model id regardless of date suffix (`claude-haiku-4-5-20251001`), Bedrock spelling (`us.anthropic.claude-opus-4-7`), or OpenRouter route (`anthropic/claude-opus-4-8`). Models without a known price show no cost.
@@ -208,6 +228,7 @@ ai models                           # list available OpenRouter models
 ai models --free                    # only free models
 ai models --refresh                 # force-refresh model cache
 ai models "llama"                   # filter by name
+ai models --bedrock [search]        # chat models your Bedrock region serves
 ai completions zsh                  # generate shell completion script
 ai doctor                           # check config, keys and connectivity
 ai sessions                         # list saved chat sessions, newest first
@@ -354,6 +375,7 @@ The TUI is a long-running chat: type a message, hit Enter, read responses in eac
 | Normal | `h` / `l` / `←` / `→` / `Tab` | Cycle between panels |
 | Normal | `j` / `k` / `↑` / `↓` | Scroll selected panel |
 | Normal | `PageUp` / `PageDown` | Page-size scroll |
+| Normal | `m` | Pick the selected panel's model |
 | Normal | `q` / `Esc` | Quit (Esc cancels first if streaming) |
 | Insert | `Enter` | Submit turn to all panels |
 | Insert | `Esc` | Back to normal |
@@ -361,11 +383,16 @@ The TUI is a long-running chat: type a message, hit Enter, read responses in eac
 | Insert | `←` / `→` / `Home` / `End` | Move the cursor (also `Ctrl+A` / `Ctrl+E`) |
 | Insert | `Ctrl+W` / `Ctrl+U` / `Ctrl+K` | Delete word back / to start / to end |
 | Insert | `PageUp` / `PageDown` | Scroll the selected panel |
+| Insert | `Ctrl+O` | Pick the selected panel's model |
 | Any | Mouse wheel | Scroll the panel under the cursor |
 
 Multi-line pastes are kept intact: newlines show as `↵` in the input box and are sent as real newlines.
 
-Slash commands in the input box: `/clear` (reset all histories), `/exit` (quit).
+Slash commands in the input box: `/clear` (reset all histories), `/model [id]` (pick, or set, the selected panel's model), `/exit` (quit).
+
+**Model picker.** `m`, `Ctrl+O` or `/model` opens a list of every chat model the Bedrock endpoint serves (fetched live when the TUI starts). Type to narrow it: each word has to match the ID, name or vendor, so `opus 5` or `grok global` work. `↑`/`↓` select, `Enter` switches the panel, `Esc` cancels, and `●` marks the current model. If what you typed isn't a listed ID, the last row offers to use it as-is, so models the list hides, or a non-Bedrock provider's models, still work. `/model <id>` does the same without the list.
+
+The panel keeps its conversation and uses the new model from the next turn on. A panel whose provider isn't on Bedrock is moved to the Bedrock provider when you pick a listed Bedrock model; an unlisted ID stays with the panel's own provider. The model can't change while a panel is still answering.
 
 Mouse capture is enabled so the wheel scrolls panels natively. To text-select in the terminal (which mouse capture normally blocks), hold `Shift` (iTerm2, Terminal.app, most Linux terminals) or `Option`.
 
@@ -375,6 +402,7 @@ Mouse capture is enabled so the wheel scrolls panels natively. To text-select in
 |-----------------------------|---------------------------------------------------|
 | `-p, --providers <list>`    | Comma-separated providers (`claude,gpt,grok,gemini`) |
 | `-a, --all`                 | Query every enabled provider that has credentials |
+| `-m, --model <id>`          | Use this model ID for every selected provider     |
 | `-s, --system <prompt>`     | System prompt / persona                           |
 | `-r, --reasoning <level>`   | `none`, `low`, `medium`, `high`, or numeric budget |
 | `-w, --search`              | Enable web search tool                            |
@@ -405,6 +433,7 @@ src/
 ├── retry.rs               Transient-error classification and backoff
 ├── bedrock.rs             Direct AWS Bedrock Converse / ConverseStream client
 ├── bedrock_eventstream.rs AWS event-stream frame decoder
+├── bedrock_catalog.rs     Bedrock model catalog (picker, `ai models --bedrock`)
 ├── search.rs              SearchEngine: Tavily + Gemini grounding, fallback logic
 ├── markdown.rs            pulldown-cmark → ratatui styled lines
 ├── display.rs             CLI output: progressive streaming, multi-provider blocks, --raw
@@ -413,6 +442,7 @@ src/
 ├── sessions.rs            Saved chat sessions (/save, /load, --continue)
 ├── sessions_cmd.rs        `ai sessions`: table/JSON listing for scripts and other tools
 ├── ui.rs                  Ratatui TUI — interactive side-by-side chat panels
+├── ui_picker.rs           The TUI's model picker popup
 ├── term.rs                Terminal guard for the full-screen UIs
 ├── diag.rs                Diagnostics held back while a full-screen UI is up
 ├── models.rs              OpenRouter model listing

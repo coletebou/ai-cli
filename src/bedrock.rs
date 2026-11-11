@@ -150,7 +150,7 @@ impl BedrockClient {
         Ok(BedrockOutcome {
             text: assistant_text,
             tool_calls,
-            input_tokens: parsed.usage.as_ref().and_then(|u| u.input_tokens),
+            input_tokens: parsed.usage.as_ref().and_then(ConverseUsage::total_input),
             output_tokens: parsed.usage.as_ref().and_then(|u| u.output_tokens),
             stop_reason: parsed.stop_reason,
         })
@@ -225,6 +225,64 @@ impl BedrockClient {
         }
         Ok(())
     }
+
+    /// GET a path on the Bedrock *control plane* of this client's region
+    /// (`bedrock.<region>…` rather than `bedrock-runtime.<region>…`), with
+    /// the same bearer token, and parse the JSON body. Used for the model
+    /// catalog (`/foundation-models`, `/inference-profiles`).
+    pub async fn control_plane_get(&self, path_and_query: &str) -> Result<Value> {
+        let Some(host) = control_plane_host(&self.host) else {
+            bail!(
+                "can't derive the Bedrock control-plane endpoint from {}",
+                self.host
+            );
+        };
+        let url = format!("{}{}", host, path_and_query);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.auth_token)
+            // The catalog is small; don't let a stalled endpoint hang the
+            // model picker for the 300s read timeout.
+            .timeout(std::time::Duration::from_secs(20))
+            .send()
+            .await
+            .with_context(|| format!("GET {}", url))?;
+        if !resp.status().is_success() {
+            return Err(http_error("catalog", resp).await);
+        }
+        resp.json::<Value>()
+            .await
+            .with_context(|| format!("parsing JSON from {}", url))
+    }
+}
+
+/// The control-plane origin for a runtime origin: the label
+/// `bedrock-runtime[-fips]` becomes `bedrock[-fips]`, so
+/// `https://bedrock-runtime.us-east-1.amazonaws.com` →
+/// `https://bedrock.us-east-1.amazonaws.com`. `None` for hosts with no such
+/// label (a PrivateLink endpoint serves only the runtime API).
+fn control_plane_host(runtime_origin: &str) -> Option<String> {
+    let (scheme, host) = runtime_origin.split_once("://")?;
+    if host.split('.').next()?.starts_with("vpce-") {
+        return None;
+    }
+    let mut replaced = false;
+    let labels: Vec<&str> = host
+        .split('.')
+        .map(|label| match label {
+            "bedrock-runtime" if !replaced => {
+                replaced = true;
+                "bedrock"
+            }
+            "bedrock-runtime-fips" if !replaced => {
+                replaced = true;
+                "bedrock-fips"
+            }
+            other => other,
+        })
+        .collect();
+    replaced.then(|| format!("{}://{}", scheme, labels.join(".")))
 }
 
 /// Human-readable note for stop reasons that mean the answer is incomplete.
@@ -474,7 +532,11 @@ fn frame_to_events(frame: Frame) -> Result<Vec<BedrockStreamEvent>> {
         "metadata" => {
             let usage = &payload["usage"];
             Ok(vec![BedrockStreamEvent::Metadata {
-                input_tokens: usage["inputTokens"].as_i64().map(|v| v as i32),
+                input_tokens: total_input_tokens(
+                    usage["inputTokens"].as_i64(),
+                    usage["cacheReadInputTokens"].as_i64(),
+                    usage["cacheWriteInputTokens"].as_i64(),
+                ),
                 output_tokens: usage["outputTokens"].as_i64().map(|v| v as i32),
             }])
         }
@@ -636,8 +698,38 @@ struct ConverseToolUseIn {
 struct ConverseUsage {
     #[serde(default, rename = "inputTokens")]
     input_tokens: Option<i32>,
+    #[serde(default, rename = "cacheReadInputTokens")]
+    cache_read_input_tokens: Option<i32>,
+    #[serde(default, rename = "cacheWriteInputTokens")]
+    cache_write_input_tokens: Option<i32>,
     #[serde(default, rename = "outputTokens")]
     output_tokens: Option<i32>,
+}
+
+impl ConverseUsage {
+    fn total_input(&self) -> Option<i32> {
+        total_input_tokens(
+            self.input_tokens.map(i64::from),
+            self.cache_read_input_tokens.map(i64::from),
+            self.cache_write_input_tokens.map(i64::from),
+        )
+    }
+}
+
+/// The prompt's full size. Bedrock leaves cached tokens out of
+/// `inputTokens`: a model that caches prompts automatically (Grok does)
+/// reports `inputTokens: 0, cacheReadInputTokens: 38` for a 38-token prompt,
+/// which showed as "0 in". `None` only when Bedrock sent none of the three.
+fn total_input_tokens(
+    input: Option<i64>,
+    cache_read: Option<i64>,
+    cache_write: Option<i64>,
+) -> Option<i32> {
+    if input.is_none() && cache_read.is_none() && cache_write.is_none() {
+        return None;
+    }
+    let total = input.unwrap_or(0) + cache_read.unwrap_or(0) + cache_write.unwrap_or(0);
+    Some(i32::try_from(total).unwrap_or(i32::MAX))
 }
 
 fn build_converse_request(
@@ -857,6 +949,43 @@ fn convert_tool_content(content: &MessageContent) -> Result<Vec<BedrockContentOu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_prompt_tokens_count_as_input() {
+        let usage: ConverseUsage = serde_json::from_str(
+            r#"{"cacheReadInputTokens":38,"cacheWriteInputTokens":0,"inputTokens":0,"outputTokens":62}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.total_input(), Some(38));
+        let plain: ConverseUsage = serde_json::from_str(r#"{"inputTokens":13}"#).unwrap();
+        assert_eq!(plain.total_input(), Some(13));
+        let none: ConverseUsage = serde_json::from_str(r#"{"outputTokens":5}"#).unwrap();
+        assert_eq!(none.total_input(), None);
+        assert_eq!(total_input_tokens(Some(5), Some(10), Some(2)), Some(17));
+    }
+
+    #[test]
+    fn control_plane_host_swaps_the_runtime_label() {
+        assert_eq!(
+            control_plane_host("https://bedrock-runtime.us-east-1.amazonaws.com").as_deref(),
+            Some("https://bedrock.us-east-1.amazonaws.com")
+        );
+        assert_eq!(
+            control_plane_host("https://bedrock-runtime-fips.us-gov-west-1.amazonaws.com")
+                .as_deref(),
+            Some("https://bedrock-fips.us-gov-west-1.amazonaws.com")
+        );
+        assert_eq!(
+            control_plane_host("https://bedrock-runtime.cn-north-1.amazonaws.com.cn").as_deref(),
+            Some("https://bedrock.cn-north-1.amazonaws.com.cn")
+        );
+        // PrivateLink endpoints only serve the runtime API.
+        assert_eq!(
+            control_plane_host("https://vpce-0abc.bedrock-runtime.us-east-1.vpce.amazonaws.com"),
+            None
+        );
+        assert_eq!(control_plane_host("https://example.com"), None);
+    }
 
     #[test]
     fn detects_bedrock_url() {
@@ -1102,6 +1231,22 @@ mod tests {
                 .collect(),
             payload: payload.to_vec(),
         }
+    }
+
+    #[test]
+    fn stream_metadata_counts_cached_prompt_tokens() {
+        let events = frame_to_events(frame(
+            &[(":message-type", "event"), (":event-type", "metadata")],
+            br#"{"usage":{"inputTokens":0,"cacheReadInputTokens":38,"outputTokens":64}}"#,
+        ))
+        .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [BedrockStreamEvent::Metadata {
+                input_tokens: Some(38),
+                output_tokens: Some(64),
+            }]
+        ));
     }
 
     #[test]

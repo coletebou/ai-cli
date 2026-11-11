@@ -404,6 +404,11 @@ fn default_auth(route: &RouteDecision) -> AuthData {
 
 #[derive(Debug, Clone)]
 pub struct Provider {
+    /// The `[providers.<name>]` key this provider was built from. Routing
+    /// that depends on the provider rather than the model (a Bedrock-backed
+    /// provider serves any model ID, including one picked at runtime) looks
+    /// it up by this name.
+    pub name: String,
     pub display_name: String,
     pub model: String,
     pub color: Color,
@@ -433,6 +438,7 @@ impl Provider {
         let model = config.get_model(tier).to_string();
 
         Provider {
+            name: name.to_string(),
             display_name,
             model,
             color,
@@ -472,6 +478,11 @@ pub struct ProviderManager {
     /// `base_url` points at AWS Bedrock (genai cannot speak Bedrock's wire
     /// protocol, so those requests bypass genai entirely).
     bedrock_by_model: HashMap<String, Arc<BedrockClient>>,
+    /// Provider name -> Bedrock client, for the same providers. A Bedrock
+    /// provider serves every model its endpoint hosts, not only the ones its
+    /// config lists, so a model chosen at runtime (the TUI model picker)
+    /// routes through this map.
+    bedrock_by_provider: HashMap<String, Arc<BedrockClient>>,
 }
 
 impl ProviderManager {
@@ -541,7 +552,8 @@ impl ProviderManager {
         // AWS Bedrock. Every configured model for that provider gets mapped
         // to the same shared client so query_single() can dispatch by model.
         let mut bedrock_by_model: HashMap<String, Arc<BedrockClient>> = HashMap::new();
-        for p in config.providers.values() {
+        let mut bedrock_by_provider: HashMap<String, Arc<BedrockClient>> = HashMap::new();
+        for (name, p) in &config.providers {
             if !p.enabled {
                 continue;
             }
@@ -561,6 +573,7 @@ impl ProviderManager {
                 continue;
             };
             let shared = Arc::new(client);
+            bedrock_by_provider.insert(name.clone(), Arc::clone(&shared));
             for model in [
                 &p.default_model,
                 p.fast_model.as_deref().unwrap_or_default(),
@@ -578,12 +591,33 @@ impl ProviderManager {
             providers,
             model_tier,
             bedrock_by_model,
+            bedrock_by_provider,
         })
     }
 
-    /// If this model is served by Bedrock, return the client for it.
-    pub fn bedrock_for(&self, model: &str) -> Option<Arc<BedrockClient>> {
-        self.bedrock_by_model.get(model).cloned()
+    /// If this provider's requests are served by Bedrock, return the client
+    /// for them. A Bedrock-backed provider sends every model there; the
+    /// by-model lookup covers a provider that names a model some Bedrock
+    /// provider lists.
+    pub fn bedrock_for(&self, provider: &Provider) -> Option<Arc<BedrockClient>> {
+        self.bedrock_by_provider
+            .get(&provider.name)
+            .or_else(|| self.bedrock_by_model.get(&provider.model))
+            .cloned()
+    }
+
+    /// The Bedrock client of one `[providers.<name>]` entry, if it has one.
+    pub fn bedrock_client(&self, provider_name: &str) -> Option<Arc<BedrockClient>> {
+        self.bedrock_by_provider.get(provider_name).cloned()
+    }
+
+    /// Names of the providers that route to Bedrock (enabled, with a token
+    /// set), in panel display order.
+    pub fn bedrock_provider_names(&self) -> Vec<String> {
+        self.all_providers_in_display_order()
+            .into_iter()
+            .filter(|name| self.bedrock_by_provider.contains_key(name))
+            .collect()
     }
 
     /// Non-streaming Bedrock Converse invocation with retry on transient errors.

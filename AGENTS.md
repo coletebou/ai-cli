@@ -98,6 +98,11 @@ at the new `$XDG_CONFIG_HOME` path — a "wrong config" report can come from eit
 - **Bedrock routing is by provider, not model.** `ProviderManager::bedrock_for` sends every model of a
   Bedrock-backed provider (`Provider::name` is its config key) to Converse, so a model picked at
   runtime works without being listed in the config. Don't key new Bedrock dispatch on the model name.
+- **genai providers route by model name, so a runtime model is namespaced.** `ProviderManager::exec_chat*`
+  take the `Provider` and ask genai for `<provider>::<model>` when that provider doesn't list the
+  model (`ModelRouter::model_for`); `ModelRouter::route` honours the namespace and genai strips it
+  before sending. Pass the `Provider`, never a bare model string: an unlisted `openai.gpt-5.4` on a
+  Mantle provider otherwise falls to genai's Ollama guess and goes to localhost.
 - **No `eprintln!` while a full-screen UI is up.** Use `crate::diag::warn` for anything that can
   fire mid-request; it's held back while the TUI owns the terminal and flushed after.
 - **Never call rustyline's `FileHistory::save`** (or `append` on a file that doesn't exist yet,

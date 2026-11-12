@@ -291,9 +291,62 @@ impl ModelRouter {
         }
     }
 
+    /// The model ID to ask genai for so that the request reaches `provider`.
+    /// A model the provider lists itself routes by name (the owners table).
+    /// Any other one, e.g. picked at runtime with `-m` or the TUI model
+    /// picker, is sent as `<provider>::<model>` so [`Self::route`] keeps it
+    /// on that provider instead of guessing from the name (an unlisted
+    /// `openai.gpt-5.4` on an OpenAI-compatible endpoint would otherwise go
+    /// to genai's Ollama fallback on localhost). Every genai adapter strips
+    /// the namespace before the request goes out.
+    fn model_for(&self, provider: &str, model: &str) -> String {
+        let listed_here = self
+            .owners
+            .get(model)
+            .is_some_and(|o| o.provider == provider);
+        if listed_here || model.contains("::") || !self.config.providers.contains_key(provider) {
+            return model.to_string();
+        }
+        format!("{provider}::{model}")
+    }
+
+    /// The adapter for a model routed to a provider: the provider's fixed
+    /// one, else genai's guess from the bare model name.
+    fn adapter_for(provider_adapter: Option<AdapterKind>, name_guess: AdapterKind) -> AdapterKind {
+        match provider_adapter {
+            // genai maps GPT "pro"/"codex" names to the Responses API,
+            // and /chat/completions rejects those models. It's still the
+            // openai provider, so keep genai's more specific adapter.
+            Some(AdapterKind::OpenAI) if name_guess == AdapterKind::OpenAIResp => {
+                AdapterKind::OpenAIResp
+            }
+            Some(kind) => kind,
+            // No fixed adapter for this provider name: trust genai.
+            None => name_guess,
+        }
+    }
+
     /// Decide where `model_name` goes. `genai_guess` is the adapter genai
     /// inferred from the name alone (`AdapterKind::from_model`).
     fn route(&self, model_name: &str, genai_guess: AdapterKind) -> RouteDecision {
+        // 0. `<provider>::<model>` (from `model_for`) goes to that provider.
+        //    genai's own adapter namespaces that share a provider's name
+        //    (`openai::`, `anthropic::`, `xai::`, `ollama::`) reach the same
+        //    provider as before; others (`groq::`, `gemini::`) fall through.
+        if let Some((namespace, bare)) = model_name.split_once("::") {
+            if self.config.providers.contains_key(namespace) {
+                if namespace == OPENROUTER_PROVIDER {
+                    return self.openrouter_route();
+                }
+                // genai guessed from the namespaced string; for a provider
+                // name it doesn't know that's always its Ollama fallback.
+                let name_guess = AdapterKind::from_model(bare).unwrap_or(genai_guess);
+                let adapter_kind =
+                    Self::adapter_for(adapter_kind_for_provider(namespace), name_guess);
+                return self.provider_route(namespace, adapter_kind, genai_guess);
+            }
+        }
+
         // 1. A configured model goes to the provider that lists it. This runs
         //    before the OpenRouter slash heuristic below so a local vLLM's
         //    "Qwen/Qwen2.5-7B-Instruct" or an Ollama "hf.co/..." tag is never
@@ -302,17 +355,7 @@ impl ModelRouter {
             if owner.provider == OPENROUTER_PROVIDER {
                 return self.openrouter_route();
             }
-            let adapter_kind = match owner.adapter {
-                // genai maps GPT "pro"/"codex" names to the Responses API,
-                // and /chat/completions rejects those models. It's still the
-                // openai provider, so keep genai's more specific adapter.
-                Some(AdapterKind::OpenAI) if genai_guess == AdapterKind::OpenAIResp => {
-                    AdapterKind::OpenAIResp
-                }
-                Some(kind) => kind,
-                // No fixed adapter for this provider name: trust genai.
-                None => genai_guess,
-            };
+            let adapter_kind = Self::adapter_for(owner.adapter, genai_guess);
             return self.provider_route(&owner.provider, adapter_kind, genai_guess);
         }
 
@@ -471,6 +514,9 @@ fn ensure_trailing_slash(mut url: String) -> String {
 pub struct ProviderManager {
     client: Client,
     config: Arc<Config>,
+    /// The routing table the genai resolvers use, kept here so a request can
+    /// name its provider (see [`ModelRouter::model_for`]).
+    router: Arc<ModelRouter>,
     providers: HashMap<String, Provider>,
     #[allow(dead_code)]
     model_tier: ModelTier,
@@ -588,6 +634,7 @@ impl ProviderManager {
         Ok(ProviderManager {
             client,
             config,
+            router,
             providers,
             model_tier,
             bedrock_by_model,
@@ -787,11 +834,13 @@ impl ProviderManager {
 
     pub async fn exec_chat(
         &self,
-        model: &str,
+        provider: &Provider,
         messages: Vec<ChatMessage>,
         options: Option<&ChatOptions>,
         tools: Option<Vec<Tool>>,
     ) -> Result<ChatResponse> {
+        let model = provider.model.as_str();
+        let model_id = self.router.model_for(&provider.name, model);
         let cfg = self.retry_cfg();
         let mut attempt: u32 = 0;
         loop {
@@ -800,7 +849,7 @@ impl ProviderManager {
             if let Some(t) = &tools {
                 request = request.with_tools(t.clone());
             }
-            match self.client.exec_chat(model, request, options).await {
+            match self.client.exec_chat(&model_id, request, options).await {
                 Ok(r) => return Ok(r),
                 Err(e) => {
                     let err = anyhow::Error::from(e);
@@ -830,11 +879,13 @@ impl ProviderManager {
     /// has reached the caller.
     pub async fn exec_chat_stream(
         &self,
-        model: &str,
+        provider: &Provider,
         messages: Vec<ChatMessage>,
         options: Option<&ChatOptions>,
         tools: Option<Vec<Tool>>,
     ) -> Result<ChatEventStream> {
+        let model = provider.model.as_str();
+        let model_id = self.router.model_for(&provider.name, model);
         let cfg = self.retry_cfg();
         let mut attempt: u32 = 0;
         loop {
@@ -843,7 +894,11 @@ impl ProviderManager {
             if let Some(t) = &tools {
                 request = request.with_tools(t.clone());
             }
-            let err = match self.client.exec_chat_stream(model, request, options).await {
+            let err = match self
+                .client
+                .exec_chat_stream(&model_id, request, options)
+                .await
+            {
                 Ok(response) => match open_stream(response.stream).await {
                     Ok(stream) => return Ok(stream),
                     Err(e) => anyhow::Error::from(e),
@@ -1351,6 +1406,70 @@ mod tests {
             );
             assert_key(router.auth(&r), "ollama");
         }
+    }
+
+    #[test]
+    fn a_model_picked_at_runtime_stays_on_its_provider() {
+        // `-p gpt -m openai.gpt-5.4` against an OpenAI-compatible endpoint
+        // (Bedrock Mantle): the ID isn't listed anywhere and genai guesses
+        // Ollama from it, which used to send it to localhost:11434.
+        let mantle = "https://bedrock-mantle.us-gov-west-1.api.aws/v1/";
+        let mut gemma = routed_provider("google.gemma-4-31b", None, Some(mantle));
+        gemma.api_key = Some("gemma-key".into());
+        let router = router_for(vec![
+            (
+                "openai",
+                routed_provider("openai.gpt-5.6-terra", None, Some(mantle)),
+            ),
+            ("gemma", gemma),
+            ("ollama", routed_provider("qwen3:8b", None, None)),
+        ]);
+        let unlisted = "openai.gpt-5.4";
+        assert_eq!(
+            AdapterKind::from_model(unlisted).unwrap(),
+            AdapterKind::Ollama
+        );
+
+        let id = router.model_for("openai", unlisted);
+        assert_eq!(id, "openai::openai.gpt-5.4");
+        let r = route(&router, &id);
+        assert_eq!(r.provider_name.as_deref(), Some("openai"));
+        assert_eq!(r.adapter_kind, AdapterKind::OpenAI);
+        assert_eq!(r.endpoint_override.as_deref(), Some(mantle));
+        assert_key(router.auth(&r), "test-key");
+
+        // A provider name genai doesn't know: the adapter comes from the bare
+        // model name, not from genai's guess on the namespaced string.
+        let id = router.model_for("gemma", "gpt-5-pro");
+        assert_eq!(id, "gemma::gpt-5-pro");
+        let r = route(&router, &id);
+        assert_eq!(r.provider_name.as_deref(), Some("gemma"));
+        assert_eq!(r.adapter_kind, AdapterKind::OpenAIResp);
+        assert_eq!(r.endpoint_override.as_deref(), Some(mantle));
+        assert_key(router.auth(&r), "gemma-key");
+    }
+
+    #[test]
+    fn listed_and_already_namespaced_models_are_sent_unchanged() {
+        let router = router_for(vec![
+            ("openai", routed_provider("gpt-5-nano", None, None)),
+            ("anthropic", routed_provider("claude-opus-4-8", None, None)),
+        ]);
+        assert_eq!(router.model_for("openai", "gpt-5-nano"), "gpt-5-nano");
+        assert_eq!(router.model_for("openai", "groq::llama"), "groq::llama");
+        // Listed, but by another provider: namespace it to this one.
+        assert_eq!(
+            router.model_for("openai", "claude-opus-4-8"),
+            "openai::claude-opus-4-8"
+        );
+        // Not a configured provider: nothing to route to, leave it to genai.
+        assert_eq!(router.model_for("nope", "x"), "x");
+
+        // genai adapter namespaces that aren't provider names fall through to
+        // genai's own choice, as before.
+        let r = route(&router, "groq::llama-3.1-8b-instant");
+        assert_eq!(r.adapter_kind, AdapterKind::Groq);
+        assert_eq!(r.provider_name, None);
     }
 
     #[test]

@@ -169,6 +169,18 @@ A Bedrock provider takes any model ID its region serves, not just the ones in it
 
 Token counts include prompt tokens that Bedrock served from its cache, which it reports separately from `inputTokens`.
 
+**GovCloud and Mantle.** The same setup works in AWS GovCloud: point `base_url` at `https://bedrock-runtime.us-gov-west-1.amazonaws.com/` (or `us-gov-east-1`) and `api_key_env` at a GovCloud bearer token, and use the `us-gov.…` inference-profile IDs. Some models are entitled on Bedrock Mantle (an OpenAI-compatible endpoint) but not through Converse — in GovCloud that includes GPT-5.6 and Grok. Mantle goes through the normal OpenAI-compatible path, not Converse, so give such a provider a Mantle `base_url` and an `openai`/`xai` key (or any other name):
+
+```toml
+[providers.openai]
+api_key_env = "AWS_BEARER_TOKEN_BEDROCK_GOV"
+base_url = "https://bedrock-mantle.us-gov-west-1.api.aws/v1/"
+default_model = "openai.gpt-5.6-terra"
+aliases = ["gpt"]
+```
+
+`-m` and the TUI picker work on these providers too: a model the provider doesn't list is still sent to its endpoint. A listed model can still be refused (HTTP 403) when the account isn't entitled to it, so check a new model with a one-line query.
+
 ### Cost estimate
 
 When a response reports its token counts, the footer shows an estimated cost, e.g. `cost: $0.0042`, and a multi-provider run ends with a `total: $…` line. The estimate uses built-in list prices (USD per million tokens) for the default Anthropic, OpenAI, Google, and xAI models, matched on the model id regardless of date suffix (`claude-haiku-4-5-20251001`), Bedrock spelling (`us.anthropic.claude-opus-4-7`), or OpenRouter route (`anthropic/claude-opus-4-8`). Models without a known price show no cost.

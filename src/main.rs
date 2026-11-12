@@ -199,8 +199,8 @@ struct Cli {
     #[arg(short, long)]
     all: bool,
 
-    /// Model ID to use instead of each selected provider's configured one
-    /// (any ID a Bedrock provider's region serves; see `ai models --bedrock`)
+    /// Model ID to use instead of each selected provider's configured one;
+    /// it is sent to that provider's endpoint (see `ai models --bedrock`)
     #[arg(short = 'm', long, value_name = "ID")]
     model: Option<String>,
 

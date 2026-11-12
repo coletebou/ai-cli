@@ -327,7 +327,7 @@ pub async fn query_single(
     for iteration in 0..ctx.max_iterations.max(1) {
         let response = match manager
             .exec_chat(
-                &provider.model,
+                provider,
                 messages.clone(),
                 Some(&options),
                 ctx.tools.clone(),
@@ -977,7 +977,7 @@ pub async fn stream_with_messages(
             biased;
             _ = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
             r = manager.exec_chat_stream(
-                &provider.model,
+                provider,
                 messages.clone(),
                 Some(&options),
                 ctx.tools.clone(),

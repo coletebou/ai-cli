@@ -7,7 +7,8 @@ use colored::Color;
 use futures::{Stream, StreamExt};
 use genai::adapter::AdapterKind;
 use genai::chat::{
-    ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatStream, ChatStreamEvent, Tool,
+    ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatStream, ChatStreamEvent,
+    ReasoningEffort, Tool,
 };
 use genai::resolver::{AuthData, AuthResolver, Endpoint, ServiceTargetResolver};
 use genai::{Client, ClientConfig, ModelIden, ServiceTarget, WebConfig};
@@ -504,6 +505,15 @@ fn provider_web_config() -> WebConfig {
     }
 }
 
+/// True for a Bedrock Mantle endpoint (`bedrock-mantle.<region>.api.aws`),
+/// Bedrock's OpenAI-compatible gateway, which genai's adapters speak.
+fn is_mantle_base_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host.starts_with("bedrock-mantle.") && host.ends_with(".api.aws"))
+}
+
 fn ensure_trailing_slash(mut url: String) -> String {
     if !url.ends_with('/') {
         url.push('/');
@@ -828,6 +838,40 @@ impl ProviderManager {
         names
     }
 
+    /// Options for a tool-carrying request to Bedrock Mantle that didn't ask
+    /// for a reasoning effort: the same, with `reasoning_effort: none`.
+    /// Mantle runs GPT-5.6 with reasoning on by default, and its
+    /// `/v1/chat/completions` rejects function tools with any effort but
+    /// "none" (HTTP 400 "Function tools with reasoning_effort are not
+    /// supported"); `/v1/responses` isn't served for those models. Only
+    /// genai's OpenAI adapter sends the field, so other adapters (xAI, the
+    /// Ollama fallback) are unaffected. `None` leaves the options as they are.
+    fn mantle_tool_options(
+        &self,
+        provider: &Provider,
+        options: Option<&ChatOptions>,
+        has_tools: bool,
+    ) -> Option<ChatOptions> {
+        if !has_tools || options.is_some_and(|o| o.reasoning_effort.is_some()) {
+            return None;
+        }
+        let base_url = self
+            .config
+            .providers
+            .get(&provider.name)?
+            .base_url
+            .as_deref()?;
+        if !is_mantle_base_url(base_url) {
+            return None;
+        }
+        Some(
+            options
+                .cloned()
+                .unwrap_or_default()
+                .with_reasoning_effort(ReasoningEffort::None),
+        )
+    }
+
     fn retry_cfg(&self) -> &RetryConfig {
         &self.config.retry
     }
@@ -841,6 +885,8 @@ impl ProviderManager {
     ) -> Result<ChatResponse> {
         let model = provider.model.as_str();
         let model_id = self.router.model_for(&provider.name, model);
+        let mantle_options = self.mantle_tool_options(provider, options, tools.is_some());
+        let options = mantle_options.as_ref().or(options);
         let cfg = self.retry_cfg();
         let mut attempt: u32 = 0;
         loop {
@@ -886,6 +932,8 @@ impl ProviderManager {
     ) -> Result<ChatEventStream> {
         let model = provider.model.as_str();
         let model_id = self.router.model_for(&provider.name, model);
+        let mantle_options = self.mantle_tool_options(provider, options, tools.is_some());
+        let options = mantle_options.as_ref().or(options);
         let cfg = self.retry_cfg();
         let mut attempt: u32 = 0;
         loop {
@@ -1406,6 +1454,66 @@ mod tests {
             );
             assert_key(router.auth(&r), "ollama");
         }
+    }
+
+    #[test]
+    fn mantle_hosts_are_recognised_by_host_only() {
+        for url in [
+            "https://bedrock-mantle.us-gov-west-1.api.aws/v1/",
+            "https://BEDROCK-MANTLE.us-east-1.api.aws/openai/v1",
+        ] {
+            assert!(is_mantle_base_url(url), "{url}");
+        }
+        for url in [
+            "https://bedrock-runtime.us-gov-west-1.amazonaws.com/",
+            "https://api.openai.com/v1/",
+            "https://proxy.example.com/bedrock-mantle.us-east-1.api.aws/v1/",
+            "https://bedrock-mantle.us-east-1.api.aws.evil.example/v1/",
+            "not a url",
+        ] {
+            assert!(!is_mantle_base_url(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn tool_requests_to_mantle_turn_reasoning_off_unless_asked() {
+        let mantle = "https://bedrock-mantle.us-gov-west-1.api.aws/v1/";
+        let manager = ProviderManager::new(
+            config_with(vec![
+                (
+                    "openai",
+                    routed_provider("openai.gpt-5.6-terra", None, Some(mantle)),
+                ),
+                ("direct", routed_provider("gpt-5-nano", None, None)),
+            ]),
+            ModelTier::Fast,
+        )
+        .unwrap();
+        let on_mantle = &manager.providers["openai"];
+        let direct = &manager.providers["direct"];
+        let plain = ChatOptions::default().with_capture_usage(true);
+
+        let adjusted = manager
+            .mantle_tool_options(on_mantle, Some(&plain), true)
+            .expect("tools on Mantle get reasoning off");
+        assert!(matches!(
+            adjusted.reasoning_effort,
+            Some(ReasoningEffort::None)
+        ));
+        assert_eq!(adjusted.capture_usage, Some(true), "other options kept");
+        assert!(manager.mantle_tool_options(on_mantle, None, true).is_some());
+
+        // No tools, an explicit effort, or a non-Mantle endpoint: unchanged.
+        assert!(manager
+            .mantle_tool_options(on_mantle, Some(&plain), false)
+            .is_none());
+        let high = plain.clone().with_reasoning_effort(ReasoningEffort::High);
+        assert!(manager
+            .mantle_tool_options(on_mantle, Some(&high), true)
+            .is_none());
+        assert!(manager
+            .mantle_tool_options(direct, Some(&plain), true)
+            .is_none());
     }
 
     #[test]

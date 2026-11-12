@@ -179,7 +179,7 @@ default_model = "openai.gpt-5.6-terra"
 aliases = ["gpt"]
 ```
 
-`-m` and the TUI picker work on these providers too: a model the provider doesn't list is still sent to its endpoint. A listed model can still be refused (HTTP 403) when the account isn't entitled to it, so check a new model with a one-line query.
+`-m` and the TUI picker work on these providers too: a model the provider doesn't list is still sent to its endpoint. Mantle's chat API refuses function tools on GPT-5.6 unless reasoning is off, so a `-w` (web search) query to a Mantle provider sends `reasoning_effort: none` unless you pass `--reasoning`. A listed model can still be refused (HTTP 403) when the account isn't entitled to it, so check a new model with a one-line query.
 
 ### Cost estimate
 

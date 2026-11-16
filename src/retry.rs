@@ -52,7 +52,17 @@ fn classify_genai(err: &GenaiError) -> Retryable {
     match err {
         GenaiError::WebAdapterCall { webc_error, .. }
         | GenaiError::WebModelCall { webc_error, .. } => classify_webc(webc_error),
-        GenaiError::HttpError { status, .. } => classify_status(*status, None),
+        // genai 0.7 carries the response headers on failed streaming calls,
+        // so a streamed 429's `Retry-After` is honoured too.
+        GenaiError::HttpError {
+            status, headers, ..
+        } => {
+            let retry_after = headers
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_retry_after);
+            classify_status(*status, retry_after)
+        }
         // Streaming requests are sent lazily on the first poll of the stream,
         // so HTTP status and transport failures surface here, boxed, rather
         // than from `exec_chat_stream` itself.
@@ -61,7 +71,7 @@ fn classify_genai(err: &GenaiError) -> Retryable {
     }
 }
 
-/// Classify the boxed error inside a `WebStream`. genai 0.5 boxes an
+/// Classify the boxed error inside a `WebStream`. genai boxes an
 /// `HttpError` or a raw `reqwest::Error` here; `webc::Error` and the
 /// `source()` chain are handled too so a genai upgrade that wraps these
 /// differently doesn't silently turn retries off again.
@@ -191,7 +201,24 @@ mod tests {
             status: StatusCode::from_u16(code).unwrap(),
             canonical_reason: String::new(),
             body: String::new(),
+            headers: Box::default(),
         }
+    }
+
+    #[test]
+    fn streamed_http_error_honours_retry_after() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "7".parse().unwrap());
+        let err = GenaiError::HttpError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            canonical_reason: String::new(),
+            body: String::new(),
+            headers: Box::new(headers),
+        };
+        assert!(matches!(
+            classify(&anyhow::Error::from(err)),
+            Retryable::Yes { retry_after: Some(d) } if d == Duration::from_secs(7)
+        ));
     }
 
     fn web_stream_error(inner: GenaiError) -> GenaiError {

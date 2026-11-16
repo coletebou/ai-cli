@@ -229,7 +229,7 @@ fn default_base_url(kind: AdapterKind) -> Option<&'static str> {
         AdapterKind::OpenAI | AdapterKind::OpenAIResp => "https://api.openai.com/v1/",
         AdapterKind::Gemini => "https://generativelanguage.googleapis.com/v1beta/",
         AdapterKind::Xai => "https://api.x.ai/v1/",
-        AdapterKind::Ollama => "http://localhost:11434/v1/",
+        AdapterKind::Ollama => "http://localhost:11434/",
         _ => return None,
     })
 }
@@ -241,10 +241,13 @@ fn default_base_url(kind: AdapterKind) -> Option<&'static str> {
 /// `http://localhost:11434` would otherwise become
 /// `http://localhost:11434/chat/completions`, which Ollama answers with 404.
 fn normalize_base_url(url: &str, adapter_kind: AdapterKind) -> String {
+    // genai's Ollama adapter speaks Ollama's native API (`/api/chat`) from
+    // the server root, so an OpenAI-compatible `/v1` suffix (what genai 0.5
+    // wanted, and what many configs and docs still show) is dropped.
     if adapter_kind == AdapterKind::Ollama {
         if let Ok(mut parsed) = reqwest::Url::parse(url) {
-            if matches!(parsed.path(), "" | "/") {
-                parsed.set_path("/v1/");
+            if matches!(parsed.path(), "/v1" | "/v1/") {
+                parsed.set_path("/");
                 return parsed.to_string();
             }
         }
@@ -316,14 +319,22 @@ impl ModelRouter {
     /// one, else genai's guess from the bare model name.
     fn adapter_for(provider_adapter: Option<AdapterKind>, name_guess: AdapterKind) -> AdapterKind {
         match provider_adapter {
-            // genai maps GPT "pro"/"codex" names to the Responses API,
-            // and /chat/completions rejects those models. It's still the
-            // openai provider, so keep genai's more specific adapter.
+            // genai sends GPT-5 and later (and "pro"/"codex" names) to the
+            // Responses API: GPT-6.1 Sol only takes tools there, and
+            // /chat/completions rejects the pro/codex models. It's still the
+            // openai provider, so keep genai's more specific adapter
+            // (`provider_route` drops it again for non-OpenAI endpoints).
             Some(AdapterKind::OpenAI) if name_guess == AdapterKind::OpenAIResp => {
                 AdapterKind::OpenAIResp
             }
             Some(kind) => kind,
-            // No fixed adapter for this provider name: trust genai.
+            // No fixed adapter for this provider name: trust genai, except
+            // for its Ollama fallback. genai guesses Ollama for any name it
+            // doesn't know, and since 0.7 its Ollama adapter speaks Ollama's
+            // native API, so a custom provider's OpenAI-compatible server
+            // would get `/api/chat` and a 404. Such providers are
+            // OpenAI-compatible (as 0.5's Ollama adapter was on the wire).
+            None if name_guess == AdapterKind::Ollama => AdapterKind::OpenAI,
             None => name_guess,
         }
     }
@@ -391,6 +402,14 @@ impl ModelRouter {
             .providers
             .get(provider)
             .and_then(|p| p.base_url.as_deref());
+        // Proxies, Azure and self-hosted OpenAI-compatible servers often
+        // don't serve /responses: keep them on chat completions.
+        let adapter_kind =
+            if adapter_kind == AdapterKind::OpenAIResp && !is_openai_api_base_url(base_url) {
+                AdapterKind::OpenAI
+            } else {
+                adapter_kind
+            };
         let endpoint_override = match base_url {
             Some(url) => Some(normalize_base_url(url, adapter_kind)),
             // genai picked the default endpoint of the adapter it guessed; if
@@ -515,46 +534,17 @@ fn is_mantle_base_url(url: &str) -> bool {
         .is_some_and(|host| host.starts_with("bedrock-mantle.") && host.ends_with(".api.aws"))
 }
 
-/// True for an OpenAI model that, like Mantle's, rejects function tools on
-/// `/v1/chat/completions` unless `reasoning_effort` is "none": GPT-5.6 and
-/// later (`gpt-5.6-sol`, `gpt-6.1-sol`, ...). Older models are left alone,
-/// since some of them reject an explicit "none" instead (gpt-4.1 has no
-/// reasoning at all; gpt-5 and its mini/nano only go down to "minimal").
-/// Accepts the `openai/` (OpenRouter-style) and `openai.` (Bedrock) prefixes.
-///
-/// `gpt-6.1-sol` is the exception that this can't fix: it rejects "none"
-/// too (it only takes low/medium/high/xhigh), so function tools work for it
-/// only on `/v1/responses`, which genai 0.5's Responses adapter can't stream.
-fn openai_tools_need_reasoning_off(model: &str) -> bool {
-    let model = model.trim().to_ascii_lowercase();
-    let bare = model
-        .strip_prefix("openai/")
-        .or_else(|| model.strip_prefix("openai."))
-        .unwrap_or(&model);
-    let Some(version) = bare.strip_prefix("gpt-") else {
-        return false;
-    };
-    let number = |s: &str| -> Option<u32> {
-        let digits: String = s.chars().take_while(char::is_ascii_digit).collect();
-        digits.parse().ok()
-    };
-    let Some(major) = number(version) else {
-        return false;
-    };
-    let after_major = &version[major.to_string().len()..];
-    let minor = after_major.strip_prefix('.').and_then(number).unwrap_or(0);
-    (major, minor) >= (5, 6)
-}
-
-/// True when `base_url` is OpenAI's own API: unset (genai's default for the
-/// OpenAI adapter) or an `api.openai.com` URL.
+/// True when `base_url` serves OpenAI's Responses API: unset (genai's
+/// default, OpenAI's own API), `api.openai.com`, or Azure OpenAI
+/// (`*.openai.azure.com`). Other OpenAI-compatible hosts (proxies, vLLM,
+/// LiteLLM, Bedrock Mantle) are assumed to speak only chat completions.
 fn is_openai_api_base_url(base_url: Option<&str>) -> bool {
     match base_url {
         None => true,
         Some(url) => reqwest::Url::parse(url)
             .ok()
             .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
-            .is_some_and(|host| host == "api.openai.com"),
+            .is_some_and(|host| host == "api.openai.com" || host.ends_with(".openai.azure.com")),
     }
 }
 
@@ -662,7 +652,8 @@ impl ProviderManager {
             .with_config(client_config)
             .with_auth_resolver(auth_resolver)
             .with_service_target_resolver(target_resolver)
-            .build();
+            .build()
+            .context("failed to initialise the HTTP client")?;
 
         // Build provider map
         let mut providers = HashMap::new();
@@ -905,21 +896,18 @@ impl ProviderManager {
         names
     }
 
-    /// Options for a tool-carrying request that didn't ask for a reasoning
-    /// effort: the same, with `reasoning_effort: none`, when the endpoint
-    /// would otherwise reject the tools. Applies to:
+    /// Options for a tool-carrying request to Bedrock Mantle that didn't ask
+    /// for a reasoning effort: the same, with `reasoning_effort: none`.
+    /// Mantle runs GPT-5.6 with reasoning on by default, and its
+    /// `/v1/chat/completions` rejects function tools with any effort but
+    /// "none" (HTTP 400 "Function tools with reasoning_effort are not
+    /// supported"); `/v1/responses` isn't served for those models.
     ///
-    /// - Bedrock Mantle: it runs GPT-5.6 with reasoning on by default, and
-    ///   its `/v1/chat/completions` rejects function tools with any effort
-    ///   but "none" (HTTP 400 "Function tools with reasoning_effort are not
-    ///   supported"); `/v1/responses` isn't served for those models.
-    /// - OpenAI's own API for GPT-5.6 and later (`gpt-6.1-sol`, ...), which
-    ///   returns the same 400 on `/v1/chat/completions` (see
-    ///   [`openai_tools_need_reasoning_off`]).
-    ///
-    /// Only genai's OpenAI adapter sends the field, so other adapters (xAI,
-    /// the Ollama fallback) are unaffected. `None` leaves the options as
-    /// they are.
+    /// OpenAI's own API needs no such help: genai sends GPT-5 and later to
+    /// its Responses API, where tools work with reasoning on (and GPT-6.1
+    /// Sol, which rejects "none", only takes tools there). Only genai's
+    /// OpenAI adapter sends the field, so other adapters are unaffected.
+    /// `None` leaves the options as they are.
     fn tool_request_options(
         &self,
         provider: &Provider,
@@ -935,18 +923,17 @@ impl ProviderManager {
             .get(&provider.name)?
             .base_url
             .as_deref();
-        let on_mantle = base_url.is_some_and(is_mantle_base_url);
-        let on_openai = adapter_kind_for_provider(&provider.name) == Some(AdapterKind::OpenAI)
-            && is_openai_api_base_url(base_url)
-            && openai_tools_need_reasoning_off(&provider.model);
-        if !on_mantle && !on_openai {
+        // Only Mantle's OpenAI-compatible side: its Anthropic endpoint takes
+        // Claude's own thinking settings, and genai 0.7 turns this "none"
+        // into `thinking: disabled`, which Opus 5.5 rejects.
+        if base_url.and_then(mantle_adapter) != Some(AdapterKind::OpenAI) {
             return None;
         }
         Some(
             options
                 .cloned()
                 .unwrap_or_default()
-                .with_reasoning_effort(ReasoningEffort::None),
+                .with_reasoning_effort(ReasoningEffort::Zero),
         )
     }
 
@@ -1399,7 +1386,7 @@ mod tests {
             assert_eq!(r.adapter_kind, AdapterKind::Ollama, "{model}");
             assert_eq!(
                 r.endpoint_override.as_deref(),
-                Some("http://localhost:11434/v1/"),
+                Some("http://localhost:11434/"),
                 "{model}"
             );
             assert!(!r.via_openrouter, "{model}");
@@ -1431,15 +1418,16 @@ mod tests {
 
     #[test]
     fn models_configured_under_openrouter_route_there_even_when_genai_guesses_otherwise() {
-        // genai maps "qwen/qwen3-32b" to its Groq adapter (it's in Groq's
-        // model list); configured under openrouter, it must go to OpenRouter.
+        // genai guesses another adapter for "qwen/qwen3-32b" (Groq in 0.5,
+        // its Ollama fallback in 0.7); configured under openrouter, it must
+        // go to OpenRouter.
         let mut or = openrouter();
         or.smart_model = Some("qwen/qwen3-32b".to_string());
         or.enabled = false; // enabled only gates the unknown-model fallback
         let router = router_for(vec![("openrouter", or)]);
-        assert_eq!(
+        assert_ne!(
             AdapterKind::from_model("qwen/qwen3-32b").unwrap(),
-            AdapterKind::Groq
+            AdapterKind::OpenAI
         );
         let r = route(&router, "qwen/qwen3-32b");
         assert!(r.via_openrouter);
@@ -1478,23 +1466,25 @@ mod tests {
     }
 
     #[test]
-    fn ollama_base_url_gets_openai_compat_path() {
+    fn ollama_base_url_is_the_server_root() {
+        // genai 0.7's Ollama adapter speaks the native API (`/api/chat`)
+        // from the root, so an OpenAI-compat `/v1` suffix is dropped.
         let ollama = AdapterKind::Ollama;
         assert_eq!(
             normalize_base_url("http://localhost:11434", ollama),
-            "http://localhost:11434/v1/"
+            "http://localhost:11434/"
         );
         assert_eq!(
             normalize_base_url("http://localhost:11434/", ollama),
-            "http://localhost:11434/v1/"
+            "http://localhost:11434/"
         );
         assert_eq!(
             normalize_base_url("http://localhost:11434/v1", ollama),
-            "http://localhost:11434/v1/"
+            "http://localhost:11434/"
         );
         assert_eq!(
             normalize_base_url("http://gpu-box:11434/v1/", ollama),
-            "http://gpu-box:11434/v1/"
+            "http://gpu-box:11434/"
         );
         // An explicit path is the user's choice; only the slash is added.
         assert_eq!(
@@ -1527,7 +1517,7 @@ mod tests {
             assert_eq!(r.adapter_kind, AdapterKind::Ollama, "{model}");
             assert_eq!(
                 r.endpoint_override.as_deref(),
-                Some("http://localhost:11434/v1/"),
+                Some("http://localhost:11434/"),
                 "{model}"
             );
             assert_key(router.auth(&r), "ollama");
@@ -1583,78 +1573,56 @@ mod tests {
     }
 
     #[test]
-    fn openai_reasoning_off_starts_at_gpt_5_6() {
-        for model in [
-            "gpt-5.6-sol",
-            "gpt-6.1-sol",
-            "gpt-6-sol",
-            "GPT-6.1-terra",
-            "openai/gpt-6.1-sol",
-            "openai.gpt-5.6-terra",
-            "gpt-5.10",
-        ] {
-            assert!(openai_tools_need_reasoning_off(model), "{model}");
-        }
-        for model in [
-            "gpt-5.5",
-            "gpt-5",
-            "gpt-5-nano",
-            "gpt-4.1",
-            "gpt-4o",
-            "o3",
-            "gpt-",
-            "claude-opus-5-5",
-        ] {
-            assert!(!openai_tools_need_reasoning_off(model), "{model}");
-        }
+    fn custom_providers_are_openai_compatible_not_genais_ollama_guess() {
+        let router = router_for(vec![(
+            "together",
+            routed_provider(
+                "meta-llama/Llama-3.3-70B",
+                None,
+                Some("https://api.together.xyz/v1"),
+            ),
+        )]);
+        let r = route(&router, "meta-llama/Llama-3.3-70B");
+        assert_eq!(r.provider_name.as_deref(), Some("together"));
+        assert_eq!(r.adapter_kind, AdapterKind::OpenAI);
+        assert_eq!(
+            r.endpoint_override.as_deref(),
+            Some("https://api.together.xyz/v1/")
+        );
+        assert!(is_openai_api_base_url(Some(
+            "https://my-res.openai.azure.com/openai/v1/"
+        )));
     }
 
     #[test]
-    fn tool_requests_to_openai_gpt_6_turn_reasoning_off() {
+    fn openai_api_gpt_models_use_responses_with_reasoning_left_alone() {
+        // genai 0.7 sends GPT-5+ to the Responses API, where tools work with
+        // reasoning on, so tool requests there are not touched.
         let manager = ProviderManager::new(
-            config_with(vec![
-                ("openai", routed_provider("gpt-6.1-sol", None, None)),
-                ("legacy", routed_provider("gpt-4.1", None, None)),
-            ]),
+            config_with(vec![("openai", routed_provider("gpt-6.1-sol", None, None))]),
             ModelTier::Fast,
         )
         .unwrap();
-        let plain = ChatOptions::default();
         let sol = &manager.providers["openai"];
-        let adjusted = manager
-            .tool_request_options(sol, Some(&plain), true)
-            .expect("GPT-6.1 Sol on OpenAI's API gets reasoning off for tools");
-        assert!(matches!(
-            adjusted.reasoning_effort,
-            Some(ReasoningEffort::None)
-        ));
-        // An explicit -r is respected, and plain chat is untouched.
-        let high = plain.clone().with_reasoning_effort(ReasoningEffort::High);
         assert!(manager
-            .tool_request_options(sol, Some(&high), true)
+            .tool_request_options(sol, Some(&ChatOptions::default()), true)
             .is_none());
-        assert!(manager
-            .tool_request_options(sol, Some(&plain), false)
-            .is_none());
-        // A provider that isn't the `openai` adapter keeps the old behaviour.
-        let legacy = &manager.providers["legacy"];
-        assert!(manager
-            .tool_request_options(legacy, Some(&plain), true)
-            .is_none());
+        let router = router_for(vec![("openai", routed_provider("gpt-6.1-sol", None, None))]);
+        assert_eq!(
+            route(&router, "gpt-6.1-sol").adapter_kind,
+            AdapterKind::OpenAIResp
+        );
 
         // The `openai` provider pointed at someone else's endpoint (a proxy,
-        // Azure) is left alone: we don't know that server's rules.
-        let proxied = ProviderManager::new(
-            config_with(vec![(
-                "openai",
-                routed_provider("gpt-6.1-sol", None, Some("https://proxy.example.com/v1/")),
-            )]),
-            ModelTier::Fast,
-        )
-        .unwrap();
-        assert!(proxied
-            .tool_request_options(&proxied.providers["openai"], Some(&plain), true)
-            .is_none());
+        // Azure, vLLM) stays on chat completions.
+        let router = router_for(vec![(
+            "openai",
+            routed_provider("gpt-6.1-sol", None, Some("https://proxy.example.com/v1/")),
+        )]);
+        assert_eq!(
+            route(&router, "gpt-6.1-sol").adapter_kind,
+            AdapterKind::OpenAI
+        );
         assert!(is_openai_api_base_url(Some("https://api.openai.com/v1/")));
         assert!(!is_openai_api_base_url(Some(
             "https://api.openai.com.evil.example/v1/"
@@ -1684,12 +1652,29 @@ mod tests {
             .expect("tools on Mantle get reasoning off");
         assert!(matches!(
             adjusted.reasoning_effort,
-            Some(ReasoningEffort::None)
+            Some(ReasoningEffort::Zero)
         ));
         assert_eq!(adjusted.capture_usage, Some(true), "other options kept");
         assert!(manager
             .tool_request_options(on_mantle, None, true)
             .is_some());
+
+        // Claude on Mantle's Anthropic endpoint keeps its own thinking.
+        let claude = ProviderManager::new(
+            config_with(vec![(
+                "anthropic",
+                routed_provider(
+                    "anthropic.claude-opus-5-5",
+                    None,
+                    Some("https://bedrock-mantle.us-gov-west-1.api.aws/anthropic/v1/"),
+                ),
+            )]),
+            ModelTier::Fast,
+        )
+        .unwrap();
+        assert!(claude
+            .tool_request_options(&claude.providers["anthropic"], Some(&plain), true)
+            .is_none());
 
         // No tools, an explicit effort, or a non-Mantle endpoint: unchanged.
         assert!(manager
@@ -1736,11 +1721,11 @@ mod tests {
 
         // A provider name genai doesn't know: the adapter comes from the bare
         // model name, not from genai's guess on the namespaced string.
-        let id = router.model_for("gemma", "gpt-5-pro");
-        assert_eq!(id, "gemma::gpt-5-pro");
+        let id = router.model_for("gemma", "claude-haiku-4-5");
+        assert_eq!(id, "gemma::claude-haiku-4-5");
         let r = route(&router, &id);
         assert_eq!(r.provider_name.as_deref(), Some("gemma"));
-        assert_eq!(r.adapter_kind, AdapterKind::OpenAIResp);
+        assert_eq!(r.adapter_kind, AdapterKind::Anthropic);
         assert_eq!(r.endpoint_override.as_deref(), Some(mantle));
         assert_key(router.auth(&r), "gemma-key");
     }
@@ -1780,8 +1765,9 @@ mod tests {
         // genai's default endpoint for OpenAIResp is already OpenAI's.
         assert_eq!(r.endpoint_override, None);
 
+        // genai 0.7 sends every GPT-5+ model to the Responses API.
         let r = route(&router, "gpt-5-nano");
-        assert_eq!(r.adapter_kind, AdapterKind::OpenAI);
+        assert_eq!(r.adapter_kind, AdapterKind::OpenAIResp);
 
         // Unconfigured Responses-API models still use the openai provider's settings.
         let r = route(&router, "gpt-5.1-codex");
@@ -1837,7 +1823,7 @@ mod tests {
     async fn default_base_urls_match_genai() {
         // default_base_url() mirrors genai's crate-private endpoint table; a
         // resolver-less client exposes those defaults.
-        let client = Client::default();
+        let client = Client::new().unwrap();
         for model in [
             "claude-haiku-4-5",
             "gpt-5-nano",
@@ -1889,7 +1875,9 @@ mod tests {
             .resolve_service_target("gpt-5-pro")
             .await
             .unwrap();
-        assert_eq!(target.model.adapter_kind, AdapterKind::OpenAIResp);
+        // genai picks the Responses API for it, but a local OpenAI-compatible
+        // server isn't OpenAI's API, so it stays on chat completions.
+        assert_eq!(target.model.adapter_kind, AdapterKind::OpenAI);
         assert_eq!(target.endpoint.base_url(), "http://localhost:8000/v1/");
 
         let target = manager
@@ -1898,7 +1886,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(target.model.adapter_kind, AdapterKind::Ollama);
-        assert_eq!(target.endpoint.base_url(), "http://localhost:11434/v1/");
+        assert_eq!(target.endpoint.base_url(), "http://localhost:11434/");
 
         let target = manager
             .client

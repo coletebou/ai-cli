@@ -14,7 +14,7 @@ $ ai -w "latest release of tokio?"          # with web search
 - **One CLI, many providers.** Unified interface over Anthropic, OpenAI, Google, xAI, and OpenRouter via the [`genai`](https://crates.io/crates/genai) crate.
 - **Side-by-side TUI.** `-t` splits the terminal into per-provider panels with proper markdown rendering. Interactive by default: type follow-ups, scroll with the mouse wheel, cancel with Ctrl+C.
 - **Streaming by default.** Tokens appear as they arrive; no waiting for the full response.
-- **Web search tool use.** `-w` exposes a `web_search` tool to any model — backed by Gemini (Google Search grounding), Exa or Tavily, with automatic fallback.
+- **Web search tool use.** `-w` exposes a `search_web` tool to any model — backed by Gemini (Google Search grounding), Exa or Tavily, with automatic fallback.
 - **Interactive chat.** `-i` keeps conversation history so you can ask follow-ups. It supports multi-line input, `@file` references and input history that persists across sessions. Chats can be saved, reloaded and resumed with `-i --continue`. `/clear`, `/history`, `/export`, `/save`, `/load`, `/sessions`, `/help` built in.
 - **Config-driven.** Edit `~/.config/ai-cli/config.toml` or run `ai config` for a TUI editor.
 - **Reasoning control.** `-r low|medium|high|<budget>` for models that support it.
@@ -483,7 +483,7 @@ src/
 
 **Streaming:** per-provider `tokio::spawn` tasks emit `StreamEvent`s through an `mpsc` channel that the display layer consumes. A single provider renders progressively as its markdown arrives; with several, each prints as soon as it finishes.
 
-**Tool use:** when `--search` is set, the model gets a `web_search` tool. The query loop runs up to `max_iterations` turns, executing tool calls and feeding results back until the model returns a final answer.
+**Tool use:** when `--search` is set, the model gets a `search_web` tool (not `web_search`, which genai turns into the provider's own built-in search). The query loop runs up to `max_iterations` turns, executing tool calls and feeding results back until the model returns a final answer.
 
 ## Development
 

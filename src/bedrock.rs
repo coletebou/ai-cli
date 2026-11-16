@@ -796,7 +796,7 @@ fn build_converse_request(
                     .iter()
                     .map(|t| BedrockToolSpec {
                         tool_spec: BedrockToolSpecInner {
-                            name: t.name.clone(),
+                            name: t.name.as_str().to_string(),
                             description: t.description.clone(),
                             input_schema: BedrockInputSchema {
                                 json: t

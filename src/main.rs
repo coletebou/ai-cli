@@ -426,18 +426,20 @@ fn select_mode(cli: &Cli, config_tui: bool, stdout_is_terminal: bool) -> Mode {
 /// fallback to medium.
 fn parse_reasoning(value: &str) -> Result<(ReasoningEffort, String)> {
     let parsed = match value.to_lowercase().as_str() {
-        "none" | "off" | "0" => (ReasoningEffort::None, "none".to_string()),
+        "none" | "off" | "0" => (ReasoningEffort::Zero, "none".to_string()),
         "low" | "l" | "1" => (ReasoningEffort::Low, "low".to_string()),
         "medium" | "med" | "m" | "2" => (ReasoningEffort::Medium, "medium".to_string()),
         "high" | "h" | "3" => (ReasoningEffort::High, "high".to_string()),
+        "xhigh" | "x" | "4" => (ReasoningEffort::XHigh, "xhigh".to_string()),
+        "max" => (ReasoningEffort::Max, "max".to_string()),
         s => match s.parse::<u32>() {
             Ok(budget) => (
                 ReasoningEffort::Budget(budget),
                 format!("budget {}", budget),
             ),
             Err(_) => anyhow::bail!(
-                "unknown reasoning level '{}': use none, low, medium, high, or a token budget \
-                 (a number; 0-3 are shorthand for none..high)",
+                "unknown reasoning level '{}': use none, low, medium, high, xhigh, max, or a \
+                 token budget (a number; 0-4 are shorthand for none..xhigh)",
                 value
             ),
         },

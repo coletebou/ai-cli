@@ -19,7 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 # AI Provider Client
-genai = "0.5"
+genai = "0.7.5"
 
 # TUI. `unstable-rendered-line-info` exposes Paragraph::line_count, the only
 # accurate way to know how many rows word-wrapped text occupies (needed for

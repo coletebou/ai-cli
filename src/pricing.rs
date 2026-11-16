@@ -68,7 +68,11 @@ const BUILTIN_PRICES: &[(&str, f64, f64)] = &[
     ("claude-sonnet-4", 3.0, 15.0),
     ("claude-haiku-4-5", 1.0, 5.0),
     ("claude-3-5-haiku", 0.80, 4.0),
-    // OpenAI
+    // OpenAI (GPT-6.x and 5.6 Sol checked 2026-11-16)
+    ("gpt-6.1-sol", 2.0, 10.0),
+    ("gpt-6.1-terra", 1.0, 5.0),
+    ("gpt-6-sol", 2.0, 10.0),
+    ("gpt-5.6-sol", 4.0, 20.0),
     ("gpt-5.5-pro", 30.0, 180.0),
     ("gpt-5.5", 5.0, 30.0),
     ("gpt-5.4-pro", 30.0, 180.0),
@@ -80,7 +84,11 @@ const BUILTIN_PRICES: &[(&str, f64, f64)] = &[
     ("gpt-5", 1.25, 10.0),
     ("gpt-5-mini", 0.25, 2.0),
     ("gpt-5-nano", 0.05, 0.40),
-    // Google
+    // Google (Gemini 4 Hydrogen and 3.5 Flash-Lite checked 2026-11-16;
+    // Gemini 4 Carbon/Argon and 3.6/3.8 Flash are left out while their
+    // introductory prices change on a date this table can't express)
+    ("gemini-4-hydrogen", 1.50, 7.50),
+    ("gemini-3.5-flash-lite", 0.30, 2.50),
     ("gemini-3.5-flash", 1.50, 9.0),
     ("gemini-3.1-pro-preview", 2.0, 12.0),
     ("gemini-3.1-flash-lite", 0.25, 1.50),
@@ -287,6 +295,9 @@ mod tests {
         assert_eq!(builtin("claude-opus-4-8"), Some(price(5.0, 25.0)));
         assert_eq!(builtin("gpt-5-nano"), Some(price(0.05, 0.40)));
         assert_eq!(builtin("gpt-5.5"), Some(price(5.0, 30.0)));
+        assert_eq!(builtin("gpt-6.1-sol"), Some(price(2.0, 10.0)));
+        // OpenRouter routes of a listed model match too.
+        assert_eq!(builtin("openai/gpt-6.1-sol"), Some(price(2.0, 10.0)));
         assert_eq!(builtin("gemini-3.5-flash"), Some(price(1.50, 9.0)));
         assert_eq!(builtin("grok-4.3"), Some(price(1.25, 2.50)));
         // Matching is exact, never by prefix: these are different models.

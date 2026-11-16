@@ -3,10 +3,9 @@ name = "ai-cli"
 version = "0.1.0"
 edition = "2021"
 # Minimum supported Rust version, enforced by the `msrv` CI job. It is set
-# by the locked dependency graph, not by our own code: ratatui's
-# `instability` macro crate (via darling 0.23) and rustyline's `home`
-# dependency declare rust-version 1.88.
-rust-version = "1.88"
+# by the locked dependency graph, not by our own code: uuid 1.29 (pulled in
+# by genai 0.7) declares rust-version 1.89.
+rust-version = "1.89"
 description = "Multi-provider AI CLI - query Grok, ChatGPT, Gemini, Claude simultaneously"
 authors = ["Cole Tebou"]
 repository = "https://github.com/coletebou/ai-cli"
@@ -19,7 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 # AI Provider Client
-genai = "0.5"
+genai = "0.7.5"
 
 # TUI. `unstable-rendered-line-info` exposes Paragraph::line_count, the only
 # accurate way to know how many rows word-wrapped text occupies (needed for

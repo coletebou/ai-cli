@@ -733,8 +733,7 @@ mod tests {
         vec![
             ChatMessage::system("be brief"),
             ChatMessage::user("what's new?\n\n```text\npiped context\n```"),
-            // With thought signatures on the first call, genai prepends
-            // them as ThoughtSignature parts (Gemini needs them back).
+            // The call carries its thought signatures (Gemini needs them back).
             ChatMessage::from(vec![call]),
             ChatMessage::from(ToolResponse::new("call_1", "results: héllo wörld")),
             ChatMessage::assistant("Rust 1.90 shipped."),
@@ -794,12 +793,11 @@ mod tests {
             Some("what's new?\n\n```text\npiped context\n```")
         );
 
-        // Assistant tool-call turn: the thought signature part, then the
-        // call with its own copy of the signatures.
+        // Assistant tool-call turn: since genai 0.7 the signatures stay on
+        // their call rather than also being prepended as their own part.
         let parts = m[2].content.parts();
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0].as_thought_signature(), Some("sig-abc"));
-        let call = parts[1].as_tool_call().expect("tool call part");
+        assert_eq!(parts.len(), 1);
+        let call = parts[0].as_tool_call().expect("tool call part");
         assert_eq!(call.call_id, "call_1");
         assert_eq!(call.fn_name, "web_search");
         assert_eq!(

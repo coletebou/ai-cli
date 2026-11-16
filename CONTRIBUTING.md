@@ -32,7 +32,7 @@ CI runs clippy and the tests on Linux and macOS (Windows is a supported target t
 ### Platforms, MSRV and the lockfile
 
 - **Windows is a supported target.** (Its CI leg runs only when a Windows runner is configured, so check your change there by hand if it touches any of the following.) Paths (`@C:\path` references, the `%APPDATA%` config dir), Ctrl+C handling and rustyline's console backend all behave differently there. Use `std::path`/`dirs` rather than hand-built `/` paths, and if a test genuinely can't run on one platform, gate it with `#[cfg(...)]` and a comment saying why.
-- **Minimum supported Rust version** is the `rust-version` in `Cargo.toml` (currently 1.88, set by dependencies). The `msrv` CI job runs `cargo check --all-targets --locked` on exactly that toolchain. To check locally: `rustup toolchain install 1.88 && cargo +1.88 check --all-targets --locked`. If a dependency bump or a newer std API needs a newer Rust, raise `rust-version` in the same PR and say why.
+- **Minimum supported Rust version** is the `rust-version` in `Cargo.toml` (currently 1.89, set by dependencies). The `msrv` CI job runs `cargo check --all-targets --locked` on exactly that toolchain. To check locally: `rustup toolchain install 1.89 && cargo +1.89 check --all-targets --locked`. If a dependency bump or a newer std API needs a newer Rust, raise `rust-version` in the same PR and say why.
 - **CI builds with `--locked`.** If you change dependencies, commit the updated `Cargo.lock`.
 
 ## Project layout

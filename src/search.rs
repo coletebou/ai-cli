@@ -646,9 +646,20 @@ fn parse_gemini_grounding(json: &Value, query: &str) -> Result<Vec<SearchResult>
 // Tool definition & formatting (shared across providers)
 // =============================================================================
 
-/// The JSON schema + description for the `web_search` tool we expose to models.
+/// Name of the search tool we expose to models. Not `web_search`: genai
+/// (0.7+) turns a tool by that name into the provider's own built-in search
+/// (Anthropic's `web_search_20250305`, OpenAI's Responses `web_search`),
+/// which Bedrock Mantle rejects and which bypasses `[search]` and bills the
+/// provider's search fees instead.
+pub const WEB_SEARCH_TOOL: &str = "search_web";
+
+/// Earlier name of [`WEB_SEARCH_TOOL`], still accepted from a model, since a
+/// resumed chat's history can show calls under it.
+pub const LEGACY_WEB_SEARCH_TOOL: &str = "web_search";
+
+/// The JSON schema + description for the search tool we expose to models.
 pub fn web_search_tool() -> Tool {
-    Tool::new("web_search")
+    Tool::new(WEB_SEARCH_TOOL)
         .with_description(
             "Search the web for current information. Use this tool when you need up-to-date \
              information, current events, recent news, documentation, or information that might \
@@ -1179,5 +1190,13 @@ mod tests {
         assert!(err.is_timeout(), "{err:?}");
         assert!(start.elapsed() < Duration::from_secs(5));
         server.abort();
+    }
+
+    #[test]
+    fn search_tool_is_not_named_like_a_provider_built_in() {
+        // genai maps a tool named "web_search" to the provider's own search.
+        let tool = web_search_tool();
+        assert_eq!(tool.name.as_str(), "search_web");
+        assert_ne!(tool.name.as_str(), "web_search");
     }
 }

@@ -48,7 +48,7 @@ this file is what an agent needs on top of them. `CLAUDE.md` only imports this f
 | `chat.rs`, `sessions.rs` | interactive chat (`-i`) and `/save`, `/load`, `/sessions`, `--continue` |
 | `sessions_cmd.rs` | `ai sessions`: table/JSON session listing for scripts and other tools |
 | `context.rs` | `@file` and piped-stdin expansion into the prompt |
-| `search.rs` | the `web_search` tool (Gemini grounding / Exa / Tavily, fallback chain) |
+| `search.rs` | the `search_web` tool (Gemini grounding / Exa / Tavily, fallback chain) |
 | `pricing.rs` | the footer's cost estimate |
 | `models.rs` | `ai models` (OpenRouter listing) |
 | `doctor.rs` | `ai doctor` diagnostics |
@@ -71,7 +71,7 @@ cargo test test_name                                                 # one test
   `clippy-test-windows` (skipped until a personal Windows runner exists and repo variable
   `PERSONAL_WINDOWS_RUNNER` is `true`). There's no `workflow_dispatch` on `ci.yml` — trigger it by
   pushing a branch or opening a PR, then `gh run watch <id> --exit-status`.
-- MSRV locally: `rustup toolchain install 1.88 && cargo +1.88 check --all-targets --locked`. Raise
+- MSRV locally: `rustup toolchain install 1.89 && cargo +1.89 check --all-targets --locked`. Raise
   `rust-version` in the same PR as any dependency/std bump that needs it, and say why.
 - `.github/workflows/release.yml` is separate — it builds and publishes binaries on a `v*` tag push,
   or does a dry run (build + package + `install.sh` smoke test, nothing published) on
@@ -95,6 +95,11 @@ Linux and macOS, `%APPDATA%\ai-cli\config.toml` on Windows. On macOS, an existin
 at the new `$XDG_CONFIG_HOME` path — a "wrong config" report can come from either location.
 
 ## Known traps
+
+- **Never name a function tool `web_search`.** genai (0.7+) turns a tool by that name into the
+  provider's built-in search (Anthropic `web_search_20250305`, OpenAI Responses `web_search`):
+  Bedrock Mantle rejects it, and OpenAI silently searches on its own bill instead of `[search]`.
+  ai-cli's tool is `search::WEB_SEARCH_TOOL` (`search_web`).
 
 - **Bedrock routing is by provider, not model.** `ProviderManager::bedrock_for` sends every model of a
   Bedrock-backed provider (`Provider::name` is its config key) to Converse, so a model picked at

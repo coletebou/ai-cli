@@ -217,7 +217,8 @@ async fn execute_tool_call(
     provider_name: &str,
     tx: Option<&mpsc::Sender<StreamEvent>>,
 ) -> String {
-    if tool_call.fn_name != "web_search" {
+    let name = tool_call.fn_name.as_str();
+    if name != crate::search::WEB_SEARCH_TOOL && name != crate::search::LEGACY_WEB_SEARCH_TOOL {
         return format!("Error: unknown tool '{}'", tool_call.fn_name);
     }
 
@@ -1415,5 +1416,26 @@ mod tests {
             msg.contains("wire-protocol mismatch; check base_url"),
             "{msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn search_tool_answers_to_its_name_and_the_legacy_one() {
+        let ctx = QueryContext::new("q");
+        let call = |name: &str| ToolCall {
+            call_id: "c1".into(),
+            fn_name: name.into(),
+            fn_arguments: serde_json::json!({"query": "rust"}),
+            thought_signatures: None,
+        };
+        // No search client here, so an accepted call reports exactly that.
+        for name in [
+            crate::search::WEB_SEARCH_TOOL,
+            crate::search::LEGACY_WEB_SEARCH_TOOL,
+        ] {
+            let out = execute_tool_call(&call(name), &ctx, "P", None).await;
+            assert_eq!(out, "Error: search is not configured", "{name}");
+        }
+        let out = execute_tool_call(&call("get_weather"), &ctx, "P", None).await;
+        assert_eq!(out, "Error: unknown tool 'get_weather'");
     }
 }

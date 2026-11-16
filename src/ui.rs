@@ -1,10 +1,12 @@
 use crate::bedrock_catalog::BedrockModel;
+use crate::composer::{self, Layout as ComposerLayout};
 use crate::providers::{Provider, ProviderManager};
 use crate::query::{stream_with_messages, QueryContext, StreamEvent};
+use crate::selection::{self, Selection, Target};
 use crate::ui_picker::{CatalogState, ModelPicker, PickerAction, PickerItem};
 use anyhow::Result;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use genai::chat::{ChatMessage, ChatRole, ContentPart};
 use opentelemetry::trace::FutureExt;
@@ -25,7 +27,6 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 /// Three lines per wheel tick — single-line feels sluggish, half-page feels too
 /// jumpy. Matches most terminal pagers.
@@ -40,6 +41,9 @@ const PANEL_INPUT_CAPACITY: usize = 8;
 /// Tabs are drawn as this many spaces. ratatui counts `\t` as one column but
 /// terminals jump to the next tab stop, which garbles panel layout.
 const TAB_WIDTH: usize = 4;
+
+/// Rows the panels keep however tall the composer grows.
+const PANEL_MIN_HEIGHT: usize = 5;
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum Mode {
@@ -170,6 +174,23 @@ pub struct App {
     /// Byte offset of the cursor in `input_buffer`; always on a grapheme
     /// boundary.
     input_cursor: usize,
+    /// First composer row shown once the text outgrows the box.
+    input_scroll: usize,
+    /// Keep the cursor's row in view. Cleared while the user scrolls or
+    /// drag-selects the composer by mouse, set again by any key.
+    input_follow_cursor: bool,
+    /// Composer text width from the last draw, for Up/Down between rows.
+    input_width: usize,
+    /// Column Up/Down aim for, kept across a run of vertical moves so a short
+    /// row in between doesn't drag the cursor left for good.
+    input_goal_col: Option<usize>,
+    /// Composer text area from the last draw, for mouse hit-testing.
+    input_inner: Option<Rect>,
+    /// The mouse selection being dragged or last copied.
+    selection: Option<Selection>,
+    /// Where copied text goes. Tests swap in a recorder so they never touch
+    /// the real clipboard.
+    copy_to_clipboard: fn(&str),
     should_quit: bool,
     /// Ephemeral one-line hint (e.g., "busy", "cleared") shown in the footer
     /// until the next key event or turn completion.
@@ -206,6 +227,13 @@ impl App {
             mode: Mode::Insert,
             input_buffer: String::new(),
             input_cursor: 0,
+            input_scroll: 0,
+            input_follow_cursor: true,
+            input_width: 0,
+            input_goal_col: None,
+            input_inner: None,
+            selection: None,
+            copy_to_clipboard: crate::clipboard::copy,
             should_quit: false,
             status_message: None,
             current_turn_cancel: None,
@@ -571,6 +599,7 @@ impl App {
             p.scroll_offset = 0;
             p.auto_scroll = true;
         }
+        self.selection = None;
         self.current_turn_cancel = None;
         self.status_message = Some("cleared".into());
     }
@@ -668,6 +697,97 @@ impl App {
     fn clear_input(&mut self) {
         self.input_buffer.clear();
         self.input_cursor = 0;
+        self.input_scroll = 0;
+    }
+
+    /// The composer as last drawn (or unwrapped before the first draw).
+    fn composer_layout(&self) -> ComposerLayout {
+        let width = if self.input_width == 0 {
+            usize::MAX / 2
+        } else {
+            self.input_width
+        };
+        ComposerLayout::new(&self.input_buffer, width, TAB_WIDTH)
+    }
+
+    /// Up/Down in the composer: move one wrapped row, keeping the column.
+    fn cursor_vertical(&mut self, delta: isize) {
+        let layout = self.composer_layout();
+        let goal = *self
+            .input_goal_col
+            .get_or_insert_with(|| layout.position(self.input_cursor).1);
+        self.input_cursor = layout.vertical(self.input_cursor, delta, goal);
+    }
+
+    // ── Mouse selection ───────────────────────────────────────────────────
+
+    /// The region under screen cell (`x`, `y`) and the content point there.
+    fn hit(&self, x: u16, y: u16) -> Option<(Target, selection::Point)> {
+        let inside = |r: Rect| x >= r.x && x < r.right() && y >= r.y && y < r.bottom();
+        if let Some(inner) = self.input_inner.filter(|r| inside(panel_inner_outer(*r))) {
+            return Some((
+                Target::Composer,
+                self.content_point(Target::Composer, inner, x, y),
+            ));
+        }
+        let i = self.panel_at(x, y)?;
+        let inner = panel_inner(self.panels[i].area?);
+        Some((
+            Target::Panel(i),
+            self.content_point(Target::Panel(i), inner, x, y),
+        ))
+    }
+
+    /// Content point for screen cell (`x`, `y`), clamped into `inner` so a
+    /// drag past the edge of a region selects up to that edge.
+    fn content_point(&self, target: Target, inner: Rect, x: u16, y: u16) -> selection::Point {
+        let col = x.clamp(inner.x, inner.right().saturating_sub(1).max(inner.x)) - inner.x;
+        let row = y.clamp(inner.y, inner.bottom().saturating_sub(1).max(inner.y)) - inner.y;
+        let scroll = match target {
+            Target::Composer => self.input_scroll,
+            Target::Panel(i) => self.panels.get(i).map_or(0, |p| p.scroll_offset as usize),
+        };
+        (scroll + row as usize, col as usize)
+    }
+
+    fn target_inner(&self, target: Target) -> Option<Rect> {
+        match target {
+            Target::Composer => self.input_inner,
+            Target::Panel(i) => self.panels.get(i)?.area.map(panel_inner),
+        }
+    }
+
+    /// Scroll a region one row because a drag went past its top or bottom.
+    fn drag_scroll(&mut self, target: Target, delta: i32) {
+        match target {
+            Target::Panel(i) => self.scroll_by(i, delta),
+            Target::Composer => {
+                self.input_follow_cursor = false;
+                let rows = self.composer_layout().row_count();
+                let visible = self.input_inner.map_or(1, |r| r.height.max(1) as usize);
+                let max = rows.saturating_sub(visible);
+                self.input_scroll =
+                    (self.input_scroll as i64 + delta as i64).clamp(0, max as i64) as usize;
+            }
+        }
+    }
+
+    /// The text under the current selection, if it covers any.
+    fn selected_text(&self) -> Option<String> {
+        let sel = self.selection.filter(|s| s.dragged)?;
+        let (start, end) = sel.bounds();
+        let text = match sel.target {
+            Target::Composer => {
+                let (a, b) = self.composer_layout().selected_range(start, end)?;
+                self.input_buffer[a..b].to_string()
+            }
+            Target::Panel(i) => {
+                let panel = self.panels.get(i)?;
+                let width = panel.area.map(panel_inner)?.width;
+                selection::lines_text(&panel_lines(panel, self.show_tokens), width, start, end)
+            }
+        };
+        (!text.trim().is_empty()).then_some(text)
     }
 
     fn cursor_left(&mut self) {
@@ -732,60 +852,6 @@ fn format_duration(duration_ms: u64) -> String {
 
 fn expand_tabs(s: &str) -> String {
     s.replace('\t', &" ".repeat(TAB_WIDTH))
-}
-
-/// Single-line rendering of the input buffer: newlines from a multi-line
-/// paste show as `↵` (they're still sent as real newlines) and tabs as
-/// spaces.
-fn input_display(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            '\n' => "↵".to_string(),
-            '\t' => " ".repeat(TAB_WIDTH),
-            '\r' => String::new(),
-            c => c.to_string(),
-        })
-        .collect()
-}
-
-/// Visible text and cursor column for a one-row input box `width` columns
-/// wide: keeps the cursor visible with the text scrolling left under it once
-/// the line is longer than the box.
-///
-/// The window is sliced here rather than handed to `Paragraph::scroll`,
-/// whose offset is a `u16`: a paste wider than 65,535 columns would wrap the
-/// offset and show an unrelated part of the buffer while the cursor kept
-/// editing the end of it.
-fn input_viewport(buffer: &str, cursor: usize, width: usize) -> (String, u16) {
-    if width == 0 {
-        return (String::new(), 0);
-    }
-    let cursor_col = input_display(&buffer[..cursor]).width();
-    let offset = cursor_col.saturating_sub(width - 1);
-    let mut visible = String::new();
-    // Display column where the current grapheme starts.
-    let mut col = 0;
-    for g in input_display(buffer).graphemes(true) {
-        let end = col + g.width();
-        if end <= offset {
-            col = end;
-            continue;
-        }
-        if end - offset > width {
-            break;
-        }
-        if col < offset {
-            // A wide glyph straddling the left edge: blank its visible half
-            // so everything after it stays aligned with the cursor.
-            visible.push_str(&" ".repeat(end - offset));
-        } else {
-            visible.push_str(g);
-        }
-        col = end;
-    }
-    // `cursor_col - offset` is at most `width - 1`, and `width` came from a
-    // u16 area, so this never truncates.
-    (visible, (cursor_col - offset) as u16)
 }
 
 /// Render one completed turn or the in-flight streaming text as a block of
@@ -854,6 +920,7 @@ fn draw_panel(
     area: Rect,
     is_selected: bool,
     show_tokens: bool,
+    selection: Option<&Selection>,
 ) {
     panel.area = Some(area);
     let color = panel.get_color();
@@ -899,25 +966,7 @@ fn draw_panel(
         .title(Line::styled(title_text, title_style))
         .border_style(border_style);
 
-    // Compose lines from all completed turns plus the in-flight streaming text.
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for turn in &panel.turns {
-        lines.extend(lines_for_turn(turn, color, show_tokens));
-    }
-    if panel.is_streaming {
-        lines.push(Line::styled(
-            "assistant".to_string(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ));
-        if panel.current_text.is_empty() {
-            lines.push(Line::styled(
-                "  ▋".to_string(),
-                Style::default().fg(Color::DarkGray),
-            ));
-        } else {
-            lines.extend(crate::markdown::markdown_to_lines(&panel.current_text));
-        }
-    }
+    let lines = panel_lines(panel, show_tokens);
 
     let inner_width = area.width.saturating_sub(2);
     let inner_height = area.height.saturating_sub(2);
@@ -942,17 +991,79 @@ fn draw_panel(
     let paragraph = paragraph.block(block).scroll((panel.scroll_offset, 0));
 
     frame.render_widget(paragraph, area);
+    if let Some(sel) = selection {
+        selection::highlight(
+            frame.buffer_mut(),
+            panel_inner(area),
+            panel.scroll_offset as usize,
+            sel,
+        );
+    }
+}
+
+/// Every line a panel shows: its completed turns plus the in-flight
+/// streaming text. Selection copies from the same lines the panel draws.
+fn panel_lines(panel: &PanelState, show_tokens: bool) -> Vec<Line<'static>> {
+    let color = panel.get_color();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for turn in &panel.turns {
+        lines.extend(lines_for_turn(turn, color, show_tokens));
+    }
+    if panel.is_streaming {
+        lines.push(Line::styled(
+            "assistant".to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+        if panel.current_text.is_empty() {
+            lines.push(Line::styled(
+                "  ▋".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        } else {
+            lines.extend(crate::markdown::markdown_to_lines(&panel.current_text));
+        }
+    }
+    lines
+}
+
+/// The bordered box around an inner text area (the inverse of
+/// `panel_inner`).
+fn panel_inner_outer(inner: Rect) -> Rect {
+    Rect::new(
+        inner.x.saturating_sub(1),
+        inner.y.saturating_sub(1),
+        inner.width.saturating_add(2),
+        inner.height.saturating_add(2),
+    )
+}
+
+/// The text area inside a bordered box.
+fn panel_inner(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
 }
 
 fn draw_ui(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
 
+    // The composer wraps its text and grows a row at a time, up to
+    // MAX_ROWS (fewer on a short terminal, so the panels keep 5 rows), then
+    // scrolls. It spans the full width, so its text width is known up front.
+    let text_width = size.width.saturating_sub(2) as usize;
+    let layout = ComposerLayout::new(&app.input_buffer, text_width, TAB_WIDTH);
+    let room = (size.height as usize).saturating_sub(PANEL_MIN_HEIGHT + 1 + 2);
+    let visible_rows = layout.row_count().min(composer::MAX_ROWS).min(room).max(1);
+
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(5),    // panels
-            Constraint::Length(3), // input box
-            Constraint::Length(1), // footer
+            Constraint::Min(PANEL_MIN_HEIGHT as u16),    // panels
+            Constraint::Length(visible_rows as u16 + 2), // input box
+            Constraint::Length(1),                       // footer
         ])
         .split(size);
 
@@ -969,40 +1080,23 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             let is_selected = i == app.selected_panel;
             let area = panel_layout[i];
             let show_tokens = app.show_tokens;
-            draw_panel(frame, &mut app.panels[i], area, is_selected, show_tokens);
+            let sel = app
+                .selection
+                .as_ref()
+                .filter(|s| s.target == Target::Panel(i));
+            draw_panel(
+                frame,
+                &mut app.panels[i],
+                area,
+                is_selected,
+                show_tokens,
+                sel,
+            );
         }
     }
 
-    // Input box: one row that scrolls horizontally to keep the cursor in
-    // view. In Normal mode the buffer still displays but no cursor is drawn.
     let input_area = main_layout[1];
-    let (input_title, input_style) = match app.mode {
-        Mode::Insert => (
-            " INSERT ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Mode::Normal => (
-            " NORMAL ",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        ),
-    };
-    let input_block = Block::default()
-        .borders(Borders::ALL)
-        .title(input_title)
-        .border_style(input_style);
-    let inner_width = input_area.width.saturating_sub(2) as usize;
-    let (visible_input, cursor_col) =
-        input_viewport(&app.input_buffer, app.input_cursor, inner_width);
-    let input_paragraph = Paragraph::new(visible_input).block(input_block);
-    frame.render_widget(input_paragraph, input_area);
-
-    if app.mode == Mode::Insert {
-        frame.set_cursor_position((input_area.x + 1 + cursor_col, input_area.y + 1));
-    }
+    draw_composer(frame, app, &layout, input_area);
 
     // Footer: mode-appropriate keybind hint, or a transient status message.
     let help_text: String = if let Some(msg) = &app.status_message {
@@ -1010,11 +1104,11 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     } else {
         match app.mode {
             Mode::Insert => {
-                "Esc: normal | Enter: send | Ctrl+C: cancel turn | Ctrl+O: model | PgUp/PgDn: scroll | /model /clear /exit"
+                "Esc: normal | Enter: send | Alt+Enter: newline | Ctrl+C: cancel turn | Ctrl+O: model | PgUp/PgDn: scroll | drag: copy | /model /clear /exit"
                     .to_string()
             }
             Mode::Normal => {
-                "i: insert | h/l or ←/→: select panel | j/k or ↑/↓: scroll | m: model | q: quit"
+                "i: insert | h/l or ←/→: select panel | j/k or ↑/↓: scroll | m: model | drag: copy | q: quit"
                     .to_string()
             }
         }
@@ -1028,6 +1122,77 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
             .as_ref()
             .and_then(|name| app.catalogs.get(name));
         crate::ui_picker::draw(frame, picker, catalog);
+    }
+}
+
+/// Draw the input box: the rows of `layout` in view, a "rows shown / total"
+/// marker once it scrolls, the cursor in Insert mode and any selection.
+fn draw_composer(frame: &mut Frame, app: &mut App, layout: &ComposerLayout, area: Rect) {
+    let (title, border_style) = match app.mode {
+        Mode::Insert => (
+            " INSERT ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Mode::Normal => (
+            " NORMAL ",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+    };
+    let inner = panel_inner(area);
+    app.input_inner = Some(inner);
+    app.input_width = inner.width as usize;
+
+    let total = layout.row_count();
+    let visible = (inner.height as usize).clamp(1, total.max(1));
+    let (cursor_row, cursor_col) = layout.position(app.input_cursor);
+    if app.input_follow_cursor {
+        if cursor_row < app.input_scroll {
+            app.input_scroll = cursor_row;
+        } else if cursor_row >= app.input_scroll + visible {
+            app.input_scroll = cursor_row + 1 - visible;
+        }
+    }
+    app.input_scroll = app.input_scroll.min(total - visible);
+    let scroll = app.input_scroll;
+
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style);
+    if total > visible {
+        block = block.title(
+            Line::styled(
+                format!(" {}-{}/{} ", scroll + 1, scroll + visible, total),
+                Style::default().fg(Color::DarkGray),
+            )
+            .right_aligned(),
+        );
+    }
+    // Rows are sliced here rather than handed to `Paragraph::scroll`, whose
+    // u16 offset would wrap for a paste taller than 65,535 rows.
+    let rows: Vec<Line> = layout.rows[scroll..scroll + visible]
+        .iter()
+        .map(|r| Line::from(r.as_str()))
+        .collect();
+    frame.render_widget(Paragraph::new(rows).block(block), area);
+
+    if let Some(sel) = app
+        .selection
+        .as_ref()
+        .filter(|s| s.target == Target::Composer)
+    {
+        selection::highlight(frame.buffer_mut(), inner, scroll, sel);
+    }
+
+    let cursor_in_view = (scroll..scroll + visible).contains(&cursor_row);
+    if app.mode == Mode::Insert && cursor_in_view && inner.width > 0 {
+        let col = cursor_col.min(inner.width as usize - 1) as u16;
+        let row = (cursor_row - scroll) as u16;
+        frame.set_cursor_position((inner.x + col, inner.y + row));
     }
 }
 
@@ -1298,9 +1463,14 @@ async fn main_loop_step(
                 if let Some(picker) = app.picker.as_mut() {
                     picker.insert_text(&text);
                 } else if app.mode == Mode::Insert {
+                    app.selection = None;
+                    app.input_follow_cursor = true;
                     app.insert_text(&normalize_newlines(&text));
                 }
             }
+            // Content coordinates shift with the width: drop the selection
+            // rather than highlight the wrong text.
+            Event::Resize(..) => app.selection = None,
             _ => {}
         }
         *dirty = true;
@@ -1327,6 +1497,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     if app.picker.is_some() {
         app.handle_picker_key(key);
         return;
+    }
+    // Typing ends a selection and brings the cursor back into view.
+    app.selection = None;
+    app.input_follow_cursor = true;
+    let vertical = app.mode == Mode::Insert && matches!(key.code, KeyCode::Up | KeyCode::Down);
+    if !vertical {
+        app.input_goal_col = None;
     }
     match app.mode {
         Mode::Normal => handle_normal_key(app, key),
@@ -1381,6 +1558,17 @@ fn handle_insert_key(app: &mut App, key: KeyEvent) {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
         KeyCode::Esc => app.mode = Mode::Normal,
+        // A newline without sending. Shift+Enter only arrives as such on
+        // terminals that report modifiers on Enter; Alt+Enter and Ctrl+J
+        // work everywhere.
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+        {
+            app.insert_text("\n")
+        }
+        KeyCode::Char('j') if ctrl && !alt => app.insert_text("\n"),
         KeyCode::Enter => {
             let line = app.input_buffer.trim().to_string();
             if line.is_empty() {
@@ -1432,6 +1620,8 @@ fn handle_insert_key(app: &mut App, key: KeyEvent) {
         KeyCode::Delete => app.delete_forward(),
         KeyCode::Left => app.cursor_left(),
         KeyCode::Right => app.cursor_right(),
+        KeyCode::Up => app.cursor_vertical(-1),
+        KeyCode::Down => app.cursor_vertical(1),
         KeyCode::Home => app.input_cursor = 0,
         KeyCode::End => app.input_cursor = app.input_buffer.len(),
         KeyCode::PageUp => app.page_scroll(-1),
@@ -1472,7 +1662,80 @@ fn handle_insert_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
+    let (x, y) = (mouse.column, mouse.row);
     match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.selection = None;
+            let Some((target, at)) = app.hit(x, y) else {
+                return;
+            };
+            match target {
+                Target::Panel(i) => app.selected_panel = i,
+                Target::Composer => {
+                    // Click to place the cursor, like any text field.
+                    app.mode = Mode::Insert;
+                    app.input_goal_col = None;
+                    app.input_cursor = app.composer_layout().offset_at(at.0, at.1);
+                }
+            }
+            app.selection = Some(Selection::new(target, at));
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let Some(target) = app.selection.map(|s| s.target) else {
+                return;
+            };
+            let Some(inner) = app.target_inner(target) else {
+                return;
+            };
+            // Dragging past the top or bottom edge scrolls to select more.
+            if y < inner.y {
+                app.drag_scroll(target, -1);
+            } else if y >= inner.bottom() {
+                app.drag_scroll(target, 1);
+            } else if target == Target::Composer {
+                app.input_follow_cursor = false;
+            }
+            let head = app.content_point(target, inner, x, y);
+            if let Some(sel) = app.selection.as_mut() {
+                sel.dragged |= head != sel.anchor;
+                sel.head = head;
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            // Take the release point too, in case no drag event reported it.
+            if let Some(sel) = app.selection {
+                if let Some(inner) = app.target_inner(sel.target) {
+                    let head = app.content_point(sel.target, inner, x, y);
+                    if let Some(sel) = app.selection.as_mut() {
+                        sel.dragged |= head != sel.anchor;
+                        sel.head = head;
+                    }
+                }
+            }
+            match app.selected_text() {
+                Some(text) => {
+                    (app.copy_to_clipboard)(&text);
+                    let n = text.chars().count();
+                    app.status_message = Some(format!(
+                        "copied {} character{} to the clipboard",
+                        n,
+                        if n == 1 { "" } else { "s" }
+                    ));
+                }
+                // A click, or a drag over nothing: no selection to keep.
+                None => app.selection = None,
+            }
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            if app.hit(x, y).is_some_and(|(t, _)| t == Target::Composer) =>
+        {
+            let delta = if mouse.kind == MouseEventKind::ScrollUp {
+                -1
+            } else {
+                1
+            };
+            app.drag_scroll(Target::Composer, delta);
+        }
         MouseEventKind::ScrollUp => {
             let idx = app
                 .panel_at(mouse.column, mouse.row)
@@ -1790,7 +2053,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = Rect::new(0, 0, 12, 30);
-                draw_panel(f, &mut app.panels[0], area, true, false);
+                draw_panel(f, &mut app.panels[0], area, true, false, None);
             })
             .unwrap();
         // "you" + 4 wrapped rows + trailing blank line.
@@ -1839,42 +2102,311 @@ mod tests {
         assert_eq!(app.input_buffer, "");
     }
 
-    #[test]
-    fn long_input_scrolls_to_keep_cursor_visible() {
-        let text: String = ('a'..='z').chain('A'..='D').collect();
-        let (visible, col) = input_viewport(&text, text.len(), 20);
-        // Scrolled 11 columns: the tail plus a free cell for the cursor.
-        assert_eq!(visible, &text[11..]);
-        assert_eq!(col, 19);
-        let (visible, col) = input_viewport(&text, 0, 20);
-        assert_eq!((visible.as_str(), col), (&text[..20], 0));
+    thread_local! {
+        static COPIED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn record_copy(text: &str) {
+        COPIED.with(|c| c.borrow_mut().push(text.to_string()));
+    }
+
+    fn take_copied() -> Vec<String> {
+        COPIED.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+
+    /// Draw the whole UI on a `width` x `height` test terminal.
+    fn draw(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw_ui(f, app)).unwrap();
+        terminal
+    }
+
+    /// The composer's text rows as drawn, and its total height with borders.
+    fn composer_rows(terminal: &Terminal<TestBackend>, app: &App) -> (Vec<String>, u16) {
+        let inner = app.input_inner.expect("composer drawn");
+        let buf = terminal.backend().buffer();
+        let rows = (inner.y..inner.bottom())
+            .map(|y| {
+                (inner.x..inner.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        (rows, inner.height + 2)
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
     #[test]
-    fn input_wider_than_u16_shows_the_text_under_the_cursor() {
-        // A single-line paste wider than a u16 scroll offset can express.
-        let mut text = "x".repeat(70_000);
-        text.push_str("TAIL");
-        let (visible, col) = input_viewport(&text, text.len(), 20);
-        assert_eq!(visible, format!("{}TAIL", "x".repeat(15)));
-        assert_eq!(col, 19);
-    }
-
-    #[test]
-    fn wide_glyph_cut_by_the_left_edge_keeps_columns_aligned() {
-        // "漢" is two columns wide; scrolling by one column cuts it in half.
-        let text = "漢abcd";
-        let (visible, col) = input_viewport(text, text.len(), 6);
-        assert_eq!(visible, " abcd");
-        assert_eq!(col, 5);
-    }
-
-    #[test]
-    fn pasted_newlines_display_as_markers_but_are_kept() {
+    fn composer_grows_a_row_when_the_text_fills_it() {
+        // The reported bug: a full row must make the box taller and put the
+        // cursor at the start of the new row.
         let (mut app, _rxs) = app_with(1);
-        app.insert_text("fn main() {\n}\n");
-        assert_eq!(input_display(&app.input_buffer), "fn main() {↵}↵");
-        assert!(app.input_buffer.contains('\n'));
+        let mut t = draw(&mut app, 22, 20); // 20 text columns
+        assert_eq!(composer_rows(&t, &app).1, 3);
+        type_str(&mut app, &"a".repeat(20));
+        t.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let (rows, height) = composer_rows(&t, &app);
+        assert_eq!(height, 4);
+        assert_eq!(rows, ["a".repeat(20), String::new()]);
+        let inner = app.input_inner.unwrap();
+        t.backend_mut()
+            .assert_cursor_position((inner.x, inner.y + 1));
+        type_str(&mut app, "bc");
+        t.draw(|f| draw_ui(f, &mut app)).unwrap();
+        assert_eq!(composer_rows(&t, &app).0[1], "bc");
+    }
+
+    #[test]
+    fn composer_stops_growing_at_five_rows_and_scrolls() {
+        let (mut app, _rxs) = app_with(1);
+        draw(&mut app, 22, 30);
+        let text: String = (0..9).map(|i| format!("row{i}").repeat(5)).collect();
+        type_str(&mut app, &text); // nine full 20-column rows + the cursor row
+        let mut t = draw(&mut app, 22, 30);
+        let (rows, height) = composer_rows(&t, &app);
+        assert_eq!(height, 7, "5 text rows plus borders");
+        assert_eq!(rows[0], "row5".repeat(5));
+        assert_eq!(rows[4], "", "the cursor's empty row is in view");
+        // The marker says which rows are shown.
+        let buf = t.backend().buffer();
+        let top = app.input_inner.unwrap().y - 1;
+        let title: String = (0..22).map(|x| buf[(x, top)].symbol()).collect();
+        assert!(title.contains(" 6-10/10 "), "title: {title:?}");
+        // Up walks the cursor back and the view follows it.
+        for _ in 0..9 {
+            handle_key(&mut app, key(KeyCode::Up));
+        }
+        t.draw(|f| draw_ui(f, &mut app)).unwrap();
+        assert_eq!(app.input_cursor, 0);
+        assert_eq!(composer_rows(&t, &app).0[0], "row0".repeat(5));
+    }
+
+    #[test]
+    fn composer_leaves_the_panels_room_on_a_short_terminal() {
+        let (mut app, _rxs) = app_with(1);
+        draw(&mut app, 22, 10);
+        type_str(&mut app, &"x".repeat(200));
+        let t = draw(&mut app, 22, 10);
+        // 10 rows: 5 for panels, 1 footer, so the composer gets 4 (2 text).
+        assert_eq!(composer_rows(&t, &app).1, 4);
+        assert!(app.panels[0].area.unwrap().height >= 5);
+    }
+
+    #[test]
+    fn newlines_show_as_line_breaks_and_alt_enter_adds_one() {
+        let (mut app, _rxs) = app_with(1);
+        app.insert_text("fn main() {\n}");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        handle_key(&mut app, ctrl('j'));
+        type_str(&mut app, "x");
+        assert_eq!(app.input_buffer, "fn main() {\n}\n\nx");
+        let t = draw(&mut app, 30, 20);
+        assert_eq!(composer_rows(&t, &app).0, ["fn main() {", "}", "", "x"]);
+        assert!(app.panels[0].turns.is_empty(), "nothing was sent");
+    }
+
+    #[test]
+    fn up_and_down_keep_the_goal_column_across_short_rows() {
+        let (mut app, _rxs) = app_with(1);
+        app.insert_text("abcdefgh\nab\nabcdefgh");
+        draw(&mut app, 22, 20);
+        app.input_cursor = "abcdefgh\nab\nabcdef".len(); // row 2, col 6
+        handle_key(&mut app, key(KeyCode::Up));
+        assert_eq!(
+            app.input_cursor,
+            "abcdefgh\nab".len(),
+            "clamped to the short row"
+        );
+        handle_key(&mut app, key(KeyCode::Up));
+        assert_eq!(app.input_cursor, 6, "back at column 6");
+        handle_key(&mut app, key(KeyCode::Down));
+        handle_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.input_cursor, "abcdefgh\nab\nabcdef".len());
+    }
+
+    #[test]
+    fn clicking_the_composer_places_the_cursor() {
+        let (mut app, _rxs) = app_with(1);
+        app.copy_to_clipboard = record_copy;
+        app.insert_text("hello world");
+        app.mode = Mode::Normal;
+        draw(&mut app, 30, 20);
+        let inner = app.input_inner.unwrap();
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                inner.x + 3,
+                inner.y,
+            ),
+        );
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), inner.x + 3, inner.y),
+        );
+        assert_eq!(app.input_cursor, 3);
+        assert_eq!(app.mode, Mode::Insert);
+        assert!(app.selection.is_none(), "a click is not a selection");
+        assert!(take_copied().is_empty());
+    }
+
+    #[test]
+    fn dragging_in_a_panel_copies_the_text_and_highlights_it() {
+        let (mut app, _rxs) = app_with(2);
+        app.copy_to_clipboard = record_copy;
+        app.panels[1].turns.push(Turn {
+            kind: TurnKind::User,
+            text: "the quick brown fox jumps over the lazy dog".into(),
+        });
+        let mut t = draw(&mut app, 60, 20);
+        let inner = panel_inner(app.panels[1].area.unwrap());
+        // Row 0 is "you"; the question (indented two columns) wraps from
+        // row 1 at 28 columns, so column 6 is the "q" of "quick".
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                inner.x + 6,
+                inner.y + 1,
+            ),
+        );
+        assert_eq!(app.selected_panel, 1, "clicking a panel selects it");
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                inner.x + 10,
+                inner.y + 2,
+            ),
+        );
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                inner.x + 10,
+                inner.y + 2,
+            ),
+        );
+        let copied = take_copied();
+        assert_eq!(copied.len(), 1);
+        assert!(
+            copied[0].starts_with("quick brown fox jumps over"),
+            "soft-wrapped rows join into one line: {copied:?}"
+        );
+        assert!(!copied[0].contains('\n'));
+        assert!(app
+            .status_message
+            .as_deref()
+            .unwrap()
+            .starts_with("copied "));
+        t.draw(|f| draw_ui(f, &mut app)).unwrap();
+        let buf = t.backend().buffer();
+        assert!(buf[(inner.x + 6, inner.y + 1)]
+            .modifier
+            .contains(Modifier::REVERSED));
+        assert!(!buf[(inner.x + 5, inner.y + 1)]
+            .modifier
+            .contains(Modifier::REVERSED));
+        // The other panel is untouched.
+        let other = panel_inner(app.panels[0].area.unwrap());
+        assert!(!buf[(other.x + 6, other.y + 1)]
+            .modifier
+            .contains(Modifier::REVERSED));
+        // Typing clears the highlight.
+        type_str(&mut app, "x");
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn dragging_in_the_composer_copies_the_exact_buffer_text() {
+        let (mut app, _rxs) = app_with(1);
+        app.copy_to_clipboard = record_copy;
+        app.insert_text("line one\nline two");
+        draw(&mut app, 30, 20);
+        let inner = app.input_inner.unwrap();
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                inner.x + 5,
+                inner.y,
+            ),
+        );
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                inner.x + 3,
+                inner.y + 1,
+            ),
+        );
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                inner.x + 3,
+                inner.y + 1,
+            ),
+        );
+        assert_eq!(take_copied(), ["one\nline"]);
+        // A release with no drag before it still selects up to that point.
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), inner.x, inner.y),
+        );
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), inner.x + 3, inner.y),
+        );
+        assert_eq!(take_copied(), ["line"]);
+    }
+
+    #[test]
+    fn dragging_past_a_panel_edge_scrolls_it() {
+        let (mut app, _rxs) = app_with(1);
+        app.copy_to_clipboard = record_copy;
+        for i in 0..30 {
+            app.panels[0].turns.push(Turn {
+                kind: TurnKind::User,
+                text: format!("message {i}"),
+            });
+        }
+        draw(&mut app, 40, 20);
+        let inner = panel_inner(app.panels[0].area.unwrap());
+        let before = app.panels[0].scroll_offset;
+        assert!(before > 0, "pinned to the bottom");
+        handle_mouse(
+            &mut app,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                inner.x,
+                inner.bottom() - 1,
+            ),
+        );
+        for _ in 0..3 {
+            handle_mouse(
+                &mut app,
+                mouse(MouseEventKind::Drag(MouseButton::Left), inner.x + 5, 0),
+            );
+        }
+        assert_eq!(app.panels[0].scroll_offset, before - 3);
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), inner.x + 5, 0),
+        );
+        let copied = take_copied();
+        assert_eq!(copied.len(), 1);
+        assert!(copied[0].lines().count() > inner.height as usize);
     }
 
     #[test]

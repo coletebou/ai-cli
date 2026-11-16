@@ -589,10 +589,18 @@ fn print_sessions(tracker: &Tracker, now: u64) {
         );
     }
     let name_width = listing.sessions.iter().map(|s| s.name.len()).max();
+    // A TUI session shows its panels where a chat shows its model.
+    let label = |s: &sessions::SessionSummary| {
+        if s.is_tui() {
+            s.providers.join(", ")
+        } else {
+            s.model.clone()
+        }
+    };
     let model_width = listing
         .sessions
         .iter()
-        .map(|s| s.model.chars().count())
+        .map(|s| label(s).chars().count())
         .max();
     for s in &listing.sessions {
         let marker = if tracker.name() == Some(s.name.as_str()) {
@@ -608,7 +616,7 @@ fn print_sessions(tracker: &Tracker, now: u64) {
                 .bold(),
             sessions::format_age(s.updated, now),
             plural_turns(s.turns),
-            format!("{:<w$}", s.model, w = model_width.unwrap_or(0)).dimmed(),
+            format!("{:<w$}", label(s), w = model_width.unwrap_or(0)).dimmed(),
             s.preview.as_deref().unwrap_or(""),
         );
     }

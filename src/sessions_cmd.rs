@@ -33,10 +33,7 @@ struct SessionJson {
     /// RFC 3339, UTC.
     updated: String,
     turns: usize,
-    /// Always one entry today (a session is saved with a single provider),
-    /// kept as an array since a stable public shape should say "these are
-    /// the providers involved" without the reader having to change if a
-    /// session ever gets more than one.
+    /// One entry for a chat session; one per panel for a TUI session.
     providers: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
@@ -48,11 +45,12 @@ impl From<&SessionSummary> for SessionJson {
             name: s.name.clone(),
             updated: sessions::rfc3339_utc(s.updated),
             turns: s.turns,
-            providers: if s.provider.is_empty() {
-                Vec::new()
-            } else {
-                vec![s.provider.clone()]
-            },
+            providers: s
+                .providers
+                .iter()
+                .filter(|p| !p.is_empty())
+                .cloned()
+                .collect(),
             model: (!s.model.is_empty()).then(|| s.model.clone()),
         }
     }
@@ -121,6 +119,8 @@ fn table_lines(sessions: &[&SessionSummary], skipped: usize) -> Vec<String> {
     let name_width = sessions.iter().map(|s| s.name.len()).max().unwrap_or(0);
     for s in sessions {
         let model = match (s.provider.is_empty(), s.model.is_empty()) {
+            // A TUI session: its panels.
+            _ if s.is_tui() => s.providers.join(", "),
             (false, false) => format!("{}/{}", s.provider, s.model),
             (false, true) => s.provider.clone(),
             (true, false) => s.model.clone(),
@@ -191,6 +191,7 @@ mod tests {
             created: updated,
             updated,
             messages: vec![ChatMessage::user(user_text), ChatMessage::assistant("ok")],
+            panels: Vec::new(),
         }
     }
 
@@ -340,5 +341,28 @@ mod tests {
 
         let empty = SessionStore::new(test_dir("table-empty"));
         run(Some(&empty), false, DEFAULT_LIMIT).unwrap();
+    }
+
+    #[test]
+    fn tui_sessions_list_every_panel_provider() {
+        use crate::sessions::PanelSession;
+        let dir = test_dir("tui");
+        let store = SessionStore::new(&dir);
+        let mut tui = session("CLAUDE", "opus", 100, "hi");
+        tui.panels = ["CLAUDE", "CHATGPT"]
+            .iter()
+            .map(|p| PanelSession {
+                provider: p.to_string(),
+                name: p.to_lowercase(),
+                model: "m".into(),
+                messages: tui.messages.clone(),
+            })
+            .collect();
+        store.save("both", &tui).unwrap();
+        let listing = store.list().unwrap();
+        let json = SessionJson::from(&listing.sessions[0]);
+        assert_eq!(json.providers, ["CLAUDE", "CHATGPT"]);
+        let lines = table_lines(&listing.sessions.iter().collect::<Vec<_>>(), 0);
+        assert!(lines[0].contains("CLAUDE, CHATGPT"), "{lines:?}");
     }
 }

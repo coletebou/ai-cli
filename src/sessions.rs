@@ -1,10 +1,13 @@
-//! Saved chat sessions for interactive mode: `/save`, `/load`, `/sessions`
-//! and `ai -i --continue`.
+//! Saved chat sessions: `/save`, `/load`, `/sessions` and `--continue`, in
+//! interactive chat (`ai -i`) and the TUI (`ai -t`).
 //!
 //! A session is one JSON file, `<data dir>/ai-cli/chats/<name>.json`. It
 //! holds the full genai message history (system prompt, user turns,
 //! assistant replies, web-search tool calls and results) plus the provider
-//! and model it was last saved with. Conversations routinely contain pasted
+//! and model it was last saved with. A TUI session also lists every panel
+//! (`panels`: provider, model and history each); its top-level fields then
+//! mirror the first panel, so chat, and ai-cli builds from before TUI
+//! sessions, open it as that panel's conversation. Conversations routinely contain pasted
 //! secrets and private files, so the files are owner-only (0600 on Unix).
 //! Every write goes to a temp file that is renamed over the target, so a
 //! crash or a full disk never leaves a half-written session behind.
@@ -20,9 +23,13 @@ use std::path::{Path, PathBuf};
 /// change: files from a newer version are refused rather than misread.
 pub const FORMAT_VERSION: u32 = 1;
 
-/// Where an unnamed conversation is saved on exit. It's a rolling slot: the
-/// next unnamed conversation replaces it.
+/// Where an unnamed chat conversation is saved on exit. It's a rolling slot:
+/// the next unnamed conversation replaces it.
 pub const AUTOSAVE_NAME: &str = "last";
+
+/// The TUI's own rolling exit slot, so a TUI session and a chat never
+/// overwrite each other's unnamed save.
+pub const TUI_AUTOSAVE_NAME: &str = "last-tui";
 
 /// Longest accepted session name. Names are ASCII, so bytes == chars.
 const MAX_NAME_LEN: usize = 100;
@@ -46,6 +53,92 @@ pub struct Session {
     /// Unix seconds of the last save.
     pub updated: u64,
     pub messages: Vec<ChatMessage>,
+    /// Every TUI panel, in order. Empty for a chat session. When set, the
+    /// fields above are a copy of the first panel's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub panels: Vec<PanelSession>,
+}
+
+impl Session {
+    /// The session as TUI panels: its `panels`, or for a chat session one
+    /// panel built from the top-level fields (with no provider key, since
+    /// a chat session only records the display name).
+    pub fn panel_sessions(&self) -> Vec<PanelSession> {
+        if !self.panels.is_empty() {
+            return self.panels.clone();
+        }
+        vec![PanelSession {
+            provider: self.provider.clone(),
+            name: String::new(),
+            model: self.model.clone(),
+            messages: self.messages.clone(),
+        }]
+    }
+}
+
+/// One TUI panel in a saved session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PanelSession {
+    /// Display name, e.g. `CLAUDE`.
+    pub provider: String,
+    /// The `[providers.<name>]` key, used to reopen the panel on the same
+    /// provider. Empty when unknown (a panel built from a chat session).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    pub model: String,
+    pub messages: Vec<ChatMessage>,
+}
+
+/// What a conversation is, for saving: a chat's one history or the TUI's
+/// panels.
+#[derive(Debug, Clone, Copy)]
+pub enum Content<'a> {
+    Chat {
+        provider: &'a Provider,
+        messages: &'a [ChatMessage],
+    },
+    Panels(&'a [PanelSession]),
+}
+
+impl Content<'_> {
+    /// User turns asked so far. Every TUI panel gets the same questions, so
+    /// that's the busiest panel's count.
+    fn user_turns(&self) -> usize {
+        match self {
+            Content::Chat { messages, .. } => user_turns(messages),
+            Content::Panels(panels) => panels
+                .iter()
+                .map(|p| user_turns(&p.messages))
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
+    fn to_session(self, created: u64, updated: u64) -> Session {
+        match self {
+            Content::Chat { provider, messages } => Session {
+                version: FORMAT_VERSION,
+                provider: provider.display_name.clone(),
+                model: provider.model.clone(),
+                created,
+                updated,
+                messages: messages.to_vec(),
+                panels: Vec::new(),
+            },
+            Content::Panels(panels) => {
+                let first = panels.first();
+                Session {
+                    version: FORMAT_VERSION,
+                    provider: first.map(|p| p.provider.clone()).unwrap_or_default(),
+                    model: first.map(|p| p.model.clone()).unwrap_or_default(),
+                    created,
+                    updated,
+                    messages: first.map(|p| p.messages.clone()).unwrap_or_default(),
+                    panels: panels.to_vec(),
+                }
+            }
+        }
+    }
 }
 
 /// What `/sessions` shows for one saved session.
@@ -57,6 +150,9 @@ pub struct SessionSummary {
     /// required field, so this is never empty for a real session).
     pub provider: String,
     pub model: String,
+    /// Display names of every provider in the session: the TUI panels, or
+    /// just `provider` for a chat.
+    pub providers: Vec<String>,
     pub updated: u64,
     /// Number of user messages.
     pub turns: usize,
@@ -65,11 +161,21 @@ pub struct SessionSummary {
 }
 
 impl SessionSummary {
+    /// A TUI session (several panels) rather than a chat.
+    pub fn is_tui(&self) -> bool {
+        self.providers.len() > 1
+    }
+
     fn of(name: &str, session: &Session) -> Self {
         Self {
             name: name.to_string(),
             provider: session.provider.clone(),
             model: session.model.clone(),
+            providers: if session.panels.is_empty() {
+                vec![session.provider.clone()]
+            } else {
+                session.panels.iter().map(|p| p.provider.clone()).collect()
+            },
             updated: session.updated,
             turns: user_turns(&session.messages),
             preview: preview(&session.messages),
@@ -491,6 +597,8 @@ pub struct Tracker {
     created: Option<u64>,
     /// A turn completed since the last save or load.
     dirty: bool,
+    /// Where an unnamed conversation goes on exit.
+    autosave_name: &'static str,
 }
 
 impl Tracker {
@@ -500,7 +608,15 @@ impl Tracker {
             name: None,
             created: None,
             dirty: false,
+            autosave_name: AUTOSAVE_NAME,
         }
+    }
+
+    /// Save unnamed conversations on exit as `name` instead of
+    /// [`AUTOSAVE_NAME`] (the TUI uses [`TUI_AUTOSAVE_NAME`]).
+    pub fn with_autosave_name(mut self, name: &'static str) -> Self {
+        self.autosave_name = name;
+        self
     }
 
     pub fn store(&self) -> Option<&SessionStore> {
@@ -543,8 +659,19 @@ impl Tracker {
         messages: &[ChatMessage],
         now: u64,
     ) -> Result<(String, PathBuf)> {
+        self.save_content(requested, force, Content::Chat { provider, messages }, now)
+    }
+
+    /// [`Tracker::save`] for any [`Content`].
+    pub fn save_content(
+        &mut self,
+        requested: Option<&str>,
+        force: bool,
+        content: Content<'_>,
+        now: u64,
+    ) -> Result<(String, PathBuf)> {
         let store = self.store_or_err()?;
-        if user_turns(messages) == 0 {
+        if content.user_turns() == 0 {
             anyhow::bail!("nothing to save yet");
         }
         // `reserved`: the name was claimed just now for this save.
@@ -569,7 +696,7 @@ impl Tracker {
                 None => (store.unused_name(&timestamp_name(now))?, true),
             },
         };
-        let path = self.write(name.clone(), reserved, provider, messages, now)?;
+        let path = self.write(name.clone(), reserved, content, now)?;
         Ok((name, path))
     }
 
@@ -583,14 +710,20 @@ impl Tracker {
         messages: &[ChatMessage],
         now: u64,
     ) -> Result<Option<String>> {
-        if !self.dirty || user_turns(messages) == 0 || self.store.is_none() {
+        self.autosave_content(Content::Chat { provider, messages }, now)
+    }
+
+    /// [`Tracker::autosave`] for any [`Content`]. An unnamed conversation
+    /// goes to this tracker's autosave slot.
+    pub fn autosave_content(&mut self, content: Content<'_>, now: u64) -> Result<Option<String>> {
+        if !self.dirty || content.user_turns() == 0 || self.store.is_none() {
             return Ok(None);
         }
         let name = self
             .name
             .clone()
-            .unwrap_or_else(|| AUTOSAVE_NAME.to_string());
-        self.write(name.clone(), false, provider, messages, now)?;
+            .unwrap_or_else(|| self.autosave_name.to_string());
+        self.write(name.clone(), false, content, now)?;
         Ok(Some(name))
     }
 
@@ -610,10 +743,19 @@ impl Tracker {
         messages: &[ChatMessage],
         now: u64,
     ) -> Result<Loaded> {
+        self.load_content(name, Content::Chat { provider, messages }, now)
+    }
+
+    /// [`Tracker::load`] for any [`Content`] (what's being replaced).
+    ///
+    /// Chat opening a TUI session gets its first panel and doesn't adopt
+    /// the name: saving one panel back under it would drop the others, so
+    /// the chat's saves go to a new name (or its autosave slot) instead.
+    pub fn load_content(&mut self, name: &str, current: Content<'_>, now: u64) -> Result<Loaded> {
         let store = self.store_or_err()?;
         // Read first: a typo or a corrupt file must not stash anything.
         let session = store.load(name)?;
-        let stash_name = if self.dirty && user_turns(messages) > 0 {
+        let stash_name = if self.dirty && current.user_turns() > 0 {
             // The flag says whether the name was claimed just now.
             Some(match self.name.as_deref() {
                 Some(current) if current != name => (current.to_string(), false),
@@ -623,10 +765,12 @@ impl Tracker {
             None
         };
         if let Some((stash, reserved)) = &stash_name {
-            self.write(stash.clone(), *reserved, provider, messages, now)?;
+            self.write(stash.clone(), *reserved, current, now)?;
         }
         let stash_name = stash_name.map(|(stash, _)| stash);
-        self.name = Some(name.to_string());
+        let chat_opening_panels =
+            matches!(current, Content::Chat { .. }) && !session.panels.is_empty();
+        self.name = (!chat_opening_panels).then(|| name.to_string());
         self.created = Some(session.created);
         self.dirty = false;
         Ok(Loaded {
@@ -644,20 +788,12 @@ impl Tracker {
         &mut self,
         name: String,
         reserved: bool,
-        provider: &Provider,
-        messages: &[ChatMessage],
+        content: Content<'_>,
         now: u64,
     ) -> Result<PathBuf> {
         let store = self.store_or_err()?;
         let created = self.created.unwrap_or(now);
-        let session = Session {
-            version: FORMAT_VERSION,
-            provider: provider.display_name.clone(),
-            model: provider.model.clone(),
-            created,
-            updated: now,
-            messages: messages.to_vec(),
-        };
+        let session = content.to_session(created, now);
         let path = match store.save(&name, &session) {
             Ok(path) => path,
             Err(e) => {
@@ -709,6 +845,7 @@ mod tests {
             created: updated,
             updated,
             messages,
+            panels: Vec::new(),
         }
     }
 
@@ -771,6 +908,7 @@ mod tests {
             created: 1_700_000_000,
             updated: 1_700_000_500,
             messages: original.clone(),
+            panels: Vec::new(),
         };
         store.save("roundtrip", &saved).unwrap();
         let loaded = store.load("roundtrip").unwrap();
@@ -1377,5 +1515,84 @@ mod tests {
         assert!(has_tool_calls(&messages));
         assert!(!has_tool_calls(&chat("x")));
         assert_eq!(system_prompt(&chat("x")), None);
+    }
+
+    fn panel(display: &str, model: &str, answer: &str) -> PanelSession {
+        PanelSession {
+            provider: display.to_string(),
+            name: display.to_lowercase(),
+            model: model.to_string(),
+            messages: vec![ChatMessage::user("q"), ChatMessage::assistant(answer)],
+        }
+    }
+
+    #[test]
+    fn a_tui_session_is_also_a_chat_of_its_first_panel() {
+        let store = SessionStore::new(test_dir("tui-compat"));
+        let panels = vec![panel("CLAUDE", "opus", "a"), panel("GEMINI", "flash", "b")];
+        let mut tracker = Tracker::new(Some(store.clone())).with_autosave_name(TUI_AUTOSAVE_NAME);
+        tracker.turn_completed(10);
+        let saved = tracker
+            .autosave_content(Content::Panels(&panels), 20)
+            .unwrap();
+        assert_eq!(saved.as_deref(), Some(TUI_AUTOSAVE_NAME));
+
+        let session = store.load(TUI_AUTOSAVE_NAME).unwrap();
+        assert_eq!(session.panels.len(), 2);
+        assert_eq!(
+            session.panels[1].messages[1].content.first_text(),
+            Some("b")
+        );
+        // The top-level fields mirror the first panel, which is all a chat
+        // (or an ai-cli from before TUI sessions) reads.
+        assert_eq!(session.provider, "CLAUDE");
+        assert_eq!(session.model, "opus");
+        assert_eq!(session.messages[1].content.first_text(), Some("a"));
+        let raw: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(store.path_for(TUI_AUTOSAVE_NAME).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["version"], 1, "same format version as chat sessions");
+
+        let listing = store.list().unwrap();
+        assert_eq!(listing.sessions[0].providers, ["CLAUDE", "GEMINI"]);
+        assert!(listing.sessions[0].is_tui());
+    }
+
+    #[test]
+    fn chat_never_saves_over_a_tui_session_it_opened() {
+        let store = SessionStore::new(test_dir("tui-from-chat"));
+        let panels = vec![panel("CLAUDE", "opus", "a"), panel("GEMINI", "flash", "b")];
+        let mut tui = Tracker::new(Some(store.clone()));
+        tui.save_content(Some("both"), false, Content::Panels(&panels), 20)
+            .unwrap();
+
+        // Chat loads it: it gets the first panel, but not the name...
+        let p = provider("CLAUDE", "opus");
+        let mut chat = Tracker::new(Some(store.clone()));
+        let loaded = chat.load("both", &p, &[], 30).unwrap();
+        assert_eq!(loaded.session.messages.len(), 2);
+        assert_eq!(chat.name(), None);
+        // ...so its exit autosave goes to `last`, and `both` keeps its panels.
+        chat.turn_completed(40);
+        let more = vec![
+            ChatMessage::user("q"),
+            ChatMessage::assistant("a"),
+            ChatMessage::user("next"),
+        ];
+        assert_eq!(
+            chat.autosave(&p, &more, 50).unwrap().as_deref(),
+            Some(AUTOSAVE_NAME)
+        );
+        assert_eq!(store.load("both").unwrap().panels.len(), 2);
+    }
+
+    #[test]
+    fn a_chat_session_opens_as_one_panel() {
+        let session = session_at(5, vec![ChatMessage::user("hi")]);
+        let panels = session.panel_sessions();
+        assert_eq!(panels.len(), 1);
+        assert_eq!(panels[0].provider, session.provider);
+        assert!(panels[0].name.is_empty());
     }
 }

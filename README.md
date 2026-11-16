@@ -330,7 +330,7 @@ installed its AI CHATS panel lists your newest chats, and `A` in `porchlight -i`
 ai sessions --json | jq -r '.sessions[] | "\(.updated)  \(.name)  \(.providers | join(","))"'
 ```
 
-`ai sessions` only lists what's saved; it doesn't open anything. `ai -t` launches the (fresh) side-by-side TUI chat — see [Interactive TUI](#interactive-tui). To resume a saved session instead of starting a new one, use interactive chat mode: `ai -i --continue` resumes whichever session was saved most recently, or `ai -i` then `/load <name>` for a specific one (there's no `--load <name>` flag yet, and the TUI doesn't resume sessions at all).
+`ai sessions` only lists what's saved; it doesn't open anything. To resume, `ai -t --continue` (TUI) or `ai -i --continue` (chat) reopens whichever session was saved most recently, and `/load <name>` inside either opens a specific one (there's no `--load <name>` flag yet). A TUI session lists every panel's provider in `providers`.
 
 ## Interactive chat
 
@@ -363,7 +363,7 @@ A line that starts with a path, such as `/etc/nginx/nginx.conf fails with …`, 
 
 Sessions:
 
-- **Autosave.** On exit (`/exit` or `Ctrl+D`), a chat with new turns is saved: under its session name if it was saved or loaded before, otherwise as `last`. The next unnamed chat replaces `last`, so use `/save <name>` to keep one. `ai -i --continue` (`-c`, needs `-i`) resumes whichever session was saved most recently.
+- **Autosave.** On exit (`/exit` or `Ctrl+D`), a chat with new turns is saved: under its session name if it was saved or loaded before, otherwise as `last`. The next unnamed chat replaces `last`, so use `/save <name>` to keep one. `ai -i --continue` (`-c`) resumes whichever session was saved most recently, TUI sessions included (as their first panel's conversation; chat then saves under a new name, so the TUI session keeps all its panels).
 - **Loading.** `/load` and `--continue` keep the current provider and model. If the session was saved with different ones, chat says so; pick another with `-p`. The session keeps its own system prompt. If the chat you're leaving has unsaved turns, `/load` saves them first (under its name, or a timestamp name) and tells you where.
 - **Names** may use letters, digits, `.`, `_` and `-`. `/save <name>` won't replace a different session with the same name unless you use `/save!`. `/clear` starts a new, unnamed chat and leaves the saved session alone.
 - **Storage.** Each session is a JSON file in `<data dir>/ai-cli/chats/<name>.json` (same data dir as the input history below). It holds the full message history, including `@file` contents, piped input and web-search results, plus the provider, model and timestamps. Writes are atomic. On Linux and macOS the files are readable only by you (mode 0600).
@@ -383,6 +383,7 @@ Chat is single-provider — if multiple are configured, the first is used and th
 ```bash
 ai -t                      # open empty, type your first question
 ai -t "initial question"   # seed the first turn
+ai -t -c                   # reopen the last saved session, panels and all
 ```
 
 The TUI is a long-running chat: type a message, hit Enter, read responses in each panel, type a follow-up. Each provider keeps its own history, so you can compare how they handle a conversation over multiple turns.
@@ -412,11 +413,18 @@ The TUI is a long-running chat: type a message, hit Enter, read responses in eac
 
 The input box wraps long text and grows a row at a time up to five rows, then scrolls (a ` 6-10/12 ` marker on its border shows which rows are in view). Multi-line pastes keep their newlines.
 
-Slash commands in the input box: `/clear` (reset all histories), `/model [id]` (pick, or set, the selected panel's model), `/exit` (quit).
+Slash commands in the input box: `/clear` (reset all histories and start a new session), `/model [id]` (pick, or set, the selected panel's model), `/save [name]`, `/save! <name>`, `/load <name>` and `/sessions` (see Sessions below), `/exit` (quit).
 
 **Model picker.** `m`, `Ctrl+O` or `/model` opens a list of every chat model the Bedrock endpoint serves (fetched live when the TUI starts). Type to narrow it: each word has to match the ID, name or vendor, so `opus 5` or `grok global` work. `↑`/`↓` select, `Enter` switches the panel, `Esc` cancels, and `●` marks the current model. If what you typed isn't a listed ID, the last row offers to use it as-is, so models the list hides, or a non-Bedrock provider's models, still work. `/model <id>` does the same without the list.
 
 The panel keeps its conversation and uses the new model from the next turn on. A panel whose provider isn't on Bedrock is moved to the Bedrock provider when you pick a listed Bedrock model; an unlisted ID stays with the panel's own provider. The model can't change while a panel is still answering.
+
+**Sessions.** The TUI saves and resumes conversations like interactive chat, in the same session files:
+
+- On exit, a TUI with new turns is saved: under its session name if it was saved or loaded before, otherwise as `last-tui` (its own slot, so it never replaces chat's `last`). The terminal says where once it's restored.
+- `ai -t --continue` (`-c`) reopens the newest saved session with the providers and models its panels were on; `-p` or `-a` picks the panels instead (saved panels for other providers are named and skipped), and `-m` overrides the saved models. A chat session opens in the panel for its provider.
+- `/save [name]`, `/save! <name>`, `/load <name>` and `/sessions` work as in chat; `/sessions` names the newest few in the footer (`ai sessions` lists all). `/load` saves unsaved turns first, and `/clear` starts a new, unnamed session.
+- A restored panel shows its questions and answers (without timings) and keeps the full history, tool calls included, so the models remember the conversation.
 
 **Copying text.** Mouse capture is on (the wheel needs it), so the TUI does selection itself: drag inside one panel or the input box and the text is copied when you let go, with the selection highlighted until the next key. A selection stays inside the region it started in, so it never picks up the other panels or the borders, and dragging past a panel's top or bottom edge scrolls it to select more. Soft-wrapped rows are joined back into their original lines. The copy goes out as an OSC 52 escape (works over SSH, and through tmux with `set -g set-clipboard on`) and also through `pbcopy` / `wl-copy` / `xclip` / `xsel` when one is available. For the terminal's own selection instead, hold `Shift` (most terminals, including Ghostty) or `Option` (iTerm2) while dragging.
 
@@ -463,9 +471,10 @@ src/
 ├── display.rs             CLI output: progressive streaming, multi-provider blocks, --raw
 ├── pricing.rs             Per-model prices and the footer's cost estimate
 ├── chat.rs                Interactive chat (rustyline) with slash commands
-├── sessions.rs            Saved chat sessions (/save, /load, --continue)
+├── sessions.rs            Saved sessions, chat and TUI (/save, /load, --continue)
 ├── sessions_cmd.rs        `ai sessions`: table/JSON listing for scripts and other tools
 ├── ui.rs                  Ratatui TUI — interactive side-by-side chat panels
+├── ui_sessions.rs         `ai -t` sessions: /save, /load, /sessions, exit autosave, --continue
 ├── ui_picker.rs           The TUI's model picker popup
 ├── term.rs                Terminal guard for the full-screen UIs
 ├── diag.rs                Diagnostics held back while a full-screen UI is up

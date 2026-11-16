@@ -3,6 +3,7 @@ use crate::composer::{self, Layout as ComposerLayout};
 use crate::providers::{Provider, ProviderManager};
 use crate::query::{stream_with_messages, QueryContext, StreamEvent};
 use crate::selection::{self, Selection, Target};
+use crate::sessions::{SessionStore, Tracker, TUI_AUTOSAVE_NAME};
 use crate::ui_picker::{CatalogState, ModelPicker, PickerAction, PickerItem};
 use anyhow::Result;
 use crossterm::event::{
@@ -89,6 +90,11 @@ enum PanelCommand {
     },
 }
 
+#[path = "ui_sessions.rs"]
+mod ui_sessions;
+use ui_sessions::History;
+pub use ui_sessions::Resume;
+
 /// A finished catalog fetch: (Bedrock provider name, models or error text).
 type CatalogResult = (String, Result<Vec<BedrockModel>, String>);
 
@@ -116,6 +122,11 @@ pub struct PanelState {
     /// tail of the streaming response stays visible. Any manual scroll toggles
     /// this off until the user scrolls back to the bottom.
     pub auto_scroll: bool,
+    /// The conversation, shared with this panel's worker (see `ui_sessions`).
+    history: History,
+    /// Questions sent to the worker; with the history's `committed`, tells
+    /// whether every finished turn has been written back yet.
+    asked: u64,
 }
 
 impl PanelState {
@@ -133,6 +144,8 @@ impl PanelState {
             visible_height: 0,
             area: None,
             auto_scroll: true,
+            history: ui_sessions::new_history(),
+            asked: 0,
         }
     }
 
@@ -208,6 +221,9 @@ pub struct App {
     /// Catalogs to fetch; the main loop (which holds the ProviderManager)
     /// drains this and reports back through `catalog_loaded`.
     catalog_requests: Vec<String>,
+    /// The saved session these panels belong to, for `/save`, `/load` and
+    /// the exit autosave.
+    tracker: Tracker,
 }
 
 impl App {
@@ -241,6 +257,13 @@ impl App {
             catalogs: HashMap::new(),
             bedrock_providers: Vec::new(),
             catalog_requests: Vec::new(),
+            // Tests never touch the real sessions directory.
+            tracker: Tracker::new(if cfg!(test) {
+                None
+            } else {
+                SessionStore::default_location()
+            })
+            .with_autosave_name(TUI_AUTOSAVE_NAME),
         }
     }
 
@@ -452,6 +475,10 @@ impl App {
                             text,
                         });
                         p.is_streaming = false;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs());
+                        self.tracker.turn_completed(now);
                     }
                 }
                 self.maybe_clear_turn_cancel();
@@ -563,6 +590,7 @@ impl App {
                     panel.provider.display_name, reason
                 ));
             } else {
+                panel.asked += 1;
                 accepted += 1;
             }
         }
@@ -585,6 +613,8 @@ impl App {
         // billing) with no way to cancel it, and its late events would land
         // in the freshly cleared panels.
         self.cancel_current_turn();
+        // A fresh conversation: saved as a new session, not over this one.
+        self.tracker.detach();
         for (i, tx) in self.senders.iter().enumerate() {
             // Fire-and-forget: if the receiver is gone the task is ending
             // anyway, and the visible state is reset regardless.
@@ -883,17 +913,21 @@ fn lines_for_turn(turn: &Turn, panel_color: Color, show_tokens: bool) -> Vec<Lin
                     .add_modifier(Modifier::BOLD),
             ));
             out.extend(crate::markdown::markdown_to_lines(&turn.text));
+            // A turn restored from a saved session has no stats to show.
+            let restored = *duration_ms == 0 && input_tokens.is_none() && output_tokens.is_none();
             let mut stats = Vec::new();
             if show_tokens {
                 if let (Some(i), Some(o)) = (input_tokens, output_tokens) {
                     stats.push(format!("{} in / {} out", i, o));
                 }
             }
-            stats.push(format_duration(*duration_ms));
-            out.push(Line::styled(
-                stats.join(" | "),
-                Style::default().fg(Color::DarkGray),
-            ));
+            if !restored {
+                stats.push(format_duration(*duration_ms));
+                out.push(Line::styled(
+                    stats.join(" | "),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
         }
         TurnKind::Error => {
             out.push(Line::styled(
@@ -1104,7 +1138,7 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     } else {
         match app.mode {
             Mode::Insert => {
-                "Esc: normal | Enter: send | Alt+Enter: newline | Ctrl+C: cancel turn | Ctrl+O: model | PgUp/PgDn: scroll | drag: copy | /model /clear /exit"
+                "Esc: normal | Enter: send | Alt+Enter: newline | Ctrl+C: cancel turn | Ctrl+O: model | PgUp/PgDn: scroll | drag: copy | /save /load /sessions /model /clear /exit"
                     .to_string()
             }
             Mode::Normal => {
@@ -1231,6 +1265,7 @@ pub async fn run_tui(
     ctx: QueryContext,
     initial_question: &str,
     show_tokens: bool,
+    resume: Option<Resume>,
 ) -> Result<()> {
     use std::io::IsTerminal;
     if !io::stdout().is_terminal() {
@@ -1258,7 +1293,9 @@ pub async fn run_tui(
     for provider in &providers {
         let (cmd_tx, cmd_rx) = mpsc::channel::<PanelCommand>(PANEL_INPUT_CAPACITY);
         senders.push(cmd_tx);
-        panels.push(PanelState::new(provider.clone()));
+        let panel = PanelState::new(provider.clone());
+        let task_history = Arc::clone(&panel.history);
+        panels.push(panel);
 
         let task_manager = Arc::clone(&manager);
         let task_provider = provider.clone();
@@ -1269,7 +1306,15 @@ pub async fn run_tui(
         // aborted on quit.
         tasks.push(tokio::spawn(
             async move {
-                panel_task(task_manager, task_provider, task_ctx, cmd_rx, task_event_tx).await;
+                panel_task(
+                    task_manager,
+                    task_provider,
+                    task_ctx,
+                    cmd_rx,
+                    task_event_tx,
+                    task_history,
+                )
+                .await;
             }
             .with_context(task_cx),
         ));
@@ -1294,6 +1339,12 @@ pub async fn run_tui(
                     app.request_catalog(&first);
                 }
 
+                // `--continue`: reopen the saved session first, so a
+                // question given on the command line is its next turn.
+                if let Some(resume) = &resume {
+                    app.resume(resume);
+                }
+
                 // Seed the first turn with the CLI-provided question, if any.
                 let initial = initial_question.trim();
                 if !initial.is_empty() {
@@ -1310,15 +1361,23 @@ pub async fn run_tui(
                 // Stop in-flight requests instead of abandoning them to run
                 // (and bill) in the background while the process exits.
                 app.cancel_current_turn();
+                // Save the conversation for `ai -t --continue` once the
+                // cancelled turns have been written back.
+                let saved = app.autosave_on_exit().await;
                 for task in &app.tasks {
                     task.abort();
                 }
-                result
+                (result, saved)
             }
-            Err(e) => Err(e.into()),
+            Err(e) => (Err(e.into()), None),
         }
     };
+    let (result, saved) = result;
     crate::diag::flush();
+    // The terminal is back to normal, so this prints in the shell.
+    if let Some(note) = saved {
+        eprintln!("ai: {note}");
+    }
 
     result
 }
@@ -1338,26 +1397,37 @@ fn ends_with_final_reply(messages: &[ChatMessage]) -> bool {
         && !last.content.texts().join("").is_empty()
 }
 
-/// Long-lived per-panel worker. Owns a private `Vec<ChatMessage>` including
-/// the system prompt (if any); executes one `stream_with_messages` per Ask
-/// command. On Clear, resets history back to just the system prompt.
+/// Long-lived per-panel worker. Keeps the panel's `Vec<ChatMessage>`
+/// (system prompt included, if any) in the shared `history`; executes one
+/// `stream_with_messages` per Ask command. On Clear, resets history back to
+/// just the system prompt. The UI only replaces the history (loading a
+/// session) while no turn is in flight, so each Ask reads it fresh and
+/// writes it back when done, counting the Ask as committed either way.
 async fn panel_task(
     manager: Arc<ProviderManager>,
     mut provider: Provider,
     ctx: QueryContext,
     mut cmd_rx: mpsc::Receiver<PanelCommand>,
     event_tx: mpsc::Sender<StreamEvent>,
+    history: History,
 ) {
     let base_messages: Vec<ChatMessage> = if let Some(s) = ctx.system_prompt.as_deref() {
         vec![ChatMessage::system(s.to_string())]
     } else {
         Vec::new()
     };
-    let mut messages = base_messages.clone();
+    {
+        // A resumed session fills the history before the worker starts.
+        let mut h = ui_sessions::lock(&history);
+        if h.messages.is_empty() {
+            h.messages = base_messages.clone();
+        }
+    }
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             PanelCommand::Ask { question, cancel } => {
+                let mut messages = ui_sessions::lock(&history).messages.clone();
                 let pre_turn_len = messages.len();
                 messages.push(ChatMessage::user(question));
                 let enriched = stream_with_messages(
@@ -1378,9 +1448,12 @@ async fn panel_task(
                     // which would otherwise corrupt every later turn.
                     messages.truncate(pre_turn_len);
                 }
+                let mut h = ui_sessions::lock(&history);
+                h.messages = messages;
+                h.committed += 1;
             }
             PanelCommand::Clear => {
-                messages = base_messages.clone();
+                ui_sessions::lock(&history).messages = base_messages.clone();
             }
             PanelCommand::SetModel {
                 provider_name,
@@ -1605,8 +1678,14 @@ fn handle_insert_key(app: &mut App, key: KeyEvent) {
                         }
                     }
                     _ => {
-                        app.status_message = Some(format!("unknown command: /{}", cmd_name));
-                        app.clear_input();
+                        // Session names keep their case.
+                        let arg = cmd.split_whitespace().nth(1);
+                        if app.session_command(cmd_name, arg) {
+                            app.clear_input();
+                        } else {
+                            app.status_message = Some(format!("unknown command: /{}", cmd_name));
+                            app.clear_input();
+                        }
                     }
                 }
                 return;
@@ -1755,12 +1834,12 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::providers::Provider;
     use ratatui::backend::TestBackend;
 
-    fn fake_provider(name: &str) -> Provider {
+    pub(super) fn fake_provider(name: &str) -> Provider {
         Provider {
             name: name.to_lowercase(),
             display_name: name.to_string(),
@@ -1773,7 +1852,7 @@ mod tests {
     /// for the duration of the test. If the receivers drop, `try_send` sees
     /// `TrySendError::Closed` and submit_turn rolls back the user turn — so
     /// tests need to hold onto the receivers explicitly.
-    fn app_with(n: usize) -> (App, Vec<mpsc::Receiver<PanelCommand>>) {
+    pub(super) fn app_with(n: usize) -> (App, Vec<mpsc::Receiver<PanelCommand>>) {
         let mut panels = Vec::with_capacity(n);
         let mut senders = Vec::with_capacity(n);
         let mut receivers = Vec::with_capacity(n);

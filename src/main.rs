@@ -263,8 +263,9 @@ struct Cli {
     #[arg(long)]
     no_expand: bool,
 
-    /// With -i: resume the most recently saved chat session
-    #[arg(short = 'c', long = "continue", requires = "interactive")]
+    /// Resume the most recently saved session: in chat (-i), or in the TUI,
+    /// which reopens its panels' providers and models
+    #[arg(short = 'c', long = "continue")]
     continue_session: bool,
 }
 
@@ -421,6 +422,15 @@ fn select_mode(cli: &Cli, config_tui: bool, stdout_is_terminal: bool) -> Mode {
     }
 }
 
+/// The newest saved session, for `ai -t --continue`, or `None` when nothing
+/// is saved (or it can't be read; the TUI then says it's starting fresh).
+fn newest_session() -> Option<(String, sessions::Session)> {
+    let store = sessions::SessionStore::default_location()?;
+    let name = store.list().ok()?.sessions.first()?.name.clone();
+    let session = store.load(&name).ok()?;
+    Some((name, session))
+}
+
 /// Parse `-r/--reasoning`. Returns the effort plus the label shown in the
 /// footer. Unknown values are an error rather than a silent (and pricier)
 /// fallback to medium.
@@ -548,11 +558,36 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             "Missing required argument: <QUESTION>\n\nUsage: ai <QUESTION>\n       cat file | ai <QUESTION>\n       ai -i [QUESTION]\n       ai -t [QUESTION]\n       ai --init"
         );
     }
+    if cli.continue_session && !cli.interactive && !mode.tui_settings {
+        anyhow::bail!("--continue resumes a chat (-i) or the TUI (-t), not a one-shot question");
+    }
     let mode_config = if mode.tui_settings {
         &config.tui_mode
     } else {
         &config.cli
     };
+
+    // `ai -t --continue`: the newest saved session, and the providers its
+    // panels were on (unless -p/-a picks them).
+    let resume_session = (cli.continue_session && !cli.interactive && use_tui)
+        .then(newest_session)
+        .flatten();
+    let resume_providers: Option<Vec<String>> = resume_session
+        .as_ref()
+        .filter(|_| cli.providers.is_none() && !cli.all)
+        .map(|(_, session)| {
+            session
+                .panel_sessions()
+                .into_iter()
+                .map(|p| {
+                    if p.name.is_empty() {
+                        p.provider.to_lowercase()
+                    } else {
+                        p.name
+                    }
+                })
+                .collect()
+        });
 
     // Create provider manager with the correct model tier for the active mode
     let manager = Arc::new(ProviderManager::new(
@@ -565,6 +600,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         ProviderRequest::All
     } else if let Some(ref requested) = cli.providers {
         ProviderRequest::Explicit(requested)
+    } else if let Some(ref resumed) = resume_providers {
+        ProviderRequest::Explicit(resumed)
     } else {
         use config::QueryMode;
         match mode_config.default_mode {
@@ -765,12 +802,18 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     let any_failed = if use_tui {
         // Phase 2: TUI mode. Per-panel errors are shown in the panels; the
         // exit status only reflects whether the TUI itself failed.
+        let resume = cli.continue_session.then(|| crate::ui::Resume {
+            name: resume_session.map(|(name, _)| name),
+            // -m on the command line wins over the saved models.
+            apply_models: cli.model.is_none(),
+        });
         crate::ui::run_tui(
             manager,
             providers_to_query,
             ctx,
             &question,
             footer.show_tokens,
+            resume,
         )
         .await?;
         false

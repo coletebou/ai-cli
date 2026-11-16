@@ -45,7 +45,7 @@ this file is what an agent needs on top of them. `CLAUDE.md` only imports this f
 | `query.rs` | the tool-use loop and `StreamEvent` production — streaming, non-streaming and the search tool |
 | `display.rs`, `markdown.rs`, `ui.rs`, `ui_picker.rs`, `term.rs`, `diag.rs` | CLI rendering, TUI panels and model picker, or terminal-state restoration on exit/panic |
 | `composer.rs`, `selection.rs`, `clipboard.rs` | the TUI input box (wrapping, growth, cursor, Up/Down), mouse selection and what gets copied, or every clipboard write (OSC 52 and the native tools) |
-| `chat.rs`, `sessions.rs` | interactive chat (`-i`) and `/save`, `/load`, `/sessions`, `--continue` |
+| `chat.rs`, `sessions.rs`, `ui_sessions.rs` | interactive chat (`-i`) and saved sessions for chat and the TUI: `/save`, `/load`, `/sessions`, `--continue`, the exit autosave, and the session file format both share |
 | `sessions_cmd.rs` | `ai sessions`: table/JSON session listing for scripts and other tools |
 | `context.rs` | `@file` and piped-stdin expansion into the prompt |
 | `search.rs` | the `search_web` tool (Gemini grounding / Exa / Tavily, fallback chain) |

@@ -49,7 +49,7 @@ There's no Homebrew formula yet; that's tracked in [#13](https://github.com/cole
 
 ### Build from source
 
-Requires Rust 1.88+ (the minimum set by the dependency graph; checked in CI).
+Requires Rust 1.89+ (the minimum set by the dependency graph; checked in CI).
 
 ```bash
 git clone https://github.com/coletebou/ai-cli

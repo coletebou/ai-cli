@@ -71,7 +71,7 @@ cargo test test_name                                                 # one test
   `clippy-test-windows` (skipped until a personal Windows runner exists and repo variable
   `PERSONAL_WINDOWS_RUNNER` is `true`). There's no `workflow_dispatch` on `ci.yml` — trigger it by
   pushing a branch or opening a PR, then `gh run watch <id> --exit-status`.
-- MSRV locally: `rustup toolchain install 1.88 && cargo +1.88 check --all-targets --locked`. Raise
+- MSRV locally: `rustup toolchain install 1.89 && cargo +1.89 check --all-targets --locked`. Raise
   `rust-version` in the same PR as any dependency/std bump that needs it, and say why.
 - `.github/workflows/release.yml` is separate — it builds and publishes binaries on a `v*` tag push,
   or does a dry run (build + package + `install.sh` smoke test, nothing published) on

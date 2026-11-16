@@ -200,6 +200,26 @@ pub fn normalize_model_id(model: &str) -> String {
 /// 3. the built-in table.
 ///
 /// Override keys are matched case-insensitively. `None` means unknown.
+/// genai reads a trailing `-<effort>` off a model name, sends it as the
+/// reasoning effort and calls the bare model: `gemini-4-hydrogen-high` is
+/// `gemini-4-hydrogen` with high thinking. Returns the bare model and the
+/// effort word, or the model unchanged and `None` when there's no such
+/// suffix. The words are genai's (`none`, `minimal`, `low`, `medium`,
+/// `high`, plus Gemini's `zero`).
+pub fn split_effort_suffix(model: &str) -> (&str, Option<&str>) {
+    let model = model.trim();
+    if let Some((base, last)) = model.rsplit_once('-') {
+        let is_effort = matches!(
+            last.to_ascii_lowercase().as_str(),
+            "none" | "minimal" | "low" | "medium" | "high" | "zero"
+        );
+        if is_effort && !base.is_empty() {
+            return (base, Some(last));
+        }
+    }
+    (model, None)
+}
+
 pub fn lookup(model: &str, overrides: &HashMap<String, ModelPrice>) -> Option<ModelPrice> {
     let raw = model.trim();
     let normalized = normalize_model_id(raw);
@@ -219,6 +239,11 @@ pub fn lookup(model: &str, overrides: &HashMap<String, ModelPrice>) -> Option<Mo
                     input_per_mtok: input,
                     output_per_mtok: output,
                 })
+        })
+        // The effort suffix doesn't change the per-token price.
+        .or_else(|| match split_effort_suffix(raw) {
+            (base, Some(_)) => lookup(base, overrides),
+            (_, None) => None,
         })
 }
 
@@ -298,6 +323,10 @@ mod tests {
         assert_eq!(builtin("gpt-6.1-sol"), Some(price(2.0, 10.0)));
         // OpenRouter routes of a listed model match too.
         assert_eq!(builtin("openai/gpt-6.1-sol"), Some(price(2.0, 10.0)));
+        // A genai effort suffix is priced as the bare model.
+        assert_eq!(builtin("gemini-4-hydrogen-high"), Some(price(1.50, 7.50)));
+        assert_eq!(builtin("gpt-6.1-sol-low"), Some(price(2.0, 10.0)));
+        assert_eq!(builtin("gemini-4-hydrogen-turbo"), None);
         assert_eq!(builtin("gemini-3.5-flash"), Some(price(1.50, 9.0)));
         assert_eq!(builtin("grok-4.3"), Some(price(1.25, 2.50)));
         // Matching is exact, never by prefix: these are different models.
@@ -477,5 +506,17 @@ output_per_mtok = 0.0
         // Nothing new is written for users who never set a price.
         let saved = toml::to_string_pretty(&Config::default()).unwrap();
         assert!(!saved.contains("[pricing"), "{saved}");
+    }
+
+    #[test]
+    fn effort_suffixes_split_off_the_model_name() {
+        assert_eq!(
+            split_effort_suffix("gemini-4-hydrogen-high"),
+            ("gemini-4-hydrogen", Some("high"))
+        );
+        assert_eq!(split_effort_suffix("gpt-5.4-mini"), ("gpt-5.4-mini", None));
+        assert_eq!(split_effort_suffix(" gpt-6.1-sol "), ("gpt-6.1-sol", None));
+        assert_eq!(split_effort_suffix("-high"), ("-high", None));
+        assert_eq!(split_effort_suffix("high"), ("high", None));
     }
 }

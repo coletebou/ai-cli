@@ -127,6 +127,7 @@ fn build_model_provider_map(config: &Config) -> HashMap<String, ModelOwner> {
             Some(AdapterKind::OpenAI)
         } else {
             adapter_kind_for_provider(provider_name)
+                .or_else(|| provider_cfg.base_url.as_deref().and_then(mantle_adapter))
         };
         for model in [
             &provider_cfg.default_model,
@@ -514,6 +515,72 @@ fn is_mantle_base_url(url: &str) -> bool {
         .is_some_and(|host| host.starts_with("bedrock-mantle.") && host.ends_with(".api.aws"))
 }
 
+/// True for an OpenAI model that, like Mantle's, rejects function tools on
+/// `/v1/chat/completions` unless `reasoning_effort` is "none": GPT-5.6 and
+/// later (`gpt-5.6-sol`, `gpt-6.1-sol`, ...). Older models are left alone,
+/// since some of them reject an explicit "none" instead (gpt-4.1 has no
+/// reasoning at all; gpt-5 and its mini/nano only go down to "minimal").
+/// Accepts the `openai/` (OpenRouter-style) and `openai.` (Bedrock) prefixes.
+///
+/// `gpt-6.1-sol` is the exception that this can't fix: it rejects "none"
+/// too (it only takes low/medium/high/xhigh), so function tools work for it
+/// only on `/v1/responses`, which genai 0.5's Responses adapter can't stream.
+fn openai_tools_need_reasoning_off(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    let bare = model
+        .strip_prefix("openai/")
+        .or_else(|| model.strip_prefix("openai."))
+        .unwrap_or(&model);
+    let Some(version) = bare.strip_prefix("gpt-") else {
+        return false;
+    };
+    let number = |s: &str| -> Option<u32> {
+        let digits: String = s.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    };
+    let Some(major) = number(version) else {
+        return false;
+    };
+    let after_major = &version[major.to_string().len()..];
+    let minor = after_major.strip_prefix('.').and_then(number).unwrap_or(0);
+    (major, minor) >= (5, 6)
+}
+
+/// True when `base_url` is OpenAI's own API: unset (genai's default for the
+/// OpenAI adapter) or an `api.openai.com` URL.
+fn is_openai_api_base_url(base_url: Option<&str>) -> bool {
+    match base_url {
+        None => true,
+        Some(url) => reqwest::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+            .is_some_and(|host| host == "api.openai.com"),
+    }
+}
+
+/// The protocol a Bedrock Mantle `base_url` speaks, for providers whose
+/// name doesn't fix an adapter (e.g. `[providers.bedrock-openai]`): its
+/// `/anthropic/` path is the Anthropic Messages API, everything else is
+/// OpenAI-compatible. Without this, genai guesses from the model name and
+/// sends `openai.gpt-5.6-terra` through its Ollama adapter, which never sends
+/// `reasoning_effort`, so tool requests got Mantle's 400.
+fn mantle_adapter(base_url: &str) -> Option<AdapterKind> {
+    if !is_mantle_base_url(base_url) {
+        return None;
+    }
+    let path = reqwest::Url::parse(base_url)
+        .ok()?
+        .path()
+        .to_ascii_lowercase();
+    Some(
+        if path.contains("/anthropic/") || path.ends_with("/anthropic") {
+            AdapterKind::Anthropic
+        } else {
+            AdapterKind::OpenAI
+        },
+    )
+}
+
 fn ensure_trailing_slash(mut url: String) -> String {
     if !url.ends_with('/') {
         url.push('/');
@@ -838,15 +905,22 @@ impl ProviderManager {
         names
     }
 
-    /// Options for a tool-carrying request to Bedrock Mantle that didn't ask
-    /// for a reasoning effort: the same, with `reasoning_effort: none`.
-    /// Mantle runs GPT-5.6 with reasoning on by default, and its
-    /// `/v1/chat/completions` rejects function tools with any effort but
-    /// "none" (HTTP 400 "Function tools with reasoning_effort are not
-    /// supported"); `/v1/responses` isn't served for those models. Only
-    /// genai's OpenAI adapter sends the field, so other adapters (xAI, the
-    /// Ollama fallback) are unaffected. `None` leaves the options as they are.
-    fn mantle_tool_options(
+    /// Options for a tool-carrying request that didn't ask for a reasoning
+    /// effort: the same, with `reasoning_effort: none`, when the endpoint
+    /// would otherwise reject the tools. Applies to:
+    ///
+    /// - Bedrock Mantle: it runs GPT-5.6 with reasoning on by default, and
+    ///   its `/v1/chat/completions` rejects function tools with any effort
+    ///   but "none" (HTTP 400 "Function tools with reasoning_effort are not
+    ///   supported"); `/v1/responses` isn't served for those models.
+    /// - OpenAI's own API for GPT-5.6 and later (`gpt-6.1-sol`, ...), which
+    ///   returns the same 400 on `/v1/chat/completions` (see
+    ///   [`openai_tools_need_reasoning_off`]).
+    ///
+    /// Only genai's OpenAI adapter sends the field, so other adapters (xAI,
+    /// the Ollama fallback) are unaffected. `None` leaves the options as
+    /// they are.
+    fn tool_request_options(
         &self,
         provider: &Provider,
         options: Option<&ChatOptions>,
@@ -860,8 +934,12 @@ impl ProviderManager {
             .providers
             .get(&provider.name)?
             .base_url
-            .as_deref()?;
-        if !is_mantle_base_url(base_url) {
+            .as_deref();
+        let on_mantle = base_url.is_some_and(is_mantle_base_url);
+        let on_openai = adapter_kind_for_provider(&provider.name) == Some(AdapterKind::OpenAI)
+            && is_openai_api_base_url(base_url)
+            && openai_tools_need_reasoning_off(&provider.model);
+        if !on_mantle && !on_openai {
             return None;
         }
         Some(
@@ -885,8 +963,8 @@ impl ProviderManager {
     ) -> Result<ChatResponse> {
         let model = provider.model.as_str();
         let model_id = self.router.model_for(&provider.name, model);
-        let mantle_options = self.mantle_tool_options(provider, options, tools.is_some());
-        let options = mantle_options.as_ref().or(options);
+        let tool_options = self.tool_request_options(provider, options, tools.is_some());
+        let options = tool_options.as_ref().or(options);
         let cfg = self.retry_cfg();
         let mut attempt: u32 = 0;
         loop {
@@ -932,8 +1010,8 @@ impl ProviderManager {
     ) -> Result<ChatEventStream> {
         let model = provider.model.as_str();
         let model_id = self.router.model_for(&provider.name, model);
-        let mantle_options = self.mantle_tool_options(provider, options, tools.is_some());
-        let options = mantle_options.as_ref().or(options);
+        let tool_options = self.tool_request_options(provider, options, tools.is_some());
+        let options = tool_options.as_ref().or(options);
         let cfg = self.retry_cfg();
         let mut attempt: u32 = 0;
         loop {
@@ -1476,6 +1554,114 @@ mod tests {
     }
 
     #[test]
+    fn mantle_urls_pick_the_protocol_for_unnamed_providers() {
+        assert_eq!(
+            mantle_adapter("https://bedrock-mantle.us-gov-west-1.api.aws/v1/"),
+            Some(AdapterKind::OpenAI)
+        );
+        assert_eq!(
+            mantle_adapter("https://bedrock-mantle.us-east-1.api.aws/openai/v1"),
+            Some(AdapterKind::OpenAI)
+        );
+        assert_eq!(
+            mantle_adapter("https://bedrock-mantle.us-gov-west-1.api.aws/anthropic/v1/"),
+            Some(AdapterKind::Anthropic)
+        );
+        assert_eq!(mantle_adapter("https://api.openai.com/v1/"), None);
+
+        // A custom-named Mantle provider routes its listed model through the
+        // OpenAI adapter rather than genai's Ollama guess.
+        let mantle = "https://bedrock-mantle.us-gov-west-1.api.aws/v1/";
+        let config = config_with(vec![(
+            "bedrock-openai",
+            routed_provider("openai.gpt-5.6-terra", None, Some(mantle)),
+        )]);
+        let router = ModelRouter::new(Arc::new(config));
+        let decision = route(&router, "openai.gpt-5.6-terra");
+        assert_eq!(decision.provider_name.as_deref(), Some("bedrock-openai"));
+        assert_eq!(decision.adapter_kind, AdapterKind::OpenAI);
+    }
+
+    #[test]
+    fn openai_reasoning_off_starts_at_gpt_5_6() {
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-6.1-sol",
+            "gpt-6-sol",
+            "GPT-6.1-terra",
+            "openai/gpt-6.1-sol",
+            "openai.gpt-5.6-terra",
+            "gpt-5.10",
+        ] {
+            assert!(openai_tools_need_reasoning_off(model), "{model}");
+        }
+        for model in [
+            "gpt-5.5",
+            "gpt-5",
+            "gpt-5-nano",
+            "gpt-4.1",
+            "gpt-4o",
+            "o3",
+            "gpt-",
+            "claude-opus-5-5",
+        ] {
+            assert!(!openai_tools_need_reasoning_off(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn tool_requests_to_openai_gpt_6_turn_reasoning_off() {
+        let manager = ProviderManager::new(
+            config_with(vec![
+                ("openai", routed_provider("gpt-6.1-sol", None, None)),
+                ("legacy", routed_provider("gpt-4.1", None, None)),
+            ]),
+            ModelTier::Fast,
+        )
+        .unwrap();
+        let plain = ChatOptions::default();
+        let sol = &manager.providers["openai"];
+        let adjusted = manager
+            .tool_request_options(sol, Some(&plain), true)
+            .expect("GPT-6.1 Sol on OpenAI's API gets reasoning off for tools");
+        assert!(matches!(
+            adjusted.reasoning_effort,
+            Some(ReasoningEffort::None)
+        ));
+        // An explicit -r is respected, and plain chat is untouched.
+        let high = plain.clone().with_reasoning_effort(ReasoningEffort::High);
+        assert!(manager
+            .tool_request_options(sol, Some(&high), true)
+            .is_none());
+        assert!(manager
+            .tool_request_options(sol, Some(&plain), false)
+            .is_none());
+        // A provider that isn't the `openai` adapter keeps the old behaviour.
+        let legacy = &manager.providers["legacy"];
+        assert!(manager
+            .tool_request_options(legacy, Some(&plain), true)
+            .is_none());
+
+        // The `openai` provider pointed at someone else's endpoint (a proxy,
+        // Azure) is left alone: we don't know that server's rules.
+        let proxied = ProviderManager::new(
+            config_with(vec![(
+                "openai",
+                routed_provider("gpt-6.1-sol", None, Some("https://proxy.example.com/v1/")),
+            )]),
+            ModelTier::Fast,
+        )
+        .unwrap();
+        assert!(proxied
+            .tool_request_options(&proxied.providers["openai"], Some(&plain), true)
+            .is_none());
+        assert!(is_openai_api_base_url(Some("https://api.openai.com/v1/")));
+        assert!(!is_openai_api_base_url(Some(
+            "https://api.openai.com.evil.example/v1/"
+        )));
+    }
+
+    #[test]
     fn tool_requests_to_mantle_turn_reasoning_off_unless_asked() {
         let mantle = "https://bedrock-mantle.us-gov-west-1.api.aws/v1/";
         let manager = ProviderManager::new(
@@ -1494,25 +1680,27 @@ mod tests {
         let plain = ChatOptions::default().with_capture_usage(true);
 
         let adjusted = manager
-            .mantle_tool_options(on_mantle, Some(&plain), true)
+            .tool_request_options(on_mantle, Some(&plain), true)
             .expect("tools on Mantle get reasoning off");
         assert!(matches!(
             adjusted.reasoning_effort,
             Some(ReasoningEffort::None)
         ));
         assert_eq!(adjusted.capture_usage, Some(true), "other options kept");
-        assert!(manager.mantle_tool_options(on_mantle, None, true).is_some());
+        assert!(manager
+            .tool_request_options(on_mantle, None, true)
+            .is_some());
 
         // No tools, an explicit effort, or a non-Mantle endpoint: unchanged.
         assert!(manager
-            .mantle_tool_options(on_mantle, Some(&plain), false)
+            .tool_request_options(on_mantle, Some(&plain), false)
             .is_none());
         let high = plain.clone().with_reasoning_effort(ReasoningEffort::High);
         assert!(manager
-            .mantle_tool_options(on_mantle, Some(&high), true)
+            .tool_request_options(on_mantle, Some(&high), true)
             .is_none());
         assert!(manager
-            .mantle_tool_options(direct, Some(&plain), true)
+            .tool_request_options(direct, Some(&plain), true)
             .is_none());
     }
 

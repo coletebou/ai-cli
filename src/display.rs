@@ -121,6 +121,8 @@ fn footer_text(
     }
 
     if footer.show_reasoning {
+        // Without -r, a `-high`-style model suffix is what set the effort.
+        let reasoning = reasoning.or(pricing::split_effort_suffix(model).1);
         parts.push(format!("reasoning: {}", format_reasoning(reasoning)));
     }
 
@@ -949,6 +951,26 @@ mod tests {
             ..FooterConfig::default()
         };
         assert!(footer_text("claude-haiku-4-5", Some(3), Some(5), 1, &none, None).is_none());
+    }
+
+    #[test]
+    fn footer_reasoning_falls_back_to_the_model_suffix() {
+        let footer = FooterConfig {
+            show_model: false,
+            show_time: false,
+            show_tokens: false,
+            show_cost: false,
+            show_reasoning: true,
+            ..FooterConfig::default()
+        };
+        let text = |model, r| footer_text(model, None, None, 1, &footer, r).unwrap();
+        assert_eq!(text("gemini-4-hydrogen-high", None), "reasoning: high");
+        // An explicit -r wins, and a plain model still says none.
+        assert_eq!(
+            text("gemini-4-hydrogen-high", Some("low")),
+            "reasoning: low"
+        );
+        assert_eq!(text("gpt-6.1-sol", None), "reasoning: none");
     }
 
     fn cost_footer() -> FooterConfig {

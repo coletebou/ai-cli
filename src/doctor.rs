@@ -1637,7 +1637,7 @@ fn search_key<'a>(env: &dyn Environment, vars: &[&'a str]) -> SearchKey<'a> {
 
 fn search_section(search: &SearchConfig, env: &dyn Environment) -> Section {
     let primary = search.provider.to_lowercase();
-    let backends: [(&str, Vec<&str>); 2] = [
+    let backends: [(&str, Vec<&str>); 3] = [
         (
             "gemini",
             vec![
@@ -1645,6 +1645,7 @@ fn search_section(search: &SearchConfig, env: &dyn Environment) -> Section {
                 search.gemini.fallback_api_key_env.as_str(),
             ],
         ),
+        ("exa", vec![search.exa.api_key_env.as_str()]),
         ("tavily", vec![search.tavily.api_key_env.as_str()]),
     ];
 
@@ -1653,7 +1654,7 @@ fn search_section(search: &SearchConfig, env: &dyn Environment) -> Section {
         checks.push(Check::new(
             Status::Warn,
             format!(
-                "unknown search provider \"{}\" in [search] (expected gemini or tavily); `ai -w` will fail",
+                "unknown search provider \"{}\" in [search] (expected gemini, exa or tavily); `ai -w` will fail",
                 search.provider
             ),
         ));
@@ -2823,15 +2824,26 @@ mod tests {
 
     #[test]
     fn search_keys_presence() {
-        let search = SearchConfig::default(); // primary gemini, fallback tavily
-        let env = FakeEnv::new(&[("GOOGLE_API_KEY", "g")]);
+        let search = SearchConfig::default(); // primary gemini, fallbacks exa, tavily
+        let env = FakeEnv::new(&[("GOOGLE_API_KEY", "g"), ("EXA_API_KEY", "e")]);
         let section = search_section(&search, &env);
-        assert_eq!(section.checks[0].status, Status::Ok);
-        assert!(section.checks[0]
+        let check = |name: &str| {
+            section
+                .checks
+                .iter()
+                .find(|c| c.text.starts_with(name))
+                .unwrap_or_else(|| panic!("no {name} check"))
+        };
+        assert_eq!(check("gemini").status, Status::Ok);
+        assert!(check("gemini")
             .text
             .contains("gemini (primary): GOOGLE_API_KEY set"));
-        assert_eq!(section.checks[1].status, Status::Info);
-        assert!(section.checks[1].text.contains("TAVILY_API_KEY not set"));
+        assert_eq!(check("exa").status, Status::Ok);
+        assert!(check("exa")
+            .text
+            .contains("exa (fallback): EXA_API_KEY set"));
+        assert_eq!(check("tavily").status, Status::Info);
+        assert!(check("tavily").text.contains("TAVILY_API_KEY not set"));
 
         let tavily_primary = SearchConfig {
             provider: "tavily".into(),
@@ -2881,8 +2893,13 @@ mod tests {
             .text
             .contains("GOOGLE_API_KEY is set but blank"));
         assert!(section.checks[0].details.is_empty());
-        assert_eq!(section.checks[1].status, Status::Warn);
-        assert!(section.checks[1]
+        let tavily = section
+            .checks
+            .iter()
+            .find(|c| c.text.starts_with("tavily"))
+            .unwrap();
+        assert_eq!(tavily.status, Status::Warn);
+        assert!(tavily
             .text
             .contains("tavily (fallback): TAVILY_API_KEY is set but blank"));
     }

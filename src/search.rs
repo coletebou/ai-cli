@@ -25,7 +25,7 @@ pub(crate) const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Overall per-request budget for a web search. Gemini grounding runs a
 /// Google search and synthesizes an answer server-side, so this is generous;
-/// Tavily usually answers in 1-3s.
+/// Tavily and Exa usually answer in 1-3s.
 const SEARCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Error bodies are embedded in errors that reach both the user and the model
@@ -74,6 +74,7 @@ fn summarize_error_body(body: &str) -> String {
 pub enum SearchProvider {
     Tavily(TavilyClient),
     Gemini(GeminiSearchClient),
+    Exa(ExaClient),
     /// Canned backend so `SearchEngine`'s fallback logic can be tested
     /// without network access.
     #[cfg(test)]
@@ -86,6 +87,7 @@ impl SearchProvider {
         match self {
             SearchProvider::Tavily(_) => "tavily",
             SearchProvider::Gemini(_) => "gemini",
+            SearchProvider::Exa(_) => "exa",
             #[cfg(test)]
             SearchProvider::Mock(m) => m.name,
         }
@@ -95,6 +97,7 @@ impl SearchProvider {
         match self {
             SearchProvider::Tavily(c) => c.search(query).await,
             SearchProvider::Gemini(c) => c.search(query).await,
+            SearchProvider::Exa(c) => c.search(query).await,
             #[cfg(test)]
             SearchProvider::Mock(m) => m.search(query),
         }
@@ -139,44 +142,63 @@ impl MockProvider {
 // SearchEngine — primary + optional fallback
 // =============================================================================
 
-/// A search engine that tries a primary provider and falls back to a secondary
-/// provider if the primary fails.
+/// Every search backend, in the order the ones that aren't the primary are
+/// tried as fallbacks: Gemini (free grounding allowance), then Exa, then
+/// Tavily.
+pub const SEARCH_BACKENDS: &[&str] = &["gemini", "exa", "tavily"];
+
+/// The fallbacks for `primary`, in the order they're tried.
+pub fn fallback_order(primary: &str) -> Vec<&'static str> {
+    SEARCH_BACKENDS
+        .iter()
+        .copied()
+        .filter(|name| !name.eq_ignore_ascii_case(primary))
+        .collect()
+}
+
+/// A search engine that tries a primary provider, then each fallback in
+/// turn until one succeeds.
 pub struct SearchEngine {
     primary: SearchProvider,
-    fallback: Option<SearchProvider>,
+    fallbacks: Vec<SearchProvider>,
 }
 
 impl SearchEngine {
-    pub fn new(primary: SearchProvider, fallback: Option<SearchProvider>) -> Self {
-        Self { primary, fallback }
+    pub fn new(primary: SearchProvider, fallbacks: Vec<SearchProvider>) -> Self {
+        Self { primary, fallbacks }
     }
 
-    /// Execute a search using the primary provider, falling back to the secondary
-    /// provider on any error. Returns `(provider_name_used, results)`.
+    /// Execute a search using the primary provider, falling back to the
+    /// others in order on any error. Returns `(provider_name_used, results)`.
     ///
     /// Errors are flattened with `{:#}` so the whole context chain survives
     /// into the message: callers render it with `to_string()`, which would
     /// otherwise show only the outermost context ("Tavily API request
     /// failed") and drop the actual cause (timeout, DNS failure, ...).
     pub async fn search(&self, query: &str) -> Result<(&'static str, Vec<SearchResult>)> {
-        match self.primary.search(query).await {
-            Ok(results) => Ok((self.primary.name(), results)),
-            Err(primary_err) => {
-                let Some(fallback) = self.fallback.as_ref() else {
-                    anyhow::bail!("{} search failed: {:#}", self.primary.name(), primary_err);
-                };
-                match fallback.search(query).await {
-                    Ok(results) => Ok((fallback.name(), results)),
-                    Err(fallback_err) => anyhow::bail!(
-                        "primary ({}) failed: {:#}; fallback ({}) also failed: {:#}",
-                        self.primary.name(),
-                        primary_err,
-                        fallback.name(),
-                        fallback_err
-                    ),
-                }
+        let primary_err = match self.primary.search(query).await {
+            Ok(results) => return Ok((self.primary.name(), results)),
+            Err(e) => e,
+        };
+        if self.fallbacks.is_empty() {
+            anyhow::bail!("{} search failed: {:#}", self.primary.name(), primary_err);
+        }
+        let mut failures = format!(
+            "primary ({}) failed: {:#}",
+            self.primary.name(),
+            primary_err
+        );
+        for fallback in &self.fallbacks {
+            match fallback.search(query).await {
+                Ok(results) => return Ok((fallback.name(), results)),
+                Err(e) => failures.push_str(&format!(
+                    "; fallback ({}) also failed: {:#}",
+                    fallback.name(),
+                    e
+                )),
             }
         }
+        anyhow::bail!(failures)
     }
 }
 
@@ -278,6 +300,161 @@ impl TavilyClient {
             .context("Failed to parse Tavily response")?;
 
         Ok(convert_tavily_results(tavily_response.results))
+    }
+}
+
+// =============================================================================
+// Exa backend
+// =============================================================================
+
+/// Characters of highlighted passages Exa returns per result: enough for the
+/// model to answer from, small enough that five results stay a few KB.
+const EXA_HIGHLIGHT_CHARS: usize = 1500;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExaRequest<'a> {
+    query: &'a str,
+    #[serde(rename = "type")]
+    search_type: &'a str,
+    num_results: usize,
+    contents: ExaContents,
+}
+
+#[derive(Debug, Serialize)]
+struct ExaContents {
+    highlights: ExaHighlights,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExaHighlights {
+    max_characters: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExaResponse {
+    #[serde(default)]
+    results: Vec<ExaResult>,
+}
+
+// Like Tavily's, every field is optional and null-tolerant.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExaResult {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    published_date: Option<String>,
+    #[serde(default)]
+    highlights: Option<Vec<String>>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+/// Convert Exa's results: the content is the highlighted passages (or the
+/// summary or text when there are none), led by the publish date when Exa
+/// knows it, since recency is often what a search is for. Results without a
+/// URL are dropped, as for Tavily.
+fn convert_exa_results(results: Vec<ExaResult>) -> Vec<SearchResult> {
+    results
+        .into_iter()
+        .filter_map(|r| {
+            let url = r.url.filter(|u| !u.is_empty())?;
+            let body = r
+                .highlights
+                .map(|h| {
+                    h.iter()
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n…\n")
+                })
+                .filter(|s| !s.is_empty())
+                .or_else(|| r.summary.filter(|s| !s.trim().is_empty()))
+                .or_else(|| r.text.filter(|s| !s.trim().is_empty()))
+                .unwrap_or_default();
+            // "2026-11-12T00:00:00.000Z" -> "2026-11-12"
+            let date = r
+                .published_date
+                .as_deref()
+                .and_then(|d| d.get(..10))
+                .filter(|d| !d.is_empty());
+            let content = match date {
+                Some(d) if !body.is_empty() => format!("Published {d}.\n{body}"),
+                Some(d) => format!("Published {d}."),
+                None => body,
+            };
+            Some(SearchResult {
+                title: r.title.unwrap_or_default(),
+                url,
+                content,
+            })
+        })
+        .collect()
+}
+
+pub struct ExaClient {
+    api_key: String,
+    max_results: usize,
+    http: reqwest::Client,
+}
+
+impl ExaClient {
+    pub fn from_env(env_var: &str, max_results: usize) -> Option<Self> {
+        std::env::var(env_var)
+            .ok()
+            .filter(|k| !k.is_empty())
+            .map(|key| ExaClient {
+                api_key: key,
+                max_results,
+                http: http_client(HTTP_CONNECT_TIMEOUT, SEARCH_REQUEST_TIMEOUT),
+            })
+    }
+
+    pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
+        let request = ExaRequest {
+            query,
+            search_type: "auto",
+            num_results: self.max_results.clamp(1, 100),
+            contents: ExaContents {
+                highlights: ExaHighlights {
+                    max_characters: EXA_HIGHLIGHT_CHARS,
+                },
+            },
+        };
+
+        // The key goes in a header, never the URL, so it can't end up in
+        // proxy logs or error messages.
+        let response = self
+            .http
+            .post("https://api.exa.ai/search")
+            .header("x-api-key", &self.api_key)
+            .json(&request)
+            .send()
+            .await
+            .context("Exa API request failed")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Exa API returned {}: {}",
+                status,
+                summarize_error_body(&body)
+            );
+        }
+
+        let exa_response: ExaResponse = response
+            .json()
+            .await
+            .context("Failed to parse Exa response")?;
+
+        Ok(convert_exa_results(exa_response.results))
     }
 }
 
@@ -510,7 +687,7 @@ pub fn format_results_for_model(results: &[SearchResult]) -> String {
             // Source-only (Gemini citations) — render compact line
             out.push_str(&format!("[{}] {} — {}\n", source_num, r.title, r.url));
         } else {
-            // Full result (Tavily) — title, URL, content
+            // Full result (Tavily, Exa) — title, URL, content
             out.push_str(&format!(
                 "[{}] {}\nURL: {}\n{}\n\n",
                 source_num, r.title, r.url, r.content
@@ -562,7 +739,7 @@ mod tests {
     async fn engine_uses_primary_when_it_succeeds() {
         let (primary, primary_calls) = ok_provider("primary", &["https://a.example"]);
         let (fallback, fallback_calls) = ok_provider("fallback", &["https://b.example"]);
-        let engine = SearchEngine::new(primary, Some(fallback));
+        let engine = SearchEngine::new(primary, vec![fallback]);
 
         let (name, results) = engine.search("q").await.unwrap();
 
@@ -577,7 +754,7 @@ mod tests {
         let (primary, primary_calls) =
             failing_provider("primary", "Gemini API request failed", "timed out");
         let (fallback, fallback_calls) = ok_provider("fallback", &["https://b.example"]);
-        let engine = SearchEngine::new(primary, Some(fallback));
+        let engine = SearchEngine::new(primary, vec![fallback]);
 
         let (name, results) = engine.search("q").await.unwrap();
 
@@ -588,13 +765,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn engine_tries_each_fallback_in_order() {
+        let (primary, _) = failing_provider("primary", "Gemini API request failed", "timed out");
+        let (first, first_calls) = failing_provider("first", "Exa API request failed", "dns");
+        let (second, second_calls) = ok_provider("second", &["https://c.example"]);
+        let (third, third_calls) = ok_provider("third", &["https://d.example"]);
+        let engine = SearchEngine::new(primary, vec![first, second, third]);
+
+        let (name, results) = engine.search("q").await.unwrap();
+
+        assert_eq!(name, "second");
+        assert_eq!(results[0].url, "https://c.example");
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            third_calls.load(Ordering::SeqCst),
+            0,
+            "stops at the first success"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_reports_every_failure_when_all_fail() {
+        let (primary, _) = failing_provider("primary", "Gemini API request failed", "timed out");
+        let (first, _) = failing_provider("first", "Exa API request failed", "dns error");
+        let (second, _) = failing_provider("second", "Tavily API request failed", "401");
+        let engine = SearchEngine::new(primary, vec![first, second]);
+
+        let msg = engine.search("q").await.unwrap_err().to_string();
+
+        assert!(msg.starts_with("primary (primary) failed"), "{msg}");
+        assert!(
+            msg.contains("fallback (first) also failed: Exa API request failed: dns error"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("fallback (second) also failed: Tavily API request failed: 401"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn fallbacks_are_the_other_backends_in_a_fixed_order() {
+        assert_eq!(fallback_order("gemini"), ["exa", "tavily"]);
+        assert_eq!(fallback_order("Exa"), ["gemini", "tavily"]);
+        assert_eq!(fallback_order("tavily"), ["gemini", "exa"]);
+    }
+
+    // ---- Exa conversion ----
+
+    #[test]
+    fn exa_results_use_highlights_and_the_publish_date() {
+        let response: ExaResponse = serde_json::from_value(json!({
+            "requestId": "r1",
+            "results": [
+                {
+                    "title": "Announcing Rust 1.100.0",
+                    "url": "https://blog.rust-lang.org/2026/11/12/Rust-1.100.0/",
+                    "publishedDate": "2026-11-12T00:00:00.000Z",
+                    "highlights": ["The Rust team is happy to announce", "  ", "1.100.0"]
+                },
+                { "title": "No date", "url": "https://doc.example", "publishedDate": null,
+                  "highlights": [], "summary": "a summary" },
+                { "title": null, "url": "https://bare.example" },
+                { "title": "No URL", "url": null, "highlights": ["dropped"] },
+                { "title": "Empty URL", "url": "" }
+            ],
+            "costDollars": { "total": 0.007 }
+        }))
+        .unwrap();
+
+        let results = convert_exa_results(response.results);
+
+        assert_eq!(results.len(), 3, "results without a URL are dropped");
+        assert_eq!(
+            results[0].content,
+            "Published 2026-11-12.\nThe Rust team is happy to announce\n…\n1.100.0"
+        );
+        assert_eq!(
+            results[1].content, "a summary",
+            "summary when no highlights"
+        );
+        assert_eq!(results[2].title, "");
+        assert_eq!(results[2].content, "");
+    }
+
+    #[test]
+    fn exa_request_matches_the_api_shape() {
+        let body = serde_json::to_value(ExaRequest {
+            query: "q",
+            search_type: "auto",
+            num_results: 5,
+            contents: ExaContents {
+                highlights: ExaHighlights {
+                    max_characters: 1500,
+                },
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "query": "q",
+                "type": "auto",
+                "numResults": 5,
+                "contents": { "highlights": { "maxCharacters": 1500 } }
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn engine_error_without_fallback_keeps_root_cause() {
         let (primary, _) = failing_provider(
             "tavily",
             "Tavily API request failed",
             "dns error: failed to lookup address",
         );
-        let engine = SearchEngine::new(primary, None);
+        let engine = SearchEngine::new(primary, Vec::new());
 
         let err = engine.search("q").await.unwrap_err();
         // query.rs renders with to_string(), so the cause must be in the
@@ -612,7 +899,7 @@ mod tests {
             failing_provider("gemini", "Gemini API request failed", "operation timed out");
         let (fallback, _) =
             failing_provider("tavily", "Tavily API request failed", "connection refused");
-        let engine = SearchEngine::new(primary, Some(fallback));
+        let engine = SearchEngine::new(primary, vec![fallback]);
 
         let msg = engine.search("q").await.unwrap_err().to_string();
 
@@ -635,7 +922,7 @@ mod tests {
         for body in bodies {
             let (primary, _) = mock("gemini", MockOutcome::GeminiBody(body.clone()));
             let (fallback, fallback_calls) = ok_provider("tavily", &["https://b.example"]);
-            let engine = SearchEngine::new(primary, Some(fallback));
+            let engine = SearchEngine::new(primary, vec![fallback]);
 
             let (name, results) = engine.search("q").await.unwrap();
 
@@ -655,7 +942,7 @@ mod tests {
         });
         let (primary, _) = mock("gemini", MockOutcome::GeminiBody(body));
         let (fallback, fallback_calls) = ok_provider("tavily", &["https://b.example"]);
-        let engine = SearchEngine::new(primary, Some(fallback));
+        let engine = SearchEngine::new(primary, vec![fallback]);
 
         let (name, results) = engine.search("q").await.unwrap();
 

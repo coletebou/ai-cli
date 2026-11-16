@@ -76,10 +76,10 @@ fn default_retry_max_delay_ms() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchConfig {
-    /// Active search provider: "gemini" or "tavily"
+    /// Active search provider: "gemini", "exa" or "tavily"
     #[serde(default = "default_search_provider")]
     pub provider: String,
-    /// Maximum number of search results per query (Tavily only)
+    /// Maximum number of search results per query (Tavily and Exa)
     #[serde(default = "default_max_results")]
     pub max_results: usize,
     /// Maximum rounds of tool calls per query (safety cap)
@@ -91,6 +91,9 @@ pub struct SearchConfig {
     /// Gemini grounding-specific settings
     #[serde(default)]
     pub gemini: GeminiSearchConfig,
+    /// Exa-specific settings
+    #[serde(default)]
+    pub exa: ExaConfig,
 }
 
 impl Default for SearchConfig {
@@ -101,6 +104,7 @@ impl Default for SearchConfig {
             max_iterations: default_max_iterations(),
             tavily: TavilyConfig::default(),
             gemini: GeminiSearchConfig::default(),
+            exa: ExaConfig::default(),
         }
     }
 }
@@ -117,6 +121,24 @@ impl Default for TavilyConfig {
             api_key_env: default_tavily_api_key_env(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExaConfig {
+    #[serde(default = "default_exa_api_key_env")]
+    pub api_key_env: String,
+}
+
+impl Default for ExaConfig {
+    fn default() -> Self {
+        Self {
+            api_key_env: default_exa_api_key_env(),
+        }
+    }
+}
+
+fn default_exa_api_key_env() -> String {
+    "EXA_API_KEY".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,7 +181,7 @@ fn default_gemini_fallback_env() -> String {
 }
 
 fn default_gemini_search_model() -> String {
-    "gemini-3.1-flash-lite-preview".to_string()
+    "gemini-3.1-flash-lite".to_string()
 }
 
 fn default_max_results() -> usize {
@@ -955,12 +977,13 @@ show_cost = true
 # output_per_mtok = 0.0
 
 # ── Web search (--search / -w) ──────────────────────────────────────
-# Primary search backend; the other is used as automatic fallback.
+# Primary search backend. If it fails, the others are tried in the
+# order gemini, exa, tavily (skipping any without a key).
 
 [search]
-# "gemini" (Google Search grounding) or "tavily"
+# "gemini" (Google Search grounding), "exa" or "tavily"
 provider = "gemini"
-# Max results per search call (Tavily only)
+# Max results per search call (Tavily and Exa)
 max_results = 5
 # Safety cap on tool-call rounds per query
 max_iterations = 5
@@ -968,10 +991,15 @@ max_iterations = 5
 [search.gemini]
 api_key_env = "GEMINI_API_KEY"
 fallback_api_key_env = "GOOGLE_API_KEY"
-model = "gemini-3.1-flash-lite-preview"
+# Google bills grounding per model family: Gemini 3 and newer share 5,000
+# free searches a month, gemini-2.5-flash-lite gets 1,500 free a day.
+model = "gemini-3.1-flash-lite"
 
 [search.tavily]
 api_key_env = "TAVILY_API_KEY"
+
+[search.exa]
+api_key_env = "EXA_API_KEY"
 
 # ── Retry behavior ──────────────────────────────────────────────────
 # Transient errors (429, 5xx, timeouts) are retried with exponential

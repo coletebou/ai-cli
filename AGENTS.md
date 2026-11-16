@@ -48,7 +48,7 @@ this file is what an agent needs on top of them. `CLAUDE.md` only imports this f
 | `chat.rs`, `sessions.rs` | interactive chat (`-i`) and `/save`, `/load`, `/sessions`, `--continue` |
 | `sessions_cmd.rs` | `ai sessions`: table/JSON session listing for scripts and other tools |
 | `context.rs` | `@file` and piped-stdin expansion into the prompt |
-| `search.rs` | the `web_search` tool (Tavily / Gemini grounding, fallback) |
+| `search.rs` | the `web_search` tool (Gemini grounding / Exa / Tavily, fallback chain) |
 | `pricing.rs` | the footer's cost estimate |
 | `models.rs` | `ai models` (OpenRouter listing) |
 | `doctor.rs` | `ai doctor` diagnostics |

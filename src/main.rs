@@ -243,7 +243,7 @@ struct Cli {
     #[arg(short = 'w', long)]
     search: bool,
 
-    /// Override search provider for this query ("gemini" or "tavily")
+    /// Override search provider for this query ("gemini", "exa" or "tavily")
     #[arg(long, value_name = "PROVIDER")]
     search_provider: Option<String>,
 
@@ -642,6 +642,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     config.search.max_results,
                 )
                 .map(search::SearchProvider::Tavily),
+                "exa" => search::ExaClient::from_env(
+                    &config.search.exa.api_key_env,
+                    config.search.max_results,
+                )
+                .map(search::SearchProvider::Exa),
                 _ => None,
             }
         };
@@ -661,22 +666,26 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                      Get a free Tavily API key at https://tavily.com",
                     config.search.tavily.api_key_env,
                 ),
+                "exa" => anyhow::bail!(
+                    "search provider 'exa' requires {} to be set.\n\
+                     Get an Exa API key at https://dashboard.exa.ai",
+                    config.search.exa.api_key_env,
+                ),
                 other => anyhow::bail!(
-                    "unknown search provider '{}'. Valid options: gemini, tavily.",
-                    other
+                    "unknown search provider '{}'. Valid options: {}.",
+                    other,
+                    search::SEARCH_BACKENDS.join(", ")
                 ),
             },
         };
 
-        // Fallback: whichever provider the primary isn't, if its key is available
-        let fallback_name = if primary_name == "gemini" {
-            "tavily"
-        } else {
-            "gemini"
-        };
-        let fallback = build(fallback_name);
+        // Fallbacks: every other backend whose key is available, in order.
+        let fallbacks = search::fallback_order(&primary_name)
+            .into_iter()
+            .filter_map(build)
+            .collect();
 
-        Some(Arc::new(search::SearchEngine::new(primary, fallback)))
+        Some(Arc::new(search::SearchEngine::new(primary, fallbacks)))
     } else {
         None
     };

@@ -14,7 +14,7 @@ $ ai -w "latest release of tokio?"          # with web search
 - **One CLI, many providers.** Unified interface over Anthropic, OpenAI, Google, xAI, and OpenRouter via the [`genai`](https://crates.io/crates/genai) crate.
 - **Side-by-side TUI.** `-t` splits the terminal into per-provider panels with proper markdown rendering. Interactive by default: type follow-ups, scroll with the mouse wheel, cancel with Ctrl+C.
 - **Streaming by default.** Tokens appear as they arrive; no waiting for the full response.
-- **Web search tool use.** `-w` exposes a `web_search` tool to any model — backed by Gemini (Google Search grounding) or Tavily, with automatic fallback.
+- **Web search tool use.** `-w` exposes a `web_search` tool to any model — backed by Gemini (Google Search grounding), Exa or Tavily, with automatic fallback.
 - **Interactive chat.** `-i` keeps conversation history so you can ask follow-ups. It supports multi-line input, `@file` references and input history that persists across sessions. Chats can be saved, reloaded and resumed with `-i --continue`. `/clear`, `/history`, `/export`, `/save`, `/load`, `/sessions`, `/help` built in.
 - **Config-driven.** Edit `~/.config/ai-cli/config.toml` or run `ai config` for a TUI editor.
 - **Reasoning control.** `-r low|medium|high|<budget>` for models that support it.
@@ -71,6 +71,7 @@ Set the env vars for whichever providers you want to use. Providers without keys
 | Gemini      | `GEMINI_API_KEY` *(or `GOOGLE_API_KEY`)* |
 | OpenRouter  | `OPENROUTER_API_KEY`                     |
 | Tavily (web search) | `TAVILY_API_KEY`                 |
+| Exa (web search)    | `EXA_API_KEY`                    |
 
 ## Quick start
 
@@ -130,24 +131,31 @@ The config UI has sections for **CLI mode**, **TUI mode**, **Footer display**, a
 
 ### Search providers
 
-Set the primary search backend in config. The other is used automatically as fallback if the primary fails.
+Set the primary search backend in config. If it fails, the others are tried in the order Gemini, Exa, Tavily, skipping any whose key isn't set.
 
 ```toml
 [search]
-provider = "gemini"      # or "tavily"
-max_results = 5
+provider = "gemini"      # or "exa", "tavily"
+max_results = 5          # Exa and Tavily
 max_iterations = 5
 
 [search.gemini]
-model = "gemini-3.1-flash-lite-preview"
+model = "gemini-3.1-flash-lite"
 api_key_env = "GEMINI_API_KEY"
 fallback_api_key_env = "GOOGLE_API_KEY"
+
+[search.exa]
+api_key_env = "EXA_API_KEY"
 
 [search.tavily]
 api_key_env = "TAVILY_API_KEY"
 ```
 
-Override at the CLI: `ai -w --search-provider tavily "query"`.
+Override at the CLI: `ai -w --search-provider exa "query"`.
+
+- **Gemini** runs the search as Google Search grounding on `model`, a separate request from the panel's own model. Google bills grounding per model family: Gemini 3 and newer share 5,000 free searches a month (then $14 per 1,000), while `gemini-2.5-flash-lite` gets 1,500 free grounded prompts a day (then $35 per 1,000).
+- **Exa** returns each result's most relevant passages and its publish date. Each search costs a fraction of a cent (about $0.007 at the time of writing), billed to your Exa account.
+- **Tavily** returns a content snippet per result.
 
 ### AWS Bedrock
 
@@ -254,7 +262,7 @@ ai sessions --json --limit 5        # same, as machine-readable JSON
 - **System:** version and build, OS, and which config file is in use, and whether it parses.
 - **Providers:** for each configured provider, whether it's enabled, its fast and smart models, where its credentials come from (env var, config `api_key`, or subscription), its endpoint, and whether it's routed through AWS Bedrock. Key values are never printed, only their length.
 - **Connectivity:** for each enabled provider with credentials, a DNS lookup of the endpoint host plus one free authenticated request (list models, or key info for OpenRouter). The result is classified as OK, auth failure, not found, rate limited, TLS error, DNS failure, timeout or connection refused. Bedrock is checked for reachability only, so doctor never makes a billed call.
-- **Web search** and **telemetry:** whether the search keys (`TAVILY_API_KEY`, `GEMINI_API_KEY` / `GOOGLE_API_KEY`) and the `LANGFUSE_*` variables are set.
+- **Web search** and **telemetry:** whether the search keys (`GEMINI_API_KEY` / `GOOGLE_API_KEY`, `EXA_API_KEY`, `TAVILY_API_KEY`) and the `LANGFUSE_*` variables are set.
 
 ```bash
 ai doctor             # full check, including network probes (about 10s at most)
@@ -422,7 +430,7 @@ The panel keeps its conversation and uses the new model from the next turn on. A
 | `-s, --system <prompt>`     | System prompt / persona                           |
 | `-r, --reasoning <level>`   | `none`, `low`, `medium`, `high`, or numeric budget |
 | `-w, --search`              | Enable web search tool                            |
-| `--search-provider <name>`  | Override search primary (`gemini`, `tavily`)      |
+| `--search-provider <name>`  | Override search primary (`gemini`, `exa`, `tavily`) |
 | `-t, --tui`                 | Side-by-side TUI display                          |
 | `--no-tui`                  | Disable TUI (overrides config)                    |
 | `-i, --interactive`         | Interactive chat mode                             |
@@ -450,7 +458,7 @@ src/
 ├── bedrock.rs             Direct AWS Bedrock Converse / ConverseStream client
 ├── bedrock_eventstream.rs AWS event-stream frame decoder
 ├── bedrock_catalog.rs     Bedrock model catalog (picker, `ai models --bedrock`)
-├── search.rs              SearchEngine: Tavily + Gemini grounding, fallback logic
+├── search.rs              SearchEngine: Gemini grounding, Exa, Tavily, fallback chain
 ├── markdown.rs            pulldown-cmark → ratatui styled lines
 ├── display.rs             CLI output: progressive streaming, multi-provider blocks, --raw
 ├── pricing.rs             Per-model prices and the footer's cost estimate

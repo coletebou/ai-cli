@@ -86,10 +86,10 @@ enum SearchField {
 /// Gemini models offered for cycling in the Search config UI.
 /// Users can still hand-edit config.toml for any other model.
 const GEMINI_MODEL_CHOICES: &[&str] = &[
-    "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash-lite",
     "gemini-3-flash-preview",
-    "gemini-3-pro-preview",
-    "gemini-2.5-flash",
 ];
 /// Preset values users can cycle through for numeric search fields.
 const MAX_RESULTS_CHOICES: &[usize] = &[3, 5, 10];
@@ -508,12 +508,15 @@ impl App {
             },
             Section::Search => match self.search_field {
                 SearchField::Provider => {
-                    // Cycle between gemini and tavily
-                    self.config.search.provider = if self.config.search.provider == "gemini" {
-                        "tavily".to_string()
-                    } else {
-                        "gemini".to_string()
-                    };
+                    // Cycle through the backends (an unknown value starts over)
+                    let backends = crate::search::SEARCH_BACKENDS;
+                    let current = self.config.search.provider.to_lowercase();
+                    let next = backends
+                        .iter()
+                        .position(|b| *b == current)
+                        .map(|i| (i + 1) % backends.len())
+                        .unwrap_or(0);
+                    self.config.search.provider = backends[next].to_string();
                 }
                 SearchField::GeminiModel => {
                     // Cycle through known Gemini models
@@ -862,16 +865,23 @@ fn draw_search_section(frame: &mut Frame, area: Rect, app: &App) {
 
     let search = &app.config.search;
 
-    let provider_display = if search.provider == "gemini" {
-        "[gemini] / tavily"
-    } else {
-        "gemini / [tavily]"
-    };
+    let current = search.provider.to_lowercase();
+    let provider_display = crate::search::SEARCH_BACKENDS
+        .iter()
+        .map(|b| {
+            if *b == current {
+                format!("[{b}]")
+            } else {
+                b.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" / ");
 
     let items = vec![
         format_mode_item(
             "Provider",
-            provider_display,
+            &provider_display,
             app.search_field == SearchField::Provider,
         ),
         format_mode_item(

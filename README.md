@@ -390,15 +390,19 @@ The TUI is a long-running chat: type a message, hit Enter, read responses in eac
 | Normal | `m` | Pick the selected panel's model |
 | Normal | `q` / `Esc` | Quit (Esc cancels first if streaming) |
 | Insert | `Enter` | Submit turn to all panels |
+| Insert | `Alt+Enter` / `Ctrl+J` | Insert a newline (also `Shift+Enter` where the terminal reports it) |
 | Insert | `Esc` | Back to normal |
 | Insert | `Ctrl+C` | Cancel in-flight turn, or clear line |
 | Insert | `←` / `→` / `Home` / `End` | Move the cursor (also `Ctrl+A` / `Ctrl+E`) |
+| Insert | `↑` / `↓` | Move the cursor between rows of the input box |
 | Insert | `Ctrl+W` / `Ctrl+U` / `Ctrl+K` | Delete word back / to start / to end |
 | Insert | `PageUp` / `PageDown` | Scroll the selected panel |
 | Insert | `Ctrl+O` | Pick the selected panel's model |
-| Any | Mouse wheel | Scroll the panel under the cursor |
+| Any | Mouse wheel | Scroll the panel (or input box) under the cursor |
+| Any | Click + drag | Select text in a panel or the input box; copied on release |
+| Any | Click in the input box | Place the cursor there |
 
-Multi-line pastes are kept intact: newlines show as `↵` in the input box and are sent as real newlines.
+The input box wraps long text and grows a row at a time up to five rows, then scrolls (a ` 6-10/12 ` marker on its border shows which rows are in view). Multi-line pastes keep their newlines.
 
 Slash commands in the input box: `/clear` (reset all histories), `/model [id]` (pick, or set, the selected panel's model), `/exit` (quit).
 
@@ -406,7 +410,7 @@ Slash commands in the input box: `/clear` (reset all histories), `/model [id]` (
 
 The panel keeps its conversation and uses the new model from the next turn on. A panel whose provider isn't on Bedrock is moved to the Bedrock provider when you pick a listed Bedrock model; an unlisted ID stays with the panel's own provider. The model can't change while a panel is still answering.
 
-Mouse capture is enabled so the wheel scrolls panels natively. To text-select in the terminal (which mouse capture normally blocks), hold `Shift` (iTerm2, Terminal.app, most Linux terminals) or `Option`.
+**Copying text.** Mouse capture is on (the wheel needs it), so the TUI does selection itself: drag inside one panel or the input box and the text is copied when you let go, with the selection highlighted until the next key. A selection stays inside the region it started in, so it never picks up the other panels or the borders, and dragging past a panel's top or bottom edge scrolls it to select more. Soft-wrapped rows are joined back into their original lines. The copy goes out as an OSC 52 escape (works over SSH, and through tmux with `set -g set-clipboard on`) and also through `pbcopy` / `wl-copy` / `xclip` / `xsel` when one is available. For the terminal's own selection instead, hold `Shift` (most terminals, including Ghostty) or `Option` (iTerm2) while dragging.
 
 ## Flags reference
 
